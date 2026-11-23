@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The diff is the plain union of the three source changes, and the author made no extra code edits. The parts are: the parallel combine/source for large perfect hash aggregates (E0003), the perfect hash join for RIGHT joins (E0004), partitioning count(DISTINCT) on the hash of the group keys (E0005), and the exact key-bitmap join filter with DELIM_GET pushdown (E0006). Every condition depends on general plan or data properties: estimated cardinality, key density, key type, memory limit, thread count, join type. None of them names a table, column or literal.",
+      "Checked whether the changes interfere with each other. The perfect hash join and the exact filter cannot both be active: CanUseBloomFilter (physical_hash_join.cpp:768) returns false when the hash table is perfect, so the bitmap is never built for a perfect join. The large perfect aggregate rejects DISTINCT aggregates (plan_aggregate.cpp), so it never overlaps with the distinct-HT partitioning. PropagateFoundMatches runs only when a perfect join executor exists and only for joins that propagate the build side.",
+      "Edge-case guards are in place. Exact mode: NULL keys are skipped on insert and follow filters_null_values on probe; an out-of-range key sets an overflow flag that lets everything pass; a mismatched key type lets everything pass; the bitmap is capped at 128 bits per key and 2^29 bits in total. Perfect join: NULL min/max is rejected and the duplicate check fixes the off-by-one. Large perfect aggregate: it is limited by density and by memory budget divided by threads."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"The diff is the plain union of the three source changes, and the author made no extra code edits. The parts are: the parallel combine/source for large perfect hash aggregates (E0003), the perfect hash join for RIGHT joins (E0004), partitioning count(DISTINCT) on the hash of the group keys (E0005), and the exact key-bitmap join filter with DELIM_GET pushdown (E0006). Every condition depends on general plan or data properties: estimated cardinality, key density, key type, memory limit, thread count, join type. None of them names a table, column or literal.\",\"Checked whether the changes interfere with each other. The perfect hash join and the exact filter cannot both be active: CanUseBloomFilter (physical_hash_join.cpp:768) returns false when the hash table is perfect, so the bitmap is never built for a perfect join. The large perfect aggregate rejects DISTINCT aggregates (plan_aggregate.cpp), so it never overlaps with the distinct-HT partitioning. PropagateFoundMatches runs only when a perfect join executor exists and only for joins that propagate the build side.\",\"Edge-case guards are in place. Exact mode: NULL keys are skipped on insert and follow filters_null_values on probe; an out-of-range key sets an overflow flag that lets everything pass; a mismatched key type lets everything pass; the bitmap is capped at 128 bits per key and 2^29 bits in total. Perfect join: NULL min/max is rejected and the duplicate check fixes the off-by-one. Large perfect aggregate: it is limited by density and by memory budget divided by threads.\"],\"required_changes\":[]}",
+  "cost_usd": 0.40989960000000003,
+  "seconds": 58.11461353302002,
+  "error": ""
+}

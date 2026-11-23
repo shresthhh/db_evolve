@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [],
+    "required_changes": []
+  },
+  "text": "{\"verdict\": \"approve\", \"benchmark_specific\": false, \"findings\": [], \"required_changes\": []}",
+  "cost_usd": 0.0,
+  "seconds": 0.0,
+  "error": ""
+}

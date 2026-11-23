@@ -1,0 +1,28 @@
+{
+  "id": "E0001",
+  "title": "Bloom filter for joins with one equality key plus non-equality conditions",
+  "started": "2026-11-21T12:13:59-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "d173f1ab180ec781d7334309aa6128a38aea9816",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q21 +1.0%; needs at least -5%)",
+    "visible geomean got slower (+1.0%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.9860654,
+  "summary": "q21 got 3.8\u20137.5% faster, well short of the 20\u201340% the issue predicted, and the gain sits right at the 5% acceptance bar. I made two small changes:\n\n1) `JoinFilterPushdownInfo::CanUseBloomFilter` (physical_hash_join.cpp): the old check `ht->conditions.size() == 1` is now `ht->equality_predicate_columns.size() == 1`, and `cmp == COMPARE_EQUAL` is still required. This is safe because:\n   - the hash table, and so the bloom filter, hashes only the equality columns;\n   - the constructor asserts equalities come first, so the single equality is condition 0, which is what `PushBloomFilter` reads (`conditions[0]`, `NullValuesAreEqual(0)`);\n   - non-equality conditions still fail the `cmp` check, so they never get a bloom filter, and their min/max filters behave as before.\n\n2) `JoinFilterPushdownOptimizer::GenerateJoinFilters`: when the build side is a `LOGICAL_DELIM_GET`, `build_side_has_filter` is now `true`. Before, it was computed on the probe side (`children[0]`). The existing probe > build cardinality check still applies.\n\nMeasured (`bench q21`, three runs against the current best):\n- 871.7 \u2192 806.4 ms (\u22127.5%)\n- 867.3 \u2192 834.0 ms (\u22123.8%)\n- 930.0 \u2192 883.8 ms (\u22125.0%)\n\nIn the profile, the NOT EXISTS subquery join (lineitem \u22c8 DELIM_SCAN on orderkey = and suppkey !=) went from 0.92s to 0.31s of operator time. All bench result checks passed.",
+  "notes": "- **Gain is smaller than expected:** the bloom filter cuts probe work, but the lineitem scan cost stays. Other operators still dominate q21: the orders/lineitem join (0.63\u20130.71s), the delim join operators (about 0.4s) and the lineitem scans.\n- **Unverified:** the `dbe-tool profile` and `sql` output is truncated, so I couldn't see the lowest lineitem scans. I never saw the `BF(l_orderkey)` tag or the scan row counts, and I don't know if the EXISTS-side join (the one producing 2.93M rows) also got a bloom filter. If the planner put lineitem on the build side there, it couldn't have.\n- **Tool problem:** `EXPLAIN (FORMAT json)` times out in `dbe-tool sql`, even without ANALYZE.\n- **Possible follow-up:** the two subqueries both scan lineitem by orderkey against the same delim key set, so sharing or merging those scans could pay off more than this.",
+  "train_ratio": 1.0097549429729082,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q21": 1.0097549429729082
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-21T12:26:10-05:00"
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0009",
+  "title": "Per-key bloom filter for multi-key joins, revived for the post-E0008 q09 plan",
+  "started": "2026-11-17T19:19:26-05:00",
+  "base": "f3239195db92fccd7fb0c344e2aa0b6a04be2ed8",
+  "candidate": "448b47834be52cbdbddede51fed8b782d1dc1897",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.4145387999999999,
+  "summary": "Multi-key hash joins can now push a bloom filter into the probe scan for each key. Before, only single-key equality joins got one.\n\nWhat changed:\n- **`JoinHashTable`**: the single bloom filter is replaced by one optional filter per condition (`vector<unique_ptr<BloomFilter>>`, with `SetBuildBloomFilter`, `HasBloomFilter`, `BloomFilterCount` and `GetBloomFilter`, each taking a condition index). `AllocatePointerTable` initialises each requested filter. For single-key joins, `InsertHashes` still fills the filter from the stored row hash, so that path behaves as before. For multi-key joins, `Finalize` gathers layout column `cond_idx` (layout column i is condition i) for each chunk, hashes it with `VectorOperations::Hash` and inserts the hashes.\n- **`CanUseBloomFilter`**: it now takes the condition index and accepts multi-key joins when that condition is `COMPARE_EQUAL` and its type is not nested, with at most 2 per-key filters per join. The existing `build_side_has_filter`, `probe_larger_then_build` and no-perfect-hash-table checks still apply.\n- **Deferred pushes**: they are now a struct (`DeferredBloomFilter`) holding the probe info, the probe column and the condition index. `PushBloomFilter` uses that condition's filter, NULL semantics (`NullValuesAreEqual(cond_idx)`), key name and type. It is still wrapped in `SelectivityOptionalFilter`.\n- **Files**: `join_hashtable.hpp/.cpp`, `join_filter_pushdown.hpp`, `physical_hash_join.cpp`.\n\nStep 1 (profile of q09.m0): the lineitem scan now shows `l_partkey IN BF(p_partkey)` and `l_suppkey IN BF(ps_suppkey)`. It emits 3,275,523 rows instead of 60M. The 2-key join dropped from 2.44s to 0.68s CPU.\n\nStep 2 (bench):\n- **q09**: -18.9%, -15.5%, -18.4% and -13.5% across four runs (725\u2192588, 668\u2192564, 721\u2192589, 711\u2192615 ms).\n- **Full bench geomean**: +0.5% on the first run, -2.0% on the second.\n- **Other templates**: they swung by \u00b110\u201334% from run to run in both directions, and every one returned to the noise band on re-run (q16 went +11%, then +34%, then +1%; q05 went +11.5%, then -13.6%). q18, q19 and q22 were neutral or faster on re-check. I checked the plans for q05 and q16: q05's only multi-key join builds on an unfiltered table, so no filter is built there, and q16 has only single-key joins. Neither plan can be affected by this change.\n\nCorrectness: I compared a two-key join on an integer and a text key against a version written so it cannot get the filter. Both returned 133118 rows.",
+  "notes": "- **Header changes**: they were unavoidable. `join_filter_pushdown.hpp` now has a `DeferredBloomFilter` struct, and the `CanUseBloomFilter`/`PushBloomFilter` signatures changed. The full rebuild finished within one build call.\n- **Bench noise**: this round, any single template could swing \u00b110\u201335% between runs. Any +X% result should be re-run before it is treated as a regression.\n- **q09 follow-up**: the o_orderkey join (1.73s CPU, 15M-row build on orders, 3.27M probe rows) is now the biggest cost in q09. Flipping its build side or pushing a filter into orders could be the next step.\n- **Second key filter**: in q09 both keys get a filter. The l_suppkey one is unselective and should switch itself off at runtime, but whether it does was not measured separately.",
+  "train_ratio": 0.9883493193940371,
+  "val_ratio": 0.9959284502632452,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0704168346015401,
+    "q03": 1.1784053046352434,
+    "q04": 0.9657864221270325,
+    "q05": 0.9464859085313994,
+    "q07": 0.9800345494679772,
+    "q08": 0.9577412429687069,
+    "q09": 0.7848687901059187,
+    "q13": 1.0905584710999552,
+    "q14": 0.9926102099971341,
+    "q16": 0.9525639827318897,
+    "q17": 0.987184918732279,
+    "q18": 0.9955381863090942,
+    "q19": 0.9874400309023172,
+    "q22": 0.9984539223028154
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-17T19:39:13-05:00"
+}

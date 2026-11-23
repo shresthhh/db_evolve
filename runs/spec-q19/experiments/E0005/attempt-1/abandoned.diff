@@ -1,0 +1,54 @@
+diff --git a/src/optimizer/expression_heuristics.cpp b/src/optimizer/expression_heuristics.cpp
+index 0bba429..d066aa3 100644
+--- a/src/optimizer/expression_heuristics.cpp
++++ b/src/optimizer/expression_heuristics.cpp
+@@ -3,6 +3,8 @@
+ #include "duckdb/planner/expression/list.hpp"
+ #include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/filter/selectivity_optional_filter.hpp"
+ #include "duckdb/planner/filter/struct_filter.hpp"
+ 
+ namespace duckdb {
+@@ -210,8 +212,7 @@ idx_t ExpressionHeuristics::Cost(Expression &expr) {
+ 		return ExpressionCost(const_expr.return_type.InternalType(), 1);
+ 	}
+ 	case ExpressionClass::BOUND_REF: {
+-		auto &col_expr = expr.Cast<BoundColumnRefExpression>();
+-		return ExpressionCost(col_expr.return_type.InternalType(), 8);
++		return ExpressionCost(expr.return_type.InternalType(), 8);
+ 	}
+ 	default: {
+ 		break;
+@@ -225,8 +226,18 @@ idx_t ExpressionHeuristics::Cost(Expression &expr) {
+ idx_t ExpressionHeuristics::Cost(const TableFilter &filter) {
+ 	switch (filter.filter_type) {
+ 	case TableFilterType::DYNAMIC_FILTER:
+-	case TableFilterType::OPTIONAL_FILTER:
+ 		return 0;
++	case TableFilterType::OPTIONAL_FILTER: {
++		// selectivity optional filters are actually evaluated (until they prove unselective): use the child's cost
++		auto selectivity_filter = dynamic_cast<const SelectivityOptionalFilter *>(&filter);
++		if (selectivity_filter && selectivity_filter->child_filter) {
++			return Cost(*selectivity_filter->child_filter);
++		}
++		return 0;
++	}
++	case TableFilterType::BLOOM_FILTER:
++		// hashing + probing the bloom filter is considerably more expensive than a constant comparison
++		return 50;
+ 	case TableFilterType::CONJUNCTION_OR: {
+ 		auto &conjunction_and = filter.Cast<ConjunctionOrFilter>();
+ 		idx_t cost = 5;
+@@ -254,6 +265,10 @@ idx_t ExpressionHeuristics::Cost(const TableFilter &filter) {
+ 		auto &struct_filter = filter.Cast<StructFilter>();
+ 		return Cost(*struct_filter.child_filter);
+ 	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr_filter = filter.Cast<ExpressionFilter>();
++		return Cost(*expr_filter.expr);
++	}
+ 	default:
+ 		return 1000;
+ 	}

@@ -1,0 +1,88 @@
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..eb67a58 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -59,6 +60,44 @@ static ExpressionBinding GetChildColumnBinding(Expression &expr) {
+ 	return ret;
+ }
+ 
++//! Substring containment filters with a non-trivial literal are typically far more selective than other filters
++static constexpr double CONTAINS_SELECTIVITY = RelationStatisticsHelper::DEFAULT_SELECTIVITY * 0.2;
++static constexpr idx_t CONTAINS_MIN_LITERAL_LENGTH = 3;
++
++static bool IsContainsFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr = *filter.Cast<ExpressionFilter>().expr;
++		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++			return false;
++		}
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (func.function.name != "contains" || func.children.size() != 2) {
++			return false;
++		}
++		auto &needle = *func.children[1];
++		if (needle.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &value = needle.Cast<BoundConstantExpression>().value;
++		if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
++			return false;
++		}
++		return StringValue::Get(value).size() >= CONTAINS_MIN_LITERAL_LENGTH;
++	}
++	case TableFilterType::CONJUNCTION_AND: {
++		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
++			if (IsContainsFilter(*child)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	default:
++		return false;
++	}
++}
++
+ idx_t RelationStatisticsHelper::GetDistinctCount(LogicalGet &get, ClientContext &context,
+                                                  const ColumnIndex &column_id) {
+ 	if (!get.function.statistics && !get.function.statistics_extended) {
+@@ -119,6 +158,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 	if (!get.table_filters.filters.empty()) {
+ 		column_statistics = nullptr;
+ 		bool has_non_optional_filters = false;
++		bool has_contains_filter = false;
+ 		for (auto &it : get.table_filters.filters) {
+ 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
+ 				if (get.function.statistics_extended) {
+@@ -139,15 +179,19 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 
+ 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
+ 				has_non_optional_filters = true;
++				if (IsContainsFilter(*it.second)) {
++					has_contains_filter = true;
++				}
+ 			}
+ 		}
+ 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
+ 		// and there are other table filters (i.e cost > 50), use default selectivity.
+ 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+ 		if (!has_equality_filter && has_non_optional_filters) {
+-			cardinality_after_filters = MaxValue<idx_t>(
+-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+-			    1U);
++			auto selectivity =
++			    has_contains_filter ? CONTAINS_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			cardinality_after_filters =
++			    MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * selectivity), 1U);
+ 		}
+ 		if (base_table_cardinality == 0) {
+ 			cardinality_after_filters = 0;

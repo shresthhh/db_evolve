@@ -1,0 +1,27 @@
+{
+  "id": "E0002",
+  "title": "Bloom filter pushdown for multi-key hash joins on the first key",
+  "started": "2026-11-20T00:19:49-05:00",
+  "base": "c6b5dde53f661ee3709ac8121136aef2f9ec784f",
+  "candidate": "0c47211ada6381cbc3ea87d7518b4c41a8a9556e",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.881267,
+  "summary": "I allowed the hash-join bloom filter to be pushed down for multi-key equi-joins, on the first join condition only. The tree builds in release, and bench on q09 went from 723.1ms to 536.1ms (-25.9%) with results matching the current best.\n\nChanges:\n(1) physical_hash_join.cpp, CanUseBloomFilter: the `conditions.size()==1` requirement is gone. It now requires that both the pushed condition and ht->conditions[0] are COMPARE_EQUAL. FinalizeFilters only calls it when join_condition[filter_idx]==0. The other existing checks are unchanged: has_cast, perfect HT, build_side_has_filter, probe larger than build.\n(2) join_hashtable.cpp: InsertHashes now only feeds the stored row hashes into the bloom filter for single-key tables. For multi-key tables, Finalize gathers key column 0 from the row locations per chunk with data_collection->Gather(..., column 0, ...), hashes it with VectorOperations::Hash and inserts those hashes. That is the same hash BFTableFilter computes on the probe side. The hash table never probes the bloom filter itself, so the combined row hash is not needed anywhere else. No header changes.\n\nProfile of q09.m0: the lineitem scan now shows `l_partkey IN BF(p_partkey)` and emits 3.28M rows instead of 60M. The 2-key HASH_JOIN dropped from 2.27s to 0.65s. The scan's own time went up (3.37s in the profile), because it now evaluates the bloom filter.\n\nCorrectness checks I ran with dbe-tool sql:\n- A 3-key join with a VARCHAR first key (lineitem self-join on shipinstruct, suppkey, linenumber against a filtered DISTINCT build) returned 554655, the same as the equivalent join on concatenated string keys.\n- A 2-key integer join against a filtered partsupp returned 295319, the same as the concatenated-key version.\n\nTwo other VARCHAR attempts returned 0 rows on both sides, so they test nothing. I did not specifically test NULL first keys or the external/spilling hash join.",
+  "notes": "- After this change the q09 lineitem scan (about 3.4s cumulative in the profile) is the dominant cost. The next idea is to push the bloom filter for the second key (suppkey) as well. That would need a separate BloomFilter member per condition, which is a header change.\n- Inside the 2-key bloom filter, the min/max filters on l_suppkey do nothing.\n- For external (partitioned) joins the bloom filter lifecycle is the same as the existing single-key path; this change only alters which hashes are inserted. I did not test that path specifically.",
+  "train_ratio": 0.8429049136679544,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.8429049136679544
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T00:26:09-05:00"
+}

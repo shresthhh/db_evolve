@@ -1,0 +1,29 @@
+{
+  "id": "E0001",
+  "title": "Merge 2 specialised systems: q09, q18",
+  "started": "2026-11-22T19:59:37-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "bc7105069b2d57c71acc668fec72aa9af9f2eb05",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.9698566,
+  "summary": "I merged the q18 changes by hand into the tree that already had q09's. The build is OK, and both templates are faster than the current best on `bench`:\n\n| Template | Best (ms) | Merged (ms) | Change |\n|---|---|---|---|\n| q09 | 1005.1 | 577.3 | -42.6% |\n| q18, first run | 655.8 | 622.6 | -5.1% |\n| q18, re-run | 657.0 | 555.9 | -15.4% |\n\nThe geomean over the two templates was -26.2% on the first run.\n\nWhat was brought in from the q18 patch, file by file:\n- **`physical_hash_join.cpp`:** the new `CastJoinFilterValueToStorage` (undoes the storage offset, then casts to the storage type) is used for both the IN-list and the min/max filters. `CanUseInFilter` now allows hash tables up to 64 times the IN-list threshold; when there are more keys than the threshold, a zonemap-only set of up to that many ranges, split at the largest gaps, is pushed for integer keys.\n- **`join_filter_pushdown.hpp`:** a new `storage_offset` field on `JoinFilterPushdownColumn`, and a `PushInFilter` signature that takes the context.\n- **`join_filter_pushdown_optimizer.cpp`:** join filters can now be pushed through the internal integer-compression function (input minus a constant), and the offset is carried through set operations.\n- **`cardinality_estimator.cpp`:** the estimate for a SEMI join now uses the ratio of the key's distinct count to the right side's size.\n- **`relation_manager.cpp`:** an aggregate with a range filter on its result (`HAVING agg > c`) gets one more selectivity cut, with a floor of 1.\n\nThe only real conflict was one line in `FinalizeFilters`, where both changes edit the bloom filter push condition. I combined them: the bloom filter is pushed only when there is no cast and no storage offset (q18's rule) and the filter is on the first join condition (q09's rule). Neither change hurt the other template, so nothing was guarded or dropped.",
+  "notes": "q18 is noisy at this run size: the same build measured -5.1% and then -15.4%. The interleaved timing should settle it.\n\nThe two changes only met at the bloom filter condition in `FinalizeFilters`; every other hunk applied as written.",
+  "train_ratio": 0.7066883832261375,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.5444970329835379,
+    "q18": 0.9171922723807956
+  },
+  "improved": [
+    "q09",
+    "q18"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-22T20:28:46-05:00"
+}

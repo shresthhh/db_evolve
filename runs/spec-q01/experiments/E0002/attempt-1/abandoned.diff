@@ -1,0 +1,71 @@
+diff --git a/src/storage/compression/bitpacking.cpp b/src/storage/compression/bitpacking.cpp
+index b9bada0..f5e944d 100644
+--- a/src/storage/compression/bitpacking.cpp
++++ b/src/storage/compression/bitpacking.cpp
+@@ -629,6 +629,8 @@ public:
+ 	ColumnSegment &current_segment;
+ 
+ 	T decompression_buffer[BITPACKING_METADATA_GROUP_SIZE];
++	//! Lazily allocated scratch buffer (STANDARD_VECTOR_SIZE values) used by select
++	unsafe_unique_array<T> select_buffer;
+ 
+ 	bitpacking_metadata_t current_group;
+ 	bitpacking_width_t current_width;
+@@ -772,13 +774,8 @@ unique_ptr<SegmentScanState> BitpackingInitScan(const QueryContext &context, Col
+ // Scan base data
+ //===--------------------------------------------------------------------===//
+ template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
+-void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
+-                           idx_t result_offset) {
+-	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
+-
+-	T *result_data = FlatVector::GetData<T>(result);
+-	result.SetVectorType(VectorType::FLAT_VECTOR);
+-
++void BitpackingScanToBuffer(BitpackingScanState<T> &scan_state, idx_t scan_count, T *result_data,
++                            idx_t result_offset) {
+ 	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
+ 	bool skip_sign_extend = true;
+ 
+@@ -862,6 +859,34 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
+ 	}
+ }
+ 
++template <class T>
++void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
++                           idx_t result_offset) {
++	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
++	T *result_data = FlatVector::GetData<T>(result);
++	result.SetVectorType(VectorType::FLAT_VECTOR);
++	BitpackingScanToBuffer<T>(scan_state, scan_count, result_data, result_offset);
++}
++
++//! Select: decompress the full vector into a scratch buffer, then gather the selected rows into a flat result
++template <class T>
++void BitpackingSelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++                      const SelectionVector &sel, idx_t sel_count) {
++	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
++	D_ASSERT(vector_count <= STANDARD_VECTOR_SIZE);
++	if (!scan_state.select_buffer) {
++		scan_state.select_buffer = make_unsafe_uniq_array_uninitialized<T>(STANDARD_VECTOR_SIZE);
++	}
++	T *scratch = scan_state.select_buffer.get();
++	BitpackingScanToBuffer<T>(scan_state, vector_count, scratch, 0);
++
++	T *result_data = FlatVector::GetData<T>(result);
++	result.SetVectorType(VectorType::FLAT_VECTOR);
++	for (idx_t i = 0; i < sel_count; i++) {
++		result_data[i] = scratch[sel.get_index(i)];
++	}
++}
++
+ template <class T>
+ void BitpackingScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result) {
+ 	BitpackingScanPartial<T>(segment, state, scan_count, result, 0);
+@@ -968,6 +993,7 @@ CompressionFunction GetBitpackingFunction(PhysicalType data_type) {
+ 	    BitpackingCompress<T, WRITE_STATISTICS>, BitpackingFinalizeCompress<T, WRITE_STATISTICS>, BitpackingInitScan<T>,
+ 	    BitpackingScan<T>, BitpackingScanPartial<T>, BitpackingFetchRow<T>, BitpackingSkip<T>);
+ 	bitpacking.get_segment_info = BitpackingGetSegmentInfo<T>;
++	bitpacking.select = BitpackingSelect<T>;
+ 	return bitpacking;
+ }

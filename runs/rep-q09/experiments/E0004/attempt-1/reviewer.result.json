@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The change is general. Exact mode switches on only from the build-side min/max at run time: integer physical type, range under 2^31, and at most 128 bits per hash-table row. It names no tables, columns or literals, and nothing in it depends on the dataset.",
+      "physical_hash_join.cpp TrySetExactBloomFilterRange: the min/max comes from the same first-key condition (is_first_key) that fills layout column 0, so out-of-range inserts should not happen. If they did, the insert throws an InternalException instead of returning a wrong answer. A wide INT64 range wraps to a huge unsigned value, so it is caught by the range check and keeps the hashed filter.",
+      "bloom_filter.cpp: memory is at most 2^31 bits (256MB). That is under the 512MB cap the hashed filter already has (MAX_NUM_SECTORS), and at most 16 bytes per build row, so it does not raise memory use beyond the current limits.",
+      "In BFTableFilter::Filter exact mode, the result_sel indices mean the same as in the hash path: positions in the selected list. A non-flat vector with a selection set is sliced first. Dictionary and constant vectors are handled through UnifiedVectorFormat.",
+      "NULL handling: NULL build keys are skipped on insert. NULL probe keys pass when !filters_null_values (IS NOT DISTINCT FROM). CheckStatistics will not prune when NULLs must pass and the segment can contain NULLs. A FILTER_ALWAYS_TRUE result only gives up the pre-filter, and the join still checks every key.",
+      "Minor: the author says the NULL and negative-key exact paths were not exercised in their tests. On reading the code I don't see a correctness hole there."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"The change is general. Exact mode switches on only from the build-side min/max at run time: integer physical type, range under 2^31, and at most 128 bits per hash-table row. It names no tables, columns or literals, and nothing in it depends on the dataset.\",\"physical_hash_join.cpp TrySetExactBloomFilterRange: the min/max comes from the same first-key condition (is_first_key) that fills layout column 0, so out-of-range inserts should not happen. If they did, the insert throws an InternalException instead of returning a wrong answer. A wide INT64 range wraps to a huge unsigned value, so it is caught by the range check and keeps the hashed filter.\",\"bloom_filter.cpp: memory is at most 2^31 bits (256MB). That is under the 512MB cap the hashed filter already has (MAX_NUM_SECTORS), and at most 16 bytes per build row, so it does not raise memory use beyond the current limits.\",\"In BFTableFilter::Filter exact mode, the result_sel indices mean the same as in the hash path: positions in the selected list. A non-flat vector with a selection set is sliced first. Dictionary and constant vectors are handled through UnifiedVectorFormat.\",\"NULL handling: NULL build keys are skipped on insert. NULL probe keys pass when !filters_null_values (IS NOT DISTINCT FROM). CheckStatistics will not prune when NULLs must pass and the segment can contain NULLs. A FILTER_ALWAYS_TRUE result only gives up the pre-filter, and the join still checks every key.\",\"Minor: the author says the NULL and negative-key exact paths were not exercised in their tests. On reading the code I don't see a correctness hole there.\"],\"required_changes\":[]}",
+  "cost_usd": 0.2422336,
+  "seconds": 56.435869455337524,
+  "error": ""
+}

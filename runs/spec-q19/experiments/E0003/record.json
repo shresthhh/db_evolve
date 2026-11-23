@@ -1,0 +1,16 @@
+{
+  "id": "E0003",
+  "title": "Dictionary-level filter evaluation for Dictionary-compressed string segments",
+  "started": "2026-11-21T00:08:12-05:00",
+  "base": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.1147085999999997,
+  "summary": "I implemented the change, but it made q19 no faster. bench q19 went from 116.6 ms to 115.9 ms (-0.6%, which is noise), so I'm abandoning it.\n\nWhat I built: a `filter` callback for plain Dictionary-compressed VARCHAR segments, in dictionary_compression.cpp, ported from DictFSSTFilter.\n- It evaluates the filter once per dictionary entry and caches a bool per entry. Slot 0 (NULL) is evaluated only when a row actually references it.\n- Rows are mapped through the bitpacked selection that ScanToDictionaryVector produces, so the output stays a dictionary vector.\n- To avoid a header change, the cache lives in a scan-state subclass defined in the .cpp.\n- Guards: full vectors only, dictionary size at most STANDARD_VECTOR_SIZE, and the filter tree must have a stable result (constant, IS [NOT] NULL, IN, non-volatile expression, AND/OR/OPTIONAL of those). Anything else uses the old scan-then-filter path.\n- In numeric_constant.cpp, ConstantFun::FiltersNullValues now handles IN_FILTER and DYNAMIC_FILTER by keeping all rows instead of throwing.\n\nThe tree builds. I ran no result checks beyond what `bench q19` does.\n\nThe key measurement was an A/B on the same build, with the callback switched off and on, for `count(*) WHERE <dictionary varchar> = const` (cumulative scan time):\n- Single filter: 0.56s with the old path, 0.59s with the new one.\n- Plus a numeric OR-of-ranges filter: 0.93s old, 1.12s new.\n\nThe issue's 1.14s figure for the isolated filter did not reproduce on the current build. Comparing strings row by row through the dictionary selection is already cheap, and the fast path is the same speed or slightly slower.",
+  "notes": "- The cost model was wrong. Even a filter that passes every row on the Dictionary column (`col >= ''`) costs about 0.46s cumulative over 60M rows. The filter that rejects 75% costs 0.56\u20130.59s. So the time goes into per-vector scan overhead (the row-group filter loop, the validity filter, pinning or segment handling), not into the string compares.\n- The q19 lineitem scan costs 2.68s cumulative in my profile, not the 3.38s quoted in the issue.\n- A cheaper first check for this kind of idea is a same-build on/off comparison of the isolated predicate.\n- The optional `l_shipmode IN` filter is shown on the scan but does not seem to be applied per row: 7.5M rows come out of the scan, and the FILTER operator above it does the work, costing 0.09\u20130.18s.\n- Possible follow-ups:\n  - Profile per-vector scan overhead with perf on a filter that passes every row.\n  - Check whether optional IN filters on dictionary columns could be applied in the scan (that would need the adaptive-filter or optional-filter policy).\n- Saved in memory as dictionary-filter-no-gain.",
+  "finished": "2026-11-21T00:13:13-05:00"
+}

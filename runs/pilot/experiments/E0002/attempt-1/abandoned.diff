@@ -1,0 +1,105 @@
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..44fb279 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,11 +8,69 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+ namespace duckdb {
+ 
++//! Selectivity assumed for substring-match filters (e.g. LIKE '%abc%' or contains(col, 'abc')),
++//! which usually match far fewer rows than a generic filter.
++static constexpr double SUBSTRING_MATCH_SELECTIVITY = 0.04;
++
++static bool IsNonEmptyStringConstant(const Expression &expr) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return false;
++	}
++	auto &value = expr.Cast<BoundConstantExpression>().value;
++	return value.type().id() == LogicalTypeId::VARCHAR && !value.IsNull() && !StringValue::Get(value).empty();
++}
++
++static bool IsSubstringMatchExpression(const Expression &expr) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return false;
++	}
++	auto &func = expr.Cast<BoundFunctionExpression>();
++	if (func.children.size() < 2 || !IsNonEmptyStringConstant(*func.children[1])) {
++		return false;
++	}
++	auto &name = func.function.name;
++	if (name == "contains") {
++		return func.children.size() == 2;
++	}
++	if (name == "~~" || name == "like_escape") {
++		// the pattern must start with a wildcard and contain at least one literal character
++		auto &pattern = StringValue::Get(func.children[1]->Cast<BoundConstantExpression>().value);
++		if (pattern[0] != '%') {
++			return false;
++		}
++		for (auto c : pattern) {
++			if (c != '%' && c != '_') {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++static bool IsSubstringMatchFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::EXPRESSION_FILTER:
++		return IsSubstringMatchExpression(*filter.Cast<ExpressionFilter>().expr);
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conj = filter.Cast<ConjunctionAndFilter>();
++		for (auto &child : conj.child_filters) {
++			if (IsSubstringMatchFilter(*child)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	default:
++		return false;
++	}
++}
++
+ static ExpressionBinding GetChildColumnBinding(Expression &expr) {
+ 	auto ret = ExpressionBinding();
+ 	switch (expr.GetExpressionClass()) {
+@@ -119,6 +177,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 	if (!get.table_filters.filters.empty()) {
+ 		column_statistics = nullptr;
+ 		bool has_non_optional_filters = false;
++		bool has_substring_match_filter = false;
+ 		for (auto &it : get.table_filters.filters) {
+ 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
+ 				if (get.function.statistics_extended) {
+@@ -139,15 +198,19 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 
+ 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
+ 				has_non_optional_filters = true;
++				if (IsSubstringMatchFilter(*it.second)) {
++					has_substring_match_filter = true;
++				}
+ 			}
+ 		}
+ 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
+ 		// and there are other table filters (i.e cost > 50), use default selectivity.
+ 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+ 		if (!has_equality_filter && has_non_optional_filters) {
+-			cardinality_after_filters = MaxValue<idx_t>(
+-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+-			    1U);
++			auto selectivity = has_substring_match_filter ? SUBSTRING_MATCH_SELECTIVITY
++			                                              : RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			cardinality_after_filters =
++			    MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * selectivity), 1U);
+ 		}
+ 		if (base_table_cardinality == 0) {
+ 			cardinality_after_filters = 0;

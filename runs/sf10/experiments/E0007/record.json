@@ -1,0 +1,44 @@
+{
+  "id": "E0007",
+  "title": "Lazy-initialised perfect hash aggregate table with a bounded bit extension (re-timed pilot/E0004)",
+  "started": "2026-11-17T18:38:08-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "def3b70712bad8a11122246bfbb9dc3c752e4967",
+  "outcome": "retired",
+  "reasons": [
+    "q02 slower by 7.9% (6 ms), beyond its 7.8% threshold",
+    "no visible template faster beyond its noise (best: q05 -6.0%; needs at least -5%)"
+  ],
+  "attempts": 0,
+  "cost_usd": 0.0,
+  "summary": "Fixed the review finding: `perfect_ht_threshold` now limits perfect hashing again. In CanUsePerfectHashAggregate (plan_aggregate.cpp), the 18-bit/4MB-per-thread extension only applies while the setting is at its default (compared with StringUtil::ToUnsigned(PerfectHtThresholdSetting::DefaultValue)). When the user changes the value, it is a hard upper bound on bits, so 0 or 1 turns perfect hashing off. The lazy-initialisation changes in perfect_aggregate_hashtable.cpp/.hpp from the earlier attempt are unchanged; the reviewer found no problem with them. States are initialised on first touch in AddChunk and Combine, there is a touched counter with an early return in Combine, Scan and Combine skip unset flags 8 bytes at a time, and Destroy only visits set slots.\n\nThe build passes. There is no unittest runner here, so I could not run the three requested test files directly. Instead I reproduced their plan checks with `dbe-tool sql` on a 16-bit no-stats key: at the default it plans PERFECT_HASH_GROUP_BY, with threshold 0 or 1 it plans HASH_GROUP_BY (what perfect_ht.test lines 17-33 and test_filter_clause:428 rely on), and with threshold 20 it plans perfect (what test_perfect_ht.test sets). I also read the other plan-regex tests (union_single_dedup, issue8505); they still match because `HASH_GROUP_BY` is a substring of `PERFECT_HASH_GROUP_BY`.\n\nFull bench against the current best: geomean -3.0% (an earlier quick run gave +0.6%, with q03 and q14 noisy). q13 is about -19% on both full runs (95->77ms), q09 -8%, q17 -6.8%, q18 -3.6%. q14 showed +12% and +24% in two runs, but its plan has no grouped aggregate, and a third run gave -1.8%, so that was noise.",
+  "notes": "The extension now applies only while the setting is at its default value. If a user explicitly sets 12 (the default), it is treated as default and the extension applies; I accepted that because the engine does not expose whether a setting was explicitly set. The harness gives no way to run sqllogictests, so those checks were reproduced with dbe-tool sql. Bench noise is about \u00b110% per query on quick runs, and the geomean landed at -3.0%, close to the 2.7% bar. The real gain is concentrated in q13. Possible follow-up: tune the 4MB cap, or base acceptance on observed cardinality at runtime.",
+  "note": "Not a new implementation: pilot/E0004's reviewed change, re-checked and re-timed under the current protocol.",
+  "train_ratio": 0.9889155105367541,
+  "val_ratio": 1.0102227241134847,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0787477055683798,
+    "q03": 1.0169846687007562,
+    "q04": 0.970829943196021,
+    "q05": 0.9400115471100943,
+    "q07": 0.9762234483944316,
+    "q08": 0.9965028557569888,
+    "q09": 1.012077838292308,
+    "q13": 0.9732589471578378,
+    "q14": 0.9867821796714891,
+    "q16": 0.9637833360236326,
+    "q17": 0.979073575266927,
+    "q18": 0.9510910557921832,
+    "q19": 0.991902899150023,
+    "q22": 1.015174261150027
+  },
+  "improved": [],
+  "regressed": [
+    "q02"
+  ],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-17T18:53:09-05:00"
+}

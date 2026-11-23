@@ -1,0 +1,27 @@
+{
+  "id": "E0003",
+  "title": "Large perfect hash aggregate (up to 22 bits) with parallel combine and source",
+  "started": "2026-11-23T17:49:42-05:00",
+  "base": "a5a01aab8f9b6eee08f485765ed9dc96cd4fc0ae",
+  "candidate": "6eb234ec7c02002c890caaa9350dd138404e58ed",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.373923,
+  "summary": "The perfect hash aggregate can now be used for integer group keys whose combined range needs more bits than perfect_ht_threshold, up to 22 bits. Two guards protect this path:\n- Density: the estimated input must have at least half as many rows as the table has slots.\n- Memory: slots \u00d7 tuple size \u00d7 (threads + 1) must be at most max_memory / 8.\n\nFor tables with at least 2^16 slots, two steps now run in parallel:\n- Combine: the slots are split into 64 stripes, each with its own lock. Each thread starts on a different stripe. Combine work uses the thread-local table's memory arena, and the global table takes ownership of that arena under the global lock afterwards.\n- Source (GetData): it is now a parallel source over blocks of 16K slots, with a claim counter, a per-thread address vector and a per-thread arena for finalize.\n\nSmall tables keep the old serial behaviour (one source thread, single-lock combine).\n\nFiles changed: `plan_aggregate.cpp` (selection and guards), `physical_perfecthash_aggregate.{cpp,hpp}`, `perfect_aggregate_hashtable.{cpp,hpp}` (range-based Combine/Scan overloads, TakeAllocator, TotalGroups, GetAggregateAllocator).\n\nMeasured with `dbe-tool bench q13`: 646.0 ms \u2192 487.8 ms (-24.5%). Spot checks matched a radix-forced reference (same aggregate, grouped on the key cast to VARCHAR):\n- `count`, `min(varchar)`, `sum` and `list(... ORDER BY)` grouped on a dense FK over the whole table: confirmed by EXPLAIN to use PERFECT_HASH_GROUP_BY, results identical.\n- A string_agg variant and a NULL-key variant (CASE \u2026 NULL) also matched, but both planned as HASH_GROUP_BY, so they did not test the new path.",
+  "notes": "- **Threshold setting:** the large path ignores a lowered perfect_ht_threshold. Any range up to 22 bits that passes the guards still uses the perfect HA. If honouring a user-lowered threshold matters, gate the large path on the threshold being at its default.\n- **Estimates:** the density guard uses the estimated cardinality of the child plan. q13's input estimate (3M rows) is well below the actual 15M but still passes for a 2^21-slot table.\n- **Arena in combine:** the striped combine must use the local (source) table's arena, not the global one, because several threads write concurrently. That arena is then moved into the global table's stored_allocators.\n- **Not tested:** NULL keys on the perfect path. Slot-0 NULL handling is unchanged.\n- **Follow-up:** each thread still initialises a full table of up to 4M slots. Lazy or sparse local tables might help when there are many threads.",
+  "train_ratio": 0.6962102286038365,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.6962102286038365
+  },
+  "improved": [
+    "q13"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-23T17:57:22-05:00"
+}

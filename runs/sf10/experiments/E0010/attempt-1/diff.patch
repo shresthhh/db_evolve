@@ -1,0 +1,111 @@
+diff --git a/src/optimizer/rule/join_dependent_filter.cpp b/src/optimizer/rule/join_dependent_filter.cpp
+index 36cdf6d..913a383 100644
+--- a/src/optimizer/rule/join_dependent_filter.cpp
++++ b/src/optimizer/rule/join_dependent_filter.cpp
+@@ -50,20 +50,9 @@ static inline void ExtractConjunctedExpressions(Expression &expression,
+ 	}
+ }
+ 
+-unique_ptr<Expression> JoinDependentFilterRule::Apply(LogicalOperator &op, vector<reference<Expression>> &bindings,
+-                                                      bool &changes_made, bool is_root) {
+-	// Only applies to top-level FILTER expressions
+-	if ((op.type != LogicalOperatorType::LOGICAL_FILTER && op.type != LogicalOperatorType::LOGICAL_ANY_JOIN) ||
+-	    !is_root) {
+-		return nullptr;
+-	}
+-
+-	// The expression must be an OR
+-	auto &conjunction = bindings[0].get().Cast<BoundConjunctionExpression>();
+-	if (conjunction.GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
+-		return nullptr;
+-	}
+-
++//! Derive per-table filters implied by an OR of ANDs. Returns nullptr if nothing can be derived.
++static unique_ptr<BoundConjunctionExpression> DeriveFilter(BoundConjunctionExpression &conjunction) {
++	D_ASSERT(conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_OR);
+ 	// Must have at least one join-dependent AND expression
+ 	auto &children = conjunction.children;
+ 	bool eligible = false;
+@@ -112,17 +101,74 @@ unique_ptr<Expression> JoinDependentFilterRule::Apply(LogicalOperator &op, vecto
+ 	if (derived_filter->children.empty()) {
+ 		return nullptr; // Could not derive filters that can be pushed down
+ 	}
++	return derived_filter;
++}
+ 
+-	// Add the derived expression to the original expression with an AND
+-	auto result = make_uniq_base<Expression, BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+-	auto &result_conjunction = result->Cast<BoundConjunctionExpression>();
+-	result_conjunction.children.push_back(conjunction.Copy());
++unique_ptr<Expression> JoinDependentFilterRule::Apply(LogicalOperator &op, vector<reference<Expression>> &bindings,
++                                                      bool &changes_made, bool is_root) {
++	// Only applies to top-level FILTER expressions
++	if ((op.type != LogicalOperatorType::LOGICAL_FILTER && op.type != LogicalOperatorType::LOGICAL_ANY_JOIN) ||
++	    !is_root) {
++		return nullptr;
++	}
+ 
+-	if (derived_filter->children.size() == 1) {
+-		result_conjunction.children.push_back(std::move(derived_filter->children[0]));
+-	} else {
+-		result_conjunction.children.push_back(std::move(derived_filter));
++	auto &conjunction = bindings[0].get().Cast<BoundConjunctionExpression>();
++	if (conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
++		auto derived_filter = DeriveFilter(conjunction);
++		if (!derived_filter) {
++			return nullptr;
++		}
++		// Add the derived expression to the original expression with an AND
++		auto result = make_uniq_base<Expression, BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
++		auto &result_conjunction = result->Cast<BoundConjunctionExpression>();
++		result_conjunction.children.push_back(conjunction.Copy());
++		for (auto &derived : derived_filter->children) {
++			result_conjunction.children.push_back(std::move(derived));
++		}
++		return result;
++	}
++
++	// The root is an AND: derive filters from each of its OR children (e.g., after common terms were factored out)
++	D_ASSERT(conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND);
++	vector<unique_ptr<Expression>> new_children;
++	for (auto &child : conjunction.children) {
++		if (child->GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
++		    child->GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
++			continue;
++		}
++		auto derived_filter = DeriveFilter(child->Cast<BoundConjunctionExpression>());
++		if (!derived_filter) {
++			continue;
++		}
++		for (auto &derived : derived_filter->children) {
++			// Only add derived filters that are not present yet (otherwise the rewriter would never reach a fixpoint)
++			bool exists = false;
++			for (auto &existing : conjunction.children) {
++				if (existing->Equals(*derived)) {
++					exists = true;
++					break;
++				}
++			}
++			for (auto &existing : new_children) {
++				if (exists || existing->Equals(*derived)) {
++					exists = true;
++					break;
++				}
++			}
++			if (!exists) {
++				new_children.push_back(std::move(derived));
++			}
++		}
++	}
++	if (new_children.empty()) {
++		return nullptr;
++	}
++	auto result = conjunction.Copy();
++	auto &result_conjunction = result->Cast<BoundConjunctionExpression>();
++	for (auto &derived : new_children) {
++		result_conjunction.children.push_back(std::move(derived));
+ 	}
++	changes_made = true;
+ 	return result;
+ }
+ 

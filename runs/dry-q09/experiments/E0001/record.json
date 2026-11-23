@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "mock change (noop)",
+  "started": "2026-11-19T01:07:07-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "a25da0a899333e44ace12efb505360b7813522fb",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -0.6%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.0,
+  "summary": "appended a comment to assert.cpp",
+  "notes": "",
+  "train_ratio": 0.9938925536287943,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9938925536287943
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-19T01:10:59-05:00"
+}

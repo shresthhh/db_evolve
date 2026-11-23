@@ -1,0 +1,41 @@
+{
+  "id": "E0001",
+  "title": "Merge 8 specialised systems: q01, q02, q09, q13, q16, q18, q19, q21",
+  "started": "2026-11-22T18:46:07-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "a0c0f31d55818681351debfc8f06e06ce878af1b",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 3.3820706000000005,
+  "summary": "I applied the three patches that had conflicted (q13, q18, q21) by hand on top of the five that applied cleanly, combining the overlapping logic:\n\n1) **Join bloom filter (q09 + q21).** I kept q09's broader `CanUseBloomFilter` check: the first condition must be an equality and the filter is only pushed for that condition. It already covers q21's \"one equality plus extra non-equality conditions\" case. I applied q21's exact-bitmap BF (`SetKeyRange` is called when the BF is deferred) and the DELIM_GET `build_side_has_filter` change in full. In `JoinHashTable`:\n   - `InsertHashes` adds row hashes to the BF only if the BF is not exact and there is exactly one equality key. This is correct because the row hash covers equality keys only.\n   - `Finalize` inserts the raw values of the first key (layout column 0) when the BF is exact.\n   - Otherwise, with more than one equality key, `Finalize` gathers and hashes column 0 (q09's path).\n\n2) **Perfect aggregate HT (q01 + q13).** q01's `CombineReplicas` now takes a slot range [begin, end) and an allocator. `Combine` is `CombineRange` plus `StoreAllocator`. Folding the replicas moved into a new `FoldReplicas()`, which the operator calls once in `GetGlobalSourceState`, before the parallel ranged scans start. The legacy `Scan` still folds on its own. q13's striped parallel combine and parallel source, the larger dense perfect HT in `plan_aggregate`, and the perfect hash join for RIGHT joins (match propagation in `PrepareScanHT`, NULL-key skip, off-by-one duplicate check, RIGHT allowed in the optimizer's `compute_aggregates_anyway`) are applied as written.\n\n3) **q18.** Applied as written: the integral-compression `storage_offset` pushdown, the gap-split range-set OR filter when there are more keys than the IN-list threshold, the semi-join estimate that accounts for the right side, and the HAVING range selectivity. Its `has_cast` change (no bloom filter when there is an offset) sits next to q09's first-condition check.\n\nNothing was dropped or guarded, because no template got slower. The build succeeds and bench reported correct results. Bench against the current best:\n\n| Template | Change |\n|---|---|\n| q01 | -16.1% |\n| q02 | -54.0% |\n| q09 | -55.7% |\n| q13 | -39.1% |\n| q16 | -6.4% (re-run: -29.5%) |\n| q18 | -6.1% (re-run: -16.7%) |\n| q19 | -57.5% |\n| q21 | -37.5% |\n| geomean | -37.2% |",
+  "notes": "The conflicts were only textual: q09 and q21 both edited `JoinHashTable` bloom-filter insertion and `CanUseBloomFilter`, and q01 and q13 both rewrote `PerfectAggregateHashTable::Combine` and `Scan`. Behaviour I chose while merging:\n- An exact bloom filter on a multi-key join is filled from layout column 0 (the first equality key).\n- A hash bloom filter on a join with one equality key plus non-equality conditions now uses the stored row hash instead of gathering the key again. This is cheaper than q09's `conditions.size()` check.\n- Replicated perfect-aggregate states (only used for tables up to 1MB) and the parallel combine and scan (64K+ groups) rarely overlap. `FoldReplicas` up front keeps both correct when they do.\n\nThe first q16 and q18 numbers looked low (-6%); re-runs gave -29.5% and -16.7%, so the quick bench is noisy for those two.",
+  "train_ratio": 0.6734087696827512,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q01": 0.8877508775892159,
+    "q02": 0.5455181154208324,
+    "q09": 0.45440465099203403,
+    "q13": 0.6192912347659801,
+    "q16": 0.9101312097178625,
+    "q18": 0.9196160066428548,
+    "q19": 0.4723803443524035,
+    "q21": 0.7848556818361382
+  },
+  "improved": [
+    "q01",
+    "q02",
+    "q09",
+    "q13",
+    "q16",
+    "q18",
+    "q19",
+    "q21"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-22T19:02:21-05:00"
+}

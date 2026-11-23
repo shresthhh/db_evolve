@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp: the change only affects cardinality estimates. For any base-table scan that has a non-optional contains() filter (which includes LIKE '%x%' after the rewrite) with a constant VARCHAR needle of at least 3 bytes, the selectivity goes from 0.2 to 0.04. Nothing in it refers to TPC-H tables, columns or literals, so it applies to a natural class of queries. Other planners also give substring matches lower selectivity than generic filters; PostgreSQL, for example, lowers the estimate as the pattern gets longer.",
+      "No correctness risk: query results do not depend on cardinality estimates, so NULL needles, empty inputs and other types cannot produce wrong answers. A NULL needle or non-VARCHAR needle is explicitly excluded and falls back to 0.2.",
+      "Equality-filter estimates based on statistics still take precedence, and OPTIONAL_FILTER, OR, NOT, prefix and suffix filters are not matched. The guard is conservative.",
+      "Small nit, not blocking: the 0.04 factor is a fixed heuristic. A contains() needle of 3 or more characters that matches most rows could still be underestimated and flip a join the wrong way. This is the same kind of risk the existing flat DEFAULT_SELECTIVITY already has."
+    ],
+    "required_changes": []
+  }
+}

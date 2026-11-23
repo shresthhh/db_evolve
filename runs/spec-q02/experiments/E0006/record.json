@@ -1,0 +1,27 @@
+{
+  "id": "E0006",
+  "title": "Rewrite correlated MIN/MAX scalar subquery over a subset of the outer join into a window aggregate",
+  "started": "2026-11-20T00:00:46-05:00",
+  "base": "fa5fe35db0c12f28f99bbc74bbeb251e46e774c5",
+  "candidate": "cef9fd6aec98f7462c0cc3d125770f03d3623427",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.8153974,
+  "summary": "I added a WinMagic-style unnesting rewrite to `src/planner/binder/query_node/plan_select_node.cpp`. It is about 300 lines in an anonymous-namespace `SubqueryToWindowRewriter`, called at the start of `Binder::PlanFilter`. No header changes. The rewrite fires when one WHERE conjunct contains exactly one correlated scalar subquery and all of these hold:\n- The subquery plan is a projection of an ungrouped `min`/`max` (one argument, no DISTINCT, FILTER or ORDER BY) over cross products, filters and table scans.\n- The outer FROM is the same kind of tree.\n- Each subquery scan maps to a distinct outer scan of the same table (same catalog entry and function, no table or dynamic filters, no ordinality), and every column the subquery uses is projected by that outer scan.\n- Every remapped subquery conjunct equals an outer conjunct (flipped comparisons count as equal).\n- The outer conjuncts left unmatched reference only the extra outer scans.\n- Every correlated column has depth 1, belongs to an extra outer scan, appears directly in a matched equality (which rejects NULLs) and has a type that partitions exactly: integral, boolean, varchar, date, timestamp, decimal or uuid. Floats and nested types are refused.\n- Nothing is volatile and no other conjunct holds a subquery.\n\nThe plan then becomes Filter(other conjuncts) \u2192 Window(min/max(remapped argument) OVER (PARTITION BY correlated columns, whole partition)) \u2192 Filter(original conjunct with the subquery replaced by the window column). If any check fails, nothing is touched and the existing delim-join decorrelation runs.\n\nMeasured with `dbe-tool bench`, against the current best, results checked: q02 went from 51.7 to 29.7 ms (-42.5%) in one run and from 58.2 to 35.2 ms (-39.6%) in a full-bench run. EXPLAIN shows the LEFT_DELIM_JOIN, the second partsupp scan and the hash aggregate gone, replaced by one WINDOW over the 5-way join.\n\nEdge cases I ran on temp tables, with results checked by hand:\n- Duplicate keys in the extra table: min and max are unaffected.\n- NULL correlated keys and NULL aggregate values.\n- A comparison written in flipped orientation.\n- IS NOT DISTINCT FROM correlation: falls back.\n- An extra outer conjunct on a matched table: falls back, result empty as expected.\n- Self-join with the same table twice: falls back.\n- Two correlated columns: rewritten, partitions by both.\n- A correlated column inside the aggregate argument with no equality on it: falls back.\n- Empty input, and `count` instead of min/max: not rewritten.",
+  "notes": "- The rewrite sits in the binder, in `PlanFilter` before `PlanSubqueries`. At that point the WHERE conjuncts are still a single expression and the FROM is a raw cross-product tree, which makes the subset matching simple.\n- Scan matching is greedy: the first unused outer scan on the same table. A different assignment that would also work can be missed, but that only costs a fallback, never correctness.\n- Possible follow-ups:\n  - Extend to correlation without an equality, partitioning on all correlated columns. The earlier argument shows it is sound for exact-equality partitioning; it was left out to stay strict.\n  - Allow outer joins written with explicit `JOIN ... ON`. They are bound as comparison joins, so they currently fall back.\n  - Apply the same idea to EXISTS / IN subsets.\n- No dead ends. The first build worked and the gain matched or beat the hand rewrite measured in the issue (it promised about -20%).",
+  "train_ratio": 0.6099185453093705,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.6099185453093705
+  },
+  "improved": [
+    "q02"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T00:09:55-05:00"
+}

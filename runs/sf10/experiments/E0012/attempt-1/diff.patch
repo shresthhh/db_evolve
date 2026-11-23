@@ -1,0 +1,198 @@
+diff --git a/src/optimizer/compressed_materialization/compress_comparison_join.cpp b/src/optimizer/compressed_materialization/compress_comparison_join.cpp
+index ed5b7dd..588ba15 100644
+--- a/src/optimizer/compressed_materialization/compress_comparison_join.cpp
++++ b/src/optimizer/compressed_materialization/compress_comparison_join.cpp
+@@ -53,8 +53,13 @@ void CompressedMaterialization::CompressComparisonJoin(unique_ptr<LogicalOperato
+ 	// But we can try to compress the expression directly
+ 	column_binding_set_t probe_compress_bindings;
+ 	column_binding_set_t referenced_bindings;
++	// For RIGHT_SEMI/RIGHT_ANTI joins, the probe-side keys are only used to find matches. Compressing them would
++	// block the join filter pushdown (min/max and bloom filters) into the probe-side scan, so we leave them as-is
++	const bool compress_condition_columns = join.join_type != JoinType::RIGHT_SEMI &&
++	                                        join.join_type != JoinType::RIGHT_ANTI &&
++	                                        join.type != LogicalOperatorType::LOGICAL_DELIM_JOIN;
+ 	for (const auto &condition : join.conditions) {
+-		if (join.conditions.size() == 1 && join.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
++		if (join.conditions.size() == 1 && compress_condition_columns) {
+ 			// We only try to compress the join condition cols if there's one join condition
+ 			// Else it gets messy with the stats if one column shows up in multiple conditions
+ 			if (condition.left->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+diff --git a/src/optimizer/deliminator.cpp b/src/optimizer/deliminator.cpp
+index af0fb66..49f5f0c 100644
+--- a/src/optimizer/deliminator.cpp
++++ b/src/optimizer/deliminator.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/planner/operator/logical_delim_get.hpp"
+ #include "duckdb/planner/operator/logical_filter.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
++#include "duckdb/planner/operator/logical_projection.hpp"
+ #include "duckdb/planner/table_filter.hpp"
+ 
+ #include <algorithm>
+@@ -66,6 +67,126 @@ static bool HasBlockingOperator(const LogicalOperator &op) {
+ 	return false;
+ }
+ 
++static bool OperatorIsDelimGet(LogicalOperator &op);
++
++// Collects the non-DelimGet side bindings of the joins with DelimGets, if all their conditions are plain equalities.
++// RemoveJoinWithDelimGet adds an IS NOT NULL filter on each of these bindings
++static bool CollectEqualityBindings(const vector<JoinWithDelimGet> &joins, vector<ColumnBinding> &bindings) {
++	for (auto &join : joins) {
++		auto &comparison_join = join.join.get()->Cast<LogicalComparisonJoin>();
++		const idx_t delim_idx = OperatorIsDelimGet(*comparison_join.children[0]) ? 0 : 1;
++		for (auto &cond : comparison_join.conditions) {
++			auto &other_side = delim_idx == 0 ? *cond.right : *cond.left;
++			if (cond.comparison != ExpressionType::COMPARE_EQUAL ||
++			    other_side.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++				return false;
++			}
++			bindings.push_back(other_side.Cast<BoundColumnRefExpression>().binding);
++		}
++	}
++	return true;
++}
++
++// Whether the binding is (a pass-through of) one of the given bindings
++static bool TraceToBinding(const LogicalOperator &op, ColumnBinding binding, const vector<ColumnBinding> &targets) {
++	for (auto &target : targets) {
++		if (target == binding) {
++			return true;
++		}
++	}
++	optional_ptr<const Expression> expr;
++	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
++		auto &proj = op.Cast<LogicalProjection>();
++		if (binding.table_index == proj.table_index && binding.column_index < proj.expressions.size()) {
++			expr = proj.expressions[binding.column_index].get();
++		}
++	} else if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
++		auto &aggr = op.Cast<LogicalAggregate>();
++		if (binding.table_index == aggr.group_index && binding.column_index < aggr.groups.size()) {
++			expr = aggr.groups[binding.column_index].get();
++		}
++	}
++	if (expr) {
++		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++			return false;
++		}
++		binding = expr->Cast<BoundColumnRefExpression>().binding;
++	}
++	for (auto &child : op.children) {
++		if (TraceToBinding(*child, binding, targets)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++// Whether the subtree cannot introduce NULLs into columns that are non-NULL in its inputs
++// (no outer joins, no grouping sets, ...)
++static bool PreservesNonNullColumns(const LogicalOperator &op) {
++	switch (op.type) {
++	case LogicalOperatorType::LOGICAL_PROJECTION:
++	case LogicalOperatorType::LOGICAL_FILTER:
++	case LogicalOperatorType::LOGICAL_GET:
++	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
++	case LogicalOperatorType::LOGICAL_ORDER_BY:
++	case LogicalOperatorType::LOGICAL_LIMIT:
++	case LogicalOperatorType::LOGICAL_TOP_N:
++	case LogicalOperatorType::LOGICAL_DISTINCT:
++	case LogicalOperatorType::LOGICAL_WINDOW:
++		break;
++	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
++		if (op.Cast<LogicalAggregate>().grouping_sets.size() > 1) {
++			return false;
++		}
++		break;
++	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
++		switch (op.Cast<LogicalComparisonJoin>().join_type) {
++		case JoinType::INNER:
++		case JoinType::SEMI:
++		case JoinType::ANTI:
++		case JoinType::RIGHT_SEMI:
++		case JoinType::RIGHT_ANTI:
++			break;
++		default:
++			return false;
++		}
++		break;
++	default:
++		return false;
++	}
++	for (auto &child : op.children) {
++		if (!PreservesNonNullColumns(*child)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++// After all joins with DelimGets were removed with plain equality conditions, an IS NOT NULL filter was added on every
++// correlated column of the RHS. If the RHS cannot re-introduce NULLs, the RHS keys of the (former) delim join are
++// never NULL, so IS NOT DISTINCT FROM is equivalent to = for INNER/SEMI/ANTI joins
++static void TryConvertNotDistinctToEquality(LogicalComparisonJoin &delim_join, const vector<ColumnBinding> &bindings) {
++	switch (delim_join.join_type) {
++	case JoinType::INNER:
++	case JoinType::SEMI:
++	case JoinType::ANTI:
++		break;
++	default:
++		return;
++	}
++	auto &rhs = *delim_join.children[1];
++	if (!PreservesNonNullColumns(rhs)) {
++		return;
++	}
++	for (auto &cond : delim_join.conditions) {
++		if (cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM &&
++		    cond.right->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
++		    TraceToBinding(rhs, cond.right->Cast<BoundColumnRefExpression>().binding, bindings)) {
++			cond.comparison = ExpressionType::COMPARE_EQUAL;
++		}
++	}
++}
++
+ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op) {
+ 	root = op;
+ 
+@@ -98,6 +219,9 @@ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op
+ 			all_removed = false;
+ 		}
+ 
++		vector<ColumnBinding> not_null_bindings;
++		const bool plain_equality = CollectEqualityBindings(candidate.joins, not_null_bindings);
++
+ 		bool all_equality_conditions = true;
+ 		for (auto &join : candidate.joins) {
+ 			all_removed = RemoveJoinWithDelimGet(delim_join, candidate.delim_get_count, join.join.get(),
+@@ -109,6 +233,9 @@ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op
+ 		if (candidate.joins.size() == candidate.delim_get_count && all_removed) {
+ 			delim_join.type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+ 			delim_join.duplicate_eliminated_columns.clear();
++			if (plain_equality) {
++				TryConvertNotDistinctToEquality(delim_join, not_null_bindings);
++			}
+ 		}
+ 
+ 		// Only DelimJoins are ever created as SINGLE joins,
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..69c1e5f 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -210,12 +210,12 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	case JoinType::LEFT:
+ 	case JoinType::OUTER:
+ 	case JoinType::ANTI:
+-	case JoinType::RIGHT_ANTI:
+-	case JoinType::RIGHT_SEMI:
+ 		// cannot generate join filters for these join types
+ 		// mark/single - cannot change cardinality of probe side
+ 		// left/outer always need to include every row from probe side
+-		// FIXME: anti/right_anti - we could do this, but need to invert the join conditions
++		// FIXME: anti - we could do this, but need to invert the join conditions
++		// right_semi/right_anti are fine: their output comes from the build side and only depends on which
++		// build rows found a match, so probe rows without a matching key can safely be filtered out
+ 		return;
+ 	default:
+ 		break;

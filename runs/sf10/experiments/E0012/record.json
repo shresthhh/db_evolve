@@ -1,0 +1,41 @@
+{
+  "id": "E0012",
+  "title": "Join filters (min-max + bloom) for RIGHT_SEMI/RIGHT_ANTI probes and equality for deliminated EXISTS conditions",
+  "started": "2026-11-17T20:21:27-05:00",
+  "base": "91c2adb1348c7dfa520cb698e983253075aa86c3",
+  "candidate": "b6929da26e9e9170936084797dd3d9e34cd54b2d",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.2636338,
+  "summary": "The change is in three .cpp files (no headers) and builds. The only clear gain is q22, about 12\u201330% faster across runs. q04, the main target, is flat. All other visible templates are within noise on reruns.\n\n1. join_filter_pushdown_optimizer.cpp: GenerateJoinFilters no longer returns early for RIGHT_SEMI and RIGHT_ANTI. Their output comes from the build side and depends only on which build rows found a match, so probe rows with no matching key can be dropped. MARK, SINGLE, LEFT, OUTER and ANTI still return early. compute_aggregates_anyway stays INNER-only.\n2. deliminator.cpp: when a delim join is fully deliminated, its type is INNER, SEMI or ANTI, and every removed correlation condition was a plain `=` on column refs, the `IS NOT DISTINCT FROM` conditions become `=`. Those removals already added IS NOT NULL filters on the subquery-side columns. A condition is converted only if two checks pass:\n   - Its RHS column ref traces back to one of those filtered columns, through column-ref projections and aggregate group keys.\n   - The subquery side has only operators that cannot add NULLs: projection, filter, get, cross product, order by, limit, top-n, distinct, window, aggregates with one grouping set, and inner/semi/anti/right-semi/right-anti comparison joins.\n3. compress_comparison_join.cpp (not in the plan): for RIGHT_SEMI/RIGHT_ANTI joins, the join-key columns are no longer compressed. Without this, parts A and B had no effect on q04. Compressed materialization runs before join filter pushdown and wraps the probe key in `__internal_compress_integral`, which the pushdown cannot pass through. Payload columns are still compressed.\n\nMeasured on q04.m0: the join condition went from `IS NOT DISTINCT FROM` to `=`. The lineitem scan now gets min/max plus a bloom filter on the key. Rows into the join fell from 37.9M to 1.7M, and join CPU from 0.83\u20130.90s to 0.30s. But the scan's CPU rose by about as much, since the bloom filter is checked on all 60M rows. So q04 wall time is flat: +1%, +4%, -5% across bench runs.\n\nLast full bench: q22 -11.7% (earlier runs -18% and -30%), geomean -1.7%. q02, q03 and q07 showed +5\u20138% once, and reran at -3%, -3% and 0%. q16\u2013q19 showed +16\u201330% once and were within noise on rerun.\n\nCorrectness: each check was compared against a run with join_filter_pushdown, deliminator and compressed_materialization all disabled, and all matched:\n- EXISTS and NOT EXISTS with NULL keys on both sides, in both directions.\n- IN and NOT IN.\n- NOT EXISTS with `IS NOT DISTINCT FROM` in the correlation.\n- A ROLLUP inside a correlated subquery.\n- A UNION ALL inside NOT EXISTS.\n- A LATERAL join.\n- On the benchmark tables: a RIGHT_ANTI case (NOT EXISTS with a selective inner filter, so the build has keys missing from the probe), an IN subquery, and an EXISTS.",
+  "notes": "- Main surprise: compressed materialization (inside STATISTICS_PROPAGATION, which runs before JOIN_FILTER_PUSHDOWN) compresses join keys of selective joins. Semi joins are selective by nature, so their keys get compressed. PushdownJoinFilterExpression cannot pass through the compress functions, so no join filter ever reaches the probe scan. The same probably silently blocks join filters for selective INNER joins, which may be worth checking. A broader fix would teach the pushdown to handle compress functions, but min/max and bloom values would then be in the compressed domain, so that is not trivial.\n- q04 did not get the expected gain. The bloom filter cuts the probe rows 22x and the join CPU drops by 0.55s, but the scan CPU rises by about 1s. The remaining cost is the 60M-row scan plus the `l_commitdate < l_receiptdate` filter.\n- Follow-up idea: let the bloom/min-max filter run before the residual LOGICAL_FILTER, or order the column scan so the key column is checked first and the others are fetched only for surviving rows. That would cut the date-column decoding.\n- Syntax note for future tests: `IS NOT DISTINCT FROM ANY (subquery)` is not supported by this parser.",
+  "train_ratio": 0.9798176140501934,
+  "val_ratio": 1.0214054631193652,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.929883626364279,
+    "q03": 0.9924671190261393,
+    "q04": 1.0166525074700121,
+    "q05": 1.0208740813946553,
+    "q07": 0.9976058853913655,
+    "q08": 0.9903481422257175,
+    "q09": 0.9714836464331679,
+    "q13": 1.0306210344071889,
+    "q14": 1.021063661269666,
+    "q16": 1.020946850550672,
+    "q17": 0.9951738542064974,
+    "q18": 0.9285068123072535,
+    "q19": 0.9512831149687303,
+    "q22": 0.8657904044613591
+  },
+  "improved": [
+    "q18",
+    "q22"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-17T22:44:18-05:00"
+}

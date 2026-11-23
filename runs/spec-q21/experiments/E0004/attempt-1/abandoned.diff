@@ -1,0 +1,106 @@
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..916200f 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -1,6 +1,7 @@
+ #include "duckdb/planner/filter/bloom_filter.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+ #include "duckdb/common/operator/subtract.hpp"
++#include "duckdb/common/types/hash.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -93,6 +94,66 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 	}
+ }
+ 
++// Probe flat, NULL-free integer keys directly. Consecutive equal keys (common for data clustered or sorted on the
++// key) reuse the previous row's hash and lookup result. Equal keys hash identically, so results are unchanged.
++template <class T>
++static idx_t TemplatedLookupRuns(const BloomFilter &bf, const Vector &keys_v, const SelectionVector &sel,
++                                 const idx_t count, SelectionVector &result_sel) {
++	const auto keys = FlatVector::GetData<T>(keys_v);
++	idx_t found_count = 0;
++	if (count == 0) {
++		return 0;
++	}
++	const bool has_sel = sel.IsSet();
++	T prev = keys[has_sel ? sel.get_index(0) : 0];
++	idx_t prev_found = bf.LookupOne(Hash<T>(prev));
++	for (idx_t i = 0; i < count; i++) {
++		const T key = keys[has_sel ? sel.get_index(i) : i];
++		if (key != prev) {
++			prev = key;
++			prev_found = bf.LookupOne(Hash<T>(key));
++		}
++		result_sel.set_index(found_count, i);
++		found_count += prev_found;
++	}
++	return found_count;
++}
++
++static bool TryLookupRuns(const BloomFilter &bf, const Vector &keys_v, const SelectionVector &sel, const idx_t count,
++                          SelectionVector &result_sel, idx_t &found_count) {
++	if (keys_v.GetVectorType() != VectorType::FLAT_VECTOR || !FlatVector::Validity(keys_v).AllValid()) {
++		return false;
++	}
++	switch (keys_v.GetType().InternalType()) {
++	case PhysicalType::INT8:
++		found_count = TemplatedLookupRuns<int8_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::INT16:
++		found_count = TemplatedLookupRuns<int16_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::INT32:
++		found_count = TemplatedLookupRuns<int32_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::INT64:
++		found_count = TemplatedLookupRuns<int64_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::UINT8:
++		found_count = TemplatedLookupRuns<uint8_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::UINT16:
++		found_count = TemplatedLookupRuns<uint16_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::UINT32:
++		found_count = TemplatedLookupRuns<uint32_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	case PhysicalType::UINT64:
++		found_count = TemplatedLookupRuns<uint64_t>(bf, keys_v, sel, count, result_sel);
++		return true;
++	default:
++		return false;
++	}
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+@@ -101,16 +162,17 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		state.current_capacity = approved_tuple_count;
+ 	}
+ 
+-	HashInternal(keys_v, sel, approved_tuple_count, state);
+-
+ 	idx_t found_count;
+-	if (state.hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+-		const auto constant_hash = *ConstantVector::GetData<hash_t>(state.hashes_v);
+-		const bool found = this->filter.LookupOne(constant_hash);
+-		found_count = found ? approved_tuple_count : 0;
+-	} else {
+-		state.hashes_v.Flatten(approved_tuple_count);
+-		found_count = this->filter.LookupHashes(state.hashes_v, state.bf_sel, approved_tuple_count);
++	if (!TryLookupRuns(this->filter, keys_v, sel, approved_tuple_count, state.bf_sel, found_count)) {
++		HashInternal(keys_v, sel, approved_tuple_count, state);
++		if (state.hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
++			const auto constant_hash = *ConstantVector::GetData<hash_t>(state.hashes_v);
++			const bool found = this->filter.LookupOne(constant_hash);
++			found_count = found ? approved_tuple_count : 0;
++		} else {
++			state.hashes_v.Flatten(approved_tuple_count);
++			found_count = this->filter.LookupHashes(state.hashes_v, state.bf_sel, approved_tuple_count);
++		}
+ 	}
+ 
+ 	// all the elements have been found, we don't need to translate anything

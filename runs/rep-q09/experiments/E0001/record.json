@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "Length-aware selectivity for substring contains() scan filters",
+  "started": "2026-11-23T11:00:27-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "be9721f0374e6dc16a5bde75cf58e00e80ad798d",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.5295816,
+  "summary": "The q09 benchmark went from 1075.0 ms to 698.2 ms (-35.0%) in the bench quick check (2 parameter bindings, 4 hot runs each). Results matched the current best. Single-query profile of q09.m0: 1.93s before, 1.17s after.\n\nThe change is in RelationStatisticsHelper::InspectTableFilter (src/optimizer/join_order/relation_statistics_helper.cpp). I added a case for EXPRESSION_FILTER that estimates selectivity for contains(col, 'literal'):\n- It only matches when the column is a column ref and the second argument is a non-NULL, non-empty VARCHAR constant.\n- Estimate = ceil(cardinality \u00d7 max(0.2 \u00d7 0.75^L, 0.01)), at least 1 row, where L is the literal length (capped at 64).\n- Every other expression filter, including NOT and OR, still returns the input cardinality, so the default 0.2 fallback is unchanged for them.\n- The existing CONJUNCTION_AND case already takes the minimum over its children, so contains ANDed with other filters on the same column is covered.\nI added one include (expression_filter.hpp).\n\nThe plan change in q09 differs from what the issue expected:\n- Before: lineitem was probed against a part-only build side, then probed the orders build side (15M rows, 3.63s) and the partsupp\u22c8supplier\u22c8nation build side (8M rows, 3.04s).\n- After: part\u22c8partsupp (436K rows, partsupp reduced by a Bloom filter from part) is the build side for the lineitem probe (join 2.36s). The 3.27M-row result of that join is the build side for the orders join, with orders probing it (1.84s). Supplier\u22c8nation is joined last (0.03s).\n- So the orders join flipped as hoped. The partsupp join was not flipped; the join order was rearranged so partsupp joins part first.\n\nI only ran EXPLAIN ANALYZE on q09.m0. The other three instances are covered only by the bench timing, not by a plan check.",
+  "notes": "In the new q09 plan the lineitem scan no longer has a Bloom filter: it emits all 60M rows (3.28s scan) into a join that keeps 3.27M. Before, it had a Bloom filter on l_partkey from part. The next step is to push a Bloom filter from the part\u22c8partsupp build side (both keys, or at least the part key) onto the lineitem scan, which could save a lot more. The orders join (1.84s) is now probed by orders, which is where the issue's \"BF on flipped probe\" idea applies.",
+  "train_ratio": 0.705712885693901,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.705712885693901
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-23T11:05:53-05:00"
+}

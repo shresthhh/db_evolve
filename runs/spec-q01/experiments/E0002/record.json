@@ -1,0 +1,16 @@
+{
+  "id": "E0002",
+  "title": "Bitpacking select: produce flat compacted vectors for filtered scans",
+  "started": "2026-11-19T11:10:25-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.5265907999999999,
+  "summary": "I added a `select` callback for bitpacking in src/storage/compression/bitpacking.cpp, but it made q01 no faster, so I'm abandoning it. How it works: I pulled the body of BitpackingScanPartial out into BitpackingScanToBuffer<T>, which writes to a raw T* (scan-state handling is unchanged). BitpackingSelect<T> uses it to decompress all vector_count rows into a per-scan-state scratch buffer of STANDARD_VECTOR_SIZE values, allocated on first use. It then copies out the selected rows (result[i] = scratch[sel[i]]) into a flat result. I registered it with `bitpacking.select = BitpackingSelect<T>`. It builds, and results match the current best. A temporary throw confirmed the filtered q01 scan really takes this path for the bitpacked payload columns: they all use bitpacking, and their validity segments use Constant compression. Measured on q01 over four bench runs: -4.5%, +1.1%, +0.6%, 0.0% (about 340-373 ms both ways). That is noise, nowhere near the 5-12% the issue expected.",
+  "notes": "- **The slicing is not where the filtered-scan cost goes.** Turning dictionary-sliced payload vectors into flat ones did not move q01. Single runs with dbe-tool sql still show the gap after the change: a filtered sum/avg query takes about 415 ms, against about 300 ms for the same query with no filter plus max(l_shipdate). One run each, so only a rough number.\n- **Where the remaining cost probably is:** this is my guess, not measured.\n  - The filter column is bitpacked, and bitpacking has no `filter` callback. ColumnData::Filter therefore scans it in full, evaluates the filter generically, and then Slices it.\n  - The two Dictionary-compressed VARCHAR columns (l_returnflag and l_linestatus, which are the group keys) also have no `select` callback. Only dict_fsst has one, so they still go through ColumnData::Select and come out sliced. They then pass through the compress_string projections into the perfect-hash aggregate.\n  - The perfect-hash group-by is the biggest operator in the profile at 1.54 s, against 2.49 s for the scan.\n- **Possible follow-ups:**\n  - A bitpacking `filter` callback for range comparisons on FOR/CONSTANT groups.\n  - A select for the classic Dictionary compression.\n  - Before building either, check the aggregate's handling of dictionary-vector group keys under a selection vector.\n- **Side note:** in BitpackingScanPartial, CONSTANT mode fills `remaining` values rather than `to_scan`. It stays within the result vector, so it's harmless, but it writes past the end of the current metadata group.",
+  "finished": "2026-11-19T11:14:52-05:00"
+}

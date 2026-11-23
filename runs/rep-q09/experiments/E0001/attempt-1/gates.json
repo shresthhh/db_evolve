@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp InspectTableFilter: the new EXPRESSION_FILTER case changes only the cardinality estimate. Query results can't change; only plans can. The heuristic (selectivity falls with literal length, with a 1% floor) is general, close to PostgreSQL's LIKE selectivity, and refers to no table, column, literal or data size.",
+      "Guards are sound. A NULL or empty literal, a non-constant pattern, NOT, OR, and any other expression all return the unchanged cardinality. The result is clamped to at least 1 row and never more than the incoming estimate.",
+      "Minor: `contains` also has LIST and MAP overloads. A list column searched with a VARCHAR constant, e.g. contains(list_col, 'abc'), would get the same string-length heuristic. This only affects the estimate and is acceptable.",
+      "Risk is limited to plan regressions when a long literal is a common substring. The 1% floor bounds how far the estimate can drop."
+    ],
+    "required_changes": []
+  }
+}

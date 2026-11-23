@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "Correctness: every raw-group hash site in the distinct radix HTs now goes through HashGroups. The radix sink reaches it through AddChunk(groups,payload,filter) at radix_partitioned_hashtable.cpp:573, and FindOrCreateGroups(groups,addresses,new_groups) also uses it. TryAddCompressedGroups, which hashes on its own, is skipped when the option is on. Combine/FlushMove (aggregate_hashtable.cpp:938), resize, repartition and spilling all reuse the stored hash column. So every tuple in one table gets the same hash function, and deduplication stays exact.",
+      "Column order: in DistinctAggregateData the grouping_set is an ordered std::set of group indices (< group_by_size) plus distinct child indices (>= group_by_size). The group columns therefore form a prefix of the distinct HT's columns, and partition_key_count = grouping_sets[i].size() covers exactly that prefix. SetPartitionKeyCount turns itself off unless the key is a strict prefix (layout ColumnCount()-1 = number of group columns).",
+      "Bit splice: only bits [36,48) (Mask(MAX_RADIX_BITS)) are replaced. Partition selection for any radix_bits <= 12 reads only those bits, and salt and pointer-table bits still come from the full hash. Probe quality is unchanged and partitioning is consistent across repartitioning.",
+      "Only distinct radix tables get the setting. The main HT, ungrouped DISTINCT, the empty grouping set, the window and recursive-CTE uses of GroupedAggregateHashTable, and the join correlated counts are all untouched.",
+      "The gate (estimated_cardinality >= 4096) depends on the planner estimate and the shape of the query, not on names, literals or this dataset. If the estimate is wrong, only performance suffers (partition skew); results stay correct.",
+      "Small and maintainable. No benchmark, settings or measurement code is touched."
+    ],
+    "required_changes": []
+  }
+}

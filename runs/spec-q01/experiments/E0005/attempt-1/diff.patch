@@ -1,0 +1,217 @@
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 2d0f674..deb1c5f 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -66,6 +66,165 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 		}
+ 	}
+ 	RowOperations::InitializeStates(*layout_ptr, addresses, *FlatVector::IncrementalSelectionVector(), init_count);
++
++	InitializeFusedUpdate();
++}
++
++// mirrors of the int64 sum and average states (SumState<int64_t> / AvgState<int64_t> in core_functions)
++struct FusedSumState {
++	bool isset;
++	int64_t value;
++};
++struct FusedAvgState {
++	uint64_t count;
++	int64_t value;
++};
++static_assert(sizeof(FusedSumState) == 16 && offsetof(FusedSumState, value) == 8, "unexpected sum state layout");
++static_assert(sizeof(FusedAvgState) == 16 && offsetof(FusedAvgState, value) == 8, "unexpected avg state layout");
++
++void PerfectAggregateHashTable::InitializeFusedUpdate() {
++	use_fused_update = false;
++	fused_aggregates.clear();
++	auto &aggregates = layout_ptr->GetAggregates();
++	if (aggregates.empty()) {
++		return;
++	}
++	idx_t payload_idx = 0;
++	idx_t state_offset = 0;
++	for (auto &aggr : aggregates) {
++		if (aggr.filter || aggr.IsDistinct() || aggr.function.HasStateDestructorCallback()) {
++			return;
++		}
++		const auto state_size = aggr.function.GetStateSizeCallback()(aggr.function);
++		FusedAggregate fused;
++		fused.state_offset = state_offset;
++		fused.payload_idx = payload_idx;
++		const auto &name = aggr.function.name;
++		if (aggr.child_count == 0) {
++			if (name != "count_star" || state_size != sizeof(int64_t)) {
++				return;
++			}
++			fused.kind = FusedAggregateKind::COUNT_STAR;
++		} else {
++			if (aggr.child_count != 1 || payload_idx >= payload_types.size()) {
++				return;
++			}
++			const auto input_type = payload_types[payload_idx].InternalType();
++			if (input_type != PhysicalType::INT32 && input_type != PhysicalType::INT64) {
++				return;
++			}
++			const bool is_int32 = input_type == PhysicalType::INT32;
++			if (name == "sum_no_overflow" && state_size == sizeof(FusedSumState)) {
++				fused.kind = is_int32 ? FusedAggregateKind::SUM_INT32 : FusedAggregateKind::SUM_INT64;
++			} else if (name == "avg" && state_size == sizeof(FusedAvgState)) {
++				fused.kind = is_int32 ? FusedAggregateKind::AVG_INT32 : FusedAggregateKind::AVG_INT64;
++			} else {
++				return;
++			}
++		}
++		fused_aggregates.push_back(fused);
++		payload_idx += aggr.child_count;
++		state_offset += aggr.payload_size;
++	}
++	use_fused_update = true;
++}
++
++namespace {
++
++struct FusedInput {
++	const data_t *data;
++	const SelectionVector *sel;
++	const ValidityMask *validity;
++};
++
++} // namespace
++
++template <class T, bool IS_SUM, bool HAS_NULLS>
++static void FusedColumnLoop(const uintptr_t *__restrict address_data, const FusedInput &input, idx_t offset,
++                            idx_t count) {
++	const auto data = reinterpret_cast<const T *>(input.data);
++	const auto &sel = *input.sel;
++	for (idx_t i = 0; i < count; i++) {
++		const auto idx = sel.get_index(i);
++		if (HAS_NULLS && !input.validity->RowIsValid(idx)) {
++			continue;
++		}
++		const auto state = reinterpret_cast<data_ptr_t>(address_data[i]) + offset;
++		if (IS_SUM) {
++			auto &sum_state = *reinterpret_cast<FusedSumState *>(state);
++			sum_state.isset = true;
++			sum_state.value += int64_t(data[idx]);
++		} else {
++			auto &avg_state = *reinterpret_cast<FusedAvgState *>(state);
++			avg_state.count++;
++			avg_state.value += int64_t(data[idx]);
++		}
++	}
++}
++
++template <bool HAS_NULLS>
++static void FusedUpdateLoop(const uintptr_t *address_data, const FusedInput *inputs, const idx_t *offsets,
++                            const uint8_t *kinds, idx_t aggr_count, idx_t count) {
++	using KIND = uint8_t;
++	for (idx_t k = 0; k < aggr_count; k++) {
++		const auto offset = offsets[k];
++		switch (kinds[k]) {
++		case KIND(0): // COUNT_STAR
++			for (idx_t i = 0; i < count; i++) {
++				(*reinterpret_cast<int64_t *>(address_data[i] + offset))++;
++			}
++			break;
++		case KIND(1): // SUM_INT32
++			FusedColumnLoop<int32_t, true, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(2): // SUM_INT64
++			FusedColumnLoop<int64_t, true, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(3): // AVG_INT32
++			FusedColumnLoop<int32_t, false, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(4): // AVG_INT64
++			FusedColumnLoop<int64_t, false, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		default:
++			break;
++		}
++	}
++}
++
++void PerfectAggregateHashTable::FusedUpdate(DataChunk &payload, idx_t count) {
++	// FusedUpdateLoop relies on these numeric values
++	static_assert(uint8_t(FusedAggregateKind::COUNT_STAR) == 0 && uint8_t(FusedAggregateKind::SUM_INT32) == 1 &&
++	                  uint8_t(FusedAggregateKind::SUM_INT64) == 2 && uint8_t(FusedAggregateKind::AVG_INT32) == 3 &&
++	                  uint8_t(FusedAggregateKind::AVG_INT64) == 4,
++	              "unexpected fused aggregate kind values");
++	const idx_t aggr_count = fused_aggregates.size();
++	unsafe_vector<UnifiedVectorFormat> formats(aggr_count);
++	unsafe_vector<FusedInput> inputs(aggr_count);
++	unsafe_vector<idx_t> offsets(aggr_count);
++	unsafe_vector<uint8_t> kinds(aggr_count);
++	bool has_nulls = false;
++	for (idx_t k = 0; k < aggr_count; k++) {
++		auto &fused = fused_aggregates[k];
++		offsets[k] = fused.state_offset;
++		kinds[k] = static_cast<uint8_t>(fused.kind);
++		if (fused.kind == FusedAggregateKind::COUNT_STAR) {
++			inputs[k] = {nullptr, nullptr, nullptr};
++			continue;
++		}
++		auto &format = formats[k];
++		payload.data[fused.payload_idx].ToUnifiedFormat(count, format);
++		inputs[k] = {format.data, format.sel, &format.validity};
++		if (!format.validity.AllValid()) {
++			has_nulls = true;
++		}
++	}
++	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
++	if (has_nulls) {
++		FusedUpdateLoop<true>(address_data, inputs.data(), offsets.data(), kinds.data(), aggr_count, count);
++	} else {
++		FusedUpdateLoop<false>(address_data, inputs.data(), offsets.data(), kinds.data(), aggr_count, count);
++	}
+ }
+ 
+ PerfectAggregateHashTable::~PerfectAggregateHashTable() {
+@@ -164,6 +323,10 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 	}
+ 
+ 	// after finding the group location we update the aggregates
++	if (use_fused_update) {
++		FusedUpdate(payload, groups.size());
++		return;
++	}
+ 	idx_t payload_idx = 0;
+ 	auto &aggregates = layout_ptr->GetAggregates();
+ 	RowOperationsState row_state(*aggregate_allocator);
+diff --git a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+index 0cec696..7db3629 100644
+--- a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+@@ -48,6 +48,20 @@ protected:
+ 	//! Whether replicas > 0 have been folded into replica 0
+ 	bool replicas_folded;
+ 
++	//! Kinds of aggregates the fused single-pass update supports
++	enum class FusedAggregateKind : uint8_t { COUNT_STAR, SUM_INT32, SUM_INT64, AVG_INT32, AVG_INT64 };
++	struct FusedAggregate {
++		FusedAggregateKind kind;
++		//! Offset of the state within the tuple
++		idx_t state_offset;
++		//! Index of the input column in the payload chunk (unused for COUNT_STAR)
++		idx_t payload_idx;
++	};
++	//! If all aggregates are simple int64-state sum/avg/count_star, their states are updated directly with typed
++	//! loops instead of going through the generic aggregate update callbacks
++	bool use_fused_update;
++	vector<FusedAggregate> fused_aggregates;
++
+ 	// The actual pointer to the data
+ 	data_ptr_t data;
+ 	//! The owned data of the HT
+@@ -71,6 +85,10 @@ private:
+ 	void Destroy();
+ 	//! Combine the states of replicas 1..replica_count-1 of "source" into replica 0 of this HT
+ 	void CombineReplicas(PerfectAggregateHashTable &source, idx_t first_replica);
++	//! Classify the aggregates and enable the fused update if all of them are supported
++	void InitializeFusedUpdate();
++	//! Update all aggregate states of the rows with typed loops (requires use_fused_update)
++	void FusedUpdate(DataChunk &payload, idx_t count);
+ };
+ 
+ } // namespace duckdb

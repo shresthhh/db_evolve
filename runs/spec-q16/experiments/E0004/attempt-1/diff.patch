@@ -1,0 +1,15 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..f08c07a 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -753,7 +753,9 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
+ 			// Append everything that belongs to an empty group
+ 			optional_ptr<PartitionedTupleData> data;
+ 			optional_ptr<PartitionedTupleDataAppendState> append_state;
+-			if (radix_bits >= UNPARTITIONED_RADIX_BITS_THRESHOLD &&
++			// Staging small appends in the unpartitioned collection only pays off for fixed-size rows:
++			// with a heap (e.g., non-inlined strings), repartitioning has to copy the heap and recompute pointers
++			if (layout_ptr->AllConstant() && radix_bits >= UNPARTITIONED_RADIX_BITS_THRESHOLD &&
+ 			    new_entry_count / RadixPartitioning::NumberOfPartitions(radix_bits) <= 4) {
+ 				TupleDataCollection::ToUnifiedFormat(state.unpartitioned_append_state.chunk_state, state.group_chunk);
+ 				data = unpartitioned_data.get();

@@ -1,0 +1,97 @@
+diff --git a/src/include/duckdb/storage/table/row_group_collection.hpp b/src/include/duckdb/storage/table/row_group_collection.hpp
+index ee0cae8..7ec38ca 100644
+--- a/src/include/duckdb/storage/table/row_group_collection.hpp
++++ b/src/include/duckdb/storage/table/row_group_collection.hpp
+@@ -167,6 +167,9 @@ public:
+ 	idx_t GetRowGroupSize() const {
+ 		return row_group_size;
+ 	}
++	//! Number of vectors handed out per parallel scan task. Collections with few row groups compared to the thread
++	//! count are split into sub-row-group morsels so that all threads can participate.
++	static idx_t GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count);
+ 	void SetRowGroupAppendMode(RowGroupAppendMode mode);
+ 	//! Returns the total amount of segments - use sparingly, as this forces all segments to be loaded
+ 	idx_t GetSegmentCount();
+diff --git a/src/storage/data_table.cpp b/src/storage/data_table.cpp
+index 456ca86..b7bb64c 100644
+--- a/src/storage/data_table.cpp
++++ b/src/storage/data_table.cpp
+@@ -15,6 +15,7 @@
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/parser/constraints/list.hpp"
+ #include "duckdb/planner/constraints/list.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+@@ -272,6 +273,10 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
+ 	idx_t parallel_scan_vector_count = row_group_size / STANDARD_VECTOR_SIZE;
+ 	if (ClientConfig::GetConfig(context).verify_parallelism) {
+ 		parallel_scan_vector_count = 1;
++	} else {
++		auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++		parallel_scan_vector_count =
++		    RowGroupCollection::GetParallelScanMorselVectors(GetTotalRows(), row_group_size, threads);
+ 	}
+ 	idx_t parallel_scan_tuple_count = STANDARD_VECTOR_SIZE * parallel_scan_vector_count;
+ 	return GetTotalRows() / parallel_scan_tuple_count + 1;
+diff --git a/src/storage/table/row_group_collection.cpp b/src/storage/table/row_group_collection.cpp
+index 9adc32f..c7b3d32 100644
+--- a/src/storage/table/row_group_collection.cpp
++++ b/src/storage/table/row_group_collection.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
+ #include "duckdb/parallel/task_executor.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
+ #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+ #include "duckdb/storage/data_table.hpp"
+@@ -275,6 +276,18 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
+ 	return row_group.GetNode().InitializeScanWithOffset(state, row_group, vector_index);
+ }
+ 
++idx_t RowGroupCollection::GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count) {
++	// aim for a few morsels per thread, but never smaller than the minimum morsel size or larger than a row group
++	static constexpr idx_t MORSELS_PER_THREAD = 4;
++	static constexpr idx_t MIN_MORSEL_VECTORS = 4;
++	auto row_group_vectors = MaxValue<idx_t>(1, row_group_size / STANDARD_VECTOR_SIZE);
++	auto total_vectors = (total_rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
++	auto target_morsels = MaxValue<idx_t>(1, thread_count) * MORSELS_PER_THREAD;
++	auto morsel_vectors = (total_vectors + target_morsels - 1) / target_morsels;
++	morsel_vectors = MaxValue<idx_t>(morsel_vectors, MIN_MORSEL_VECTORS);
++	return MinValue<idx_t>(morsel_vectors, row_group_vectors);
++}
++
+ void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
+ 	state.collection = this;
+ 	state.row_groups = GetRowGroups();
+@@ -307,12 +320,24 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
+ 			auto row_start = state.current_row_group->GetRowStart();
+ 			collection = state.collection;
+ 			row_group = state.current_row_group;
++			idx_t morsel_vectors;
+ 			if (ClientConfig::GetConfig(context).verify_parallelism) {
++				morsel_vectors = 1;
++			} else {
++				auto scan_rows = state.max_row - state.row_groups->GetBaseRowId();
++				auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++				morsel_vectors = GetParallelScanMorselVectors(scan_rows, collection->GetRowGroupSize(), threads);
++			}
++			if (morsel_vectors * STANDARD_VECTOR_SIZE < current_row_group.count || state.vector_index > 0) {
++				// scan a part of the row group
+ 				vector_index = state.vector_index;
+-				max_row = row_start + MinValue<idx_t>(current_row_group.count,
+-				                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
+-				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
+-				state.vector_index++;
++				auto morsel_start = STANDARD_VECTOR_SIZE * vector_index;
++				auto morsel_end =
++				    MinValue<idx_t>(current_row_group.count, morsel_start + STANDARD_VECTOR_SIZE * morsel_vectors);
++				D_ASSERT(morsel_start < current_row_group.count);
++				max_row = row_start + morsel_end;
++				state.processed_rows += morsel_end - morsel_start;
++				state.vector_index += morsel_vectors;
+ 				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
+ 					state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+ 					state.vector_index = 0;

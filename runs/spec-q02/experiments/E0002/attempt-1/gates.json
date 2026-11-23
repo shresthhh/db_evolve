@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/storage/compression/bitpacking.cpp BitpackingSelect: adds the missing `select` callback for bitpacking, so StandardColumnData::Select can take its specialised path for bitpacked columns with constant validity. The only conditions are structural (selected fraction <= 25%, ascending selection, mode of the current group). Nothing refers to tables, columns, literals or data size.",
+      "Scan position: BitpackingSelectAdvance leaves the scan state exactly where BitpackingScanPartial would. It uses the plain offset increase for non-DELTA groups inside one metadata group, Skip otherwise, and a Skip(n-1)+1 trick when the skip ends exactly on a group boundary, so it never calls LoadNextGroup past the end of a segment. Skip already handles starting at current_group_offset == GROUP_SIZE correctly.",
+      "Sparse values: CONSTANT and CONSTANT_DELTA formulas match the scan. FOR unpacks the single 32-value block that holds the row, and the cache is keyed on block pointer and width (FOR skips never touch decompression_buffer). DELTA_FOR is correct because Skip leaves current_delta_offset at the value of row idx-1, so delta[idx] + FOR + delta_offset is the row's value. Caching is disabled for DELTA_FOR because Skip overwrites the buffer.",
+      "Dense path: the in-place gather is safe for an ascending selection (sel[i] >= i). A non-ascending selection goes through a scratch vector instead.",
+      "The fallback is unchanged for NULL-bearing (non-constant validity), updated and segment-spanning vectors, through the existing StandardColumnData::Select guards. The callback contract matches FSST's select as called from ColumnData::SelectVector.",
+      "Not verified by running tests: the review is from reading the code, and the author could not run the bitpacking sqllogic tests because only dbe-tool was available."
+    ],
+    "required_changes": []
+  }
+}

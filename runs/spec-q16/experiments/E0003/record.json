@@ -1,0 +1,16 @@
+{
+  "id": "E0003",
+  "title": "Early tentative SkipLookups for near-unique radix aggregate sinks",
+  "started": "2026-11-20T15:22:54-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.7756448,
+  "summary": "I added an early, reversible switch to SkipLookups in RadixPartitionedHashTable::Sink. It applies only to the multi-thread path that is not external and has not yet adapted. After each ht.Abandon(), it computes the HLL-unique % and the materialized (deduplicated) % of sink_count. If both are above 0.95 the sink skips lookups; otherwise lookups are turned back on. There is also a one-time check at 4*STANDARD_VECTOR_SIZE rows during the first fill, which calls Abandon() and then SkipLookups(). DecideAdaptation at 1M rows now also re-enables lookups (Abandon, then EnableLookups) when a tentative skip turned out wrong. To support this I added GroupedAggregateHashTable::EnableLookups() and LookupsSkipped(). It builds and results are correct. Spot checks gave correct results on a GROUP BY with 25k groups, a near-unique 2.5M-group GROUP BY, and a count(DISTINCT) that is unique early and duplicate-heavy later. q16 bench vs best: first version (re-check at abandon only) -4.4, -6.8, +1.7, -4.8%. With the early 8192-row check added: -1.0, -5.3, -0.6%. The same build with the check forced off measured -0.7%, which is the noise level. On a plain 3M-row near-unique 4-key GROUP BY, sql timings with the feature off and on overlapped (343-381 ms off, 321-409 ms on), so no measurable gain there either. The real effect is at most about 3%, below the 5% bar, so I am abandoning it.",
+  "notes": "The hypothesis expected roughly 300-400 ms CPU to be saved in the distinct-table sink. In wall time on 8 threads this did not show up: q16 HASH_GROUP_BY takes about 0.51 s in the profile, and most of it appears to be the distinct finalize/Combine and the re-sink into the main table, not the sink-side probe and staging. Skipping lookups does not reduce finalize work, because the HT deduplicated nothing anyway. Follow-up: profile the distinct finalize path (PhysicalHashAggregate distinct finalize, combine of the distinct radix table, re-sink into the grouping table). A promising direction is to avoid materialising and re-hashing the distinct tuples twice, or to hash-partition the distinct table on the group keys so each partition can be counted directly. Sink-side tweaks for q16 (this one, early HT grow, unpartitioned staging) have all given \u22645%.",
+  "finished": "2026-11-20T15:28:58-05:00"
+}

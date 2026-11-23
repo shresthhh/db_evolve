@@ -1,0 +1,944 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..c04efe0 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -717,7 +717,7 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataChunkState &chunk_state,
+                                  InsertState &insert_state, bool parallel) {
+ 	// Insert Hashes into the BF
+-	if (bloom_filter.IsInitialized()) {
++	if (bloom_filter.IsInitialized() && !bloom_filter.IsExact()) {
+ 		bloom_filter.InsertHashes(hashes_v, count);
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+@@ -772,6 +772,47 @@ void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx
+ 	std::fill_n(entries + entry_idx_from, entry_idx_to - entry_idx_from, ht_entry_t());
+ }
+ 
++template <class T>
++static void InsertExactBloomFilterKeys(const BloomFilter &bf, const data_ptr_t *row_locations, const idx_t count,
++                                       const idx_t key_offset, const idx_t column_count) {
++	// the (single) equality key is the first column of the layout
++	idx_t entry_idx;
++	idx_t idx_in_entry;
++	ValidityBytes::GetEntryIndex(0, entry_idx, idx_in_entry);
++	for (idx_t i = 0; i < count; i++) {
++		const auto row = row_locations[i];
++		if (!ValidityBytes::RowIsValid(ValidityBytes(row, column_count).GetValidityEntryUnsafe(entry_idx),
++		                               idx_in_entry)) {
++			continue;
++		}
++		bf.InsertKey(static_cast<int64_t>(Load<T>(row + key_offset)));
++	}
++}
++
++static void InsertExactBloomFilter(const BloomFilter &bloom_filter, const TupleDataLayout &layout,
++                                   const data_ptr_t *row_locations, const idx_t count) {
++	const auto key_offset = layout.GetOffsets()[0];
++	const auto column_count = layout.ColumnCount();
++	switch (bloom_filter.ExactKeyType()) {
++	case PhysicalType::INT8:
++		return InsertExactBloomFilterKeys<int8_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT16:
++		return InsertExactBloomFilterKeys<int16_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT32:
++		return InsertExactBloomFilterKeys<int32_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT64:
++		return InsertExactBloomFilterKeys<int64_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT8:
++		return InsertExactBloomFilterKeys<uint8_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT16:
++		return InsertExactBloomFilterKeys<uint16_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT32:
++		return InsertExactBloomFilterKeys<uint32_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
+ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel) {
+ 	// Pointer table should be allocated
+ 	D_ASSERT(hash_map.get());
+@@ -783,12 +824,16 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 	                                chunk_idx_to, false);
+ 	const auto row_locations = iterator.GetRowLocations();
+ 
++	const bool exact_bloom_filter = bloom_filter.IsInitialized() && bloom_filter.IsExact();
+ 	InsertState insert_state(*this);
+ 	do {
+ 		const auto count = iterator.GetCurrentChunkCount();
+ 		for (idx_t i = 0; i < count; i++) {
+ 			hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+ 		}
++		if (exact_bloom_filter) {
++			InsertExactBloomFilter(bloom_filter, *layout_ptr, row_locations, count);
++		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+ 
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..614dcd9 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -772,7 +772,8 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 
+ 	// bf is only supported for single key joins with equality condition as the Filter API only allows
+ 	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// additional non-equality conditions are fine: the bf is built on the hash of the single equality key
++	const bool can_use_bf = ht->equality_predicate_columns.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -901,6 +902,9 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+ 						ht->SetBuildBloomFilter(true);
++						// the build key range allows an exact key bitmap if it is dense enough
++						ht->GetBloomFilter().SetKeyRange(final_min_max->data[min_idx].GetValue(0),
++						                                 final_min_max->data[max_idx].GetValue(0));
+ 						deferred_bloom_filters->emplace_back(info, filter_col_idx);
+ 					}
+ 				}
+diff --git a/src/include/duckdb/planner/filter/bloom_filter.hpp b/src/include/duckdb/planner/filter/bloom_filter.hpp
+index bff73c0..a3c1bf0 100644
+--- a/src/include/duckdb/planner/filter/bloom_filter.hpp
++++ b/src/include/duckdb/planner/filter/bloom_filter.hpp
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "duckdb/common/atomic.hpp"
+ #include "duckdb/common/serializer/deserializer.hpp"
+ #include "duckdb/common/serializer/serializer.hpp"
+ #include "duckdb/planner/table_filter.hpp"
+@@ -32,10 +33,47 @@ public:
+ 		return initialized;
+ 	}
+ 
++	//! Provide the [min, max] range of the (single, integral) build key before Initialize. If the range is dense
++	//! enough relative to the number of rows, Initialize builds an exact bitmap indexed by (key - min) instead.
++	void SetKeyRange(const Value &min, const Value &max);
++	//! Whether the filter is an exact key bitmap (keys must be inserted with InsertKey instead of InsertHashes)
++	bool IsExact() const {
++		return exact;
++	}
++	PhysicalType ExactKeyType() const {
++		return exact_type;
++	}
++	inline void InsertKey(const int64_t key) const {
++		const uint64_t offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(exact_min);
++		if (DUCKDB_UNLIKELY(offset >= exact_bits)) {
++			// should not happen (the range covers all build keys), but stay correct: let everything pass
++			exact_overflow.store(true, std::memory_order_relaxed);
++			return;
++		}
++		std::atomic<uint64_t> &slot = *reinterpret_cast<std::atomic<uint64_t> *>(&bf[offset >> 6]);
++		slot.fetch_or(1ULL << (offset & 63), std::memory_order_relaxed);
++	}
++	inline bool LookupKey(const int64_t key) const {
++		const uint64_t offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(exact_min);
++		return offset < exact_bits && ((bf[offset >> 6] >> (offset & 63)) & 1ULL);
++	}
++	bool ExactOverflow() const {
++		return exact_overflow.load(std::memory_order_relaxed);
++	}
++
+ private:
+ 	idx_t num_sectors;
+ 	uint64_t bitmask; // num_sectors - 1 -> used to get the sector offset
+ 
++	//! Exact bitmap mode
++	bool has_key_range = false;
++	bool exact = false;
++	PhysicalType exact_type = PhysicalType::INVALID;
++	int64_t exact_min = 0;
++	int64_t exact_max = 0;
++	uint64_t exact_bits = 0;
++	mutable std::atomic<bool> exact_overflow {false};
++
+ 	bool initialized = false;
+ 	AllocatedData buf_;
+ 	uint64_t *bf;
+@@ -81,6 +119,8 @@ public:
+ private:
+ 	static void HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
+ 	                         BFTableFilterState &state);
++	idx_t FilterExact(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
++	                  BFTableFilterState &state) const;
+ 
+ 	bool Equals(const TableFilter &other) const override;
+ 	unique_ptr<TableFilter> Copy() const override;
+diff --git a/src/include/duckdb/storage/table/row_group_collection.hpp b/src/include/duckdb/storage/table/row_group_collection.hpp
+index ee0cae8..7ec38ca 100644
+--- a/src/include/duckdb/storage/table/row_group_collection.hpp
++++ b/src/include/duckdb/storage/table/row_group_collection.hpp
+@@ -167,6 +167,9 @@ public:
+ 	idx_t GetRowGroupSize() const {
+ 		return row_group_size;
+ 	}
++	//! Number of vectors handed out per parallel scan task. Collections with few row groups compared to the thread
++	//! count are split into sub-row-group morsels so that all threads can participate.
++	static idx_t GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count);
+ 	void SetRowGroupAppendMode(RowGroupAppendMode mode);
+ 	//! Returns the total amount of segments - use sparingly, as this forces all segments to be loaded
+ 	idx_t GetSegmentCount();
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..cd98173 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -302,7 +302,9 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// the build side is the (deduplicated) set of correlated values that occur on the other side
++			// of the delim join, so it usually covers only a fraction of the probe-side key domain
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}
+diff --git a/src/planner/binder/query_node/plan_select_node.cpp b/src/planner/binder/query_node/plan_select_node.cpp
+index 335ccdb..7abd4cf 100644
+--- a/src/planner/binder/query_node/plan_select_node.cpp
++++ b/src/planner/binder/query_node/plan_select_node.cpp
+@@ -1,4 +1,14 @@
+ #include "duckdb/planner/binder.hpp"
++#include "duckdb/function/aggregate_function.hpp"
++#include "duckdb/planner/column_binding_map.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_subquery_expression.hpp"
++#include "duckdb/planner/expression/bound_window_expression.hpp"
++#include "duckdb/planner/expression_iterator.hpp"
++#include "duckdb/planner/operator/logical_window.hpp"
++#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/planner/operator/list.hpp"
+@@ -8,7 +18,375 @@
+ 
+ namespace duckdb {
+ 
++namespace {
++
++//! Rewrites a WHERE conjunct "... (SELECT min/max(x) FROM <subset of the outer FROM> WHERE <subset of the outer
++//! conjuncts> AND <equalities on outer columns>) ..." into a window aggregate over the outer join, partitioned by the
++//! correlated outer columns. This is valid when the tables of the subquery map onto distinct outer tables, every
++//! subquery conjunct is also an outer conjunct, and the remaining ("extra") outer tables and conjuncts only connect
++//! to the subquery tables through the correlated columns: then the rows of a partition are copies of the rows the
++//! subquery aggregates over, and MIN/MAX is insensitive to duplicates.
++class SubqueryToWindowRewriter {
++public:
++	explicit SubqueryToWindowRewriter(Binder &binder) : binder(binder) {
++	}
++
++	bool TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root);
++
++private:
++	static void CollectConjuncts(unique_ptr<Expression> &expr, vector<unique_ptr<Expression> *> &out) {
++		if (expr->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++			for (auto &child : expr->Cast<BoundConjunctionExpression>().children) {
++				CollectConjuncts(child, out);
++			}
++			return;
++		}
++		out.push_back(&expr);
++	}
++	static bool CollectJoinTree(LogicalOperator &op, vector<reference<LogicalGet>> &gets,
++	                            vector<reference<Expression>> &conjuncts) {
++		switch (op.type) {
++		case LogicalOperatorType::LOGICAL_GET:
++			gets.push_back(op.Cast<LogicalGet>());
++			return true;
++		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
++			return CollectJoinTree(*op.children[0], gets, conjuncts) && CollectJoinTree(*op.children[1], gets, conjuncts);
++		case LogicalOperatorType::LOGICAL_FILTER: {
++			auto &filter = op.Cast<LogicalFilter>();
++			if (!filter.projection_map.empty()) {
++				return false;
++			}
++			for (auto &expr : filter.expressions) {
++				conjuncts.push_back(*expr);
++			}
++			return CollectJoinTree(*op.children[0], gets, conjuncts);
++		}
++		default:
++			return false;
++		}
++	}
++	static bool OnlyReferencesTables(const Expression &expr, const unordered_set<idx_t> &tables) {
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			return false;
++		}
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr.Cast<BoundColumnRefExpression>();
++			return colref.depth == 0 && tables.find(colref.binding.table_index) != tables.end();
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
++			if (!OnlyReferencesTables(child, tables)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	//! Remap the bindings of a (copied) subquery expression to the outer bindings
++	bool Remap(unique_ptr<Expression> &expr) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY || expr->IsVolatile()) {
++			return false;
++		}
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr->Cast<BoundColumnRefExpression>();
++			if (colref.depth == 0) {
++				auto entry = binding_map.find(colref.binding);
++				if (entry == binding_map.end()) {
++					return false;
++				}
++				colref.binding = entry->second;
++				return true;
++			}
++			if (colref.depth == 1 && extra_tables.find(colref.binding.table_index) != extra_tables.end()) {
++				colref.depth = 0;
++				return true;
++			}
++			return false;
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			if (result && !Remap(child)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	static bool ConjunctEquals(const Expression &a, const Expression &b) {
++		if (a.Equals(b)) {
++			return true;
++		}
++		if (a.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON ||
++		    b.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++			return false;
++		}
++		auto &left = a.Cast<BoundComparisonExpression>();
++		auto &right = b.Cast<BoundComparisonExpression>();
++		return right.GetExpressionType() == FlipComparisonExpression(left.GetExpressionType()) &&
++		       left.left->Equals(*right.right) && left.right->Equals(*right.left);
++	}
++	static bool IsSupportedPartitionType(const LogicalType &type) {
++		// partitioning must never be coarser than value equality (e.g. -0.0 vs 0.0 for floating point)
++		if (type.IsIntegral()) {
++			return true;
++		}
++		switch (type.id()) {
++		case LogicalTypeId::BOOLEAN:
++		case LogicalTypeId::VARCHAR:
++		case LogicalTypeId::DATE:
++		case LogicalTypeId::TIMESTAMP:
++		case LogicalTypeId::DECIMAL:
++		case LogicalTypeId::UUID:
++			return true;
++		default:
++			return false;
++		}
++	}
++	static optional_ptr<unique_ptr<Expression>> FindSubquery(unique_ptr<Expression> &expr, idx_t &count) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			count++;
++			return &expr;
++		}
++		optional_ptr<unique_ptr<Expression>> result;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			auto child_result = FindSubquery(child, count);
++			if (child_result) {
++				result = child_result;
++			}
++		});
++		return result;
++	}
++
++private:
++	Binder &binder;
++	column_binding_map_t<ColumnBinding> binding_map;
++	unordered_set<idx_t> extra_tables;
++};
++
++bool SubqueryToWindowRewriter::TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root) {
++	if (!condition->HasSubquery()) {
++		return false;
++	}
++	// (1) find exactly one conjunct holding exactly one correlated scalar subquery
++	vector<unique_ptr<Expression> *> conjuncts;
++	CollectConjuncts(condition, conjuncts);
++	optional_idx subquery_conjunct;
++	optional_ptr<unique_ptr<Expression>> subquery_ptr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		auto &conjunct = *conjuncts[i];
++		if (conjunct->IsVolatile()) {
++			return false;
++		}
++		if (!conjunct->HasSubquery()) {
++			continue;
++		}
++		idx_t count = 0;
++		auto found = FindSubquery(conjunct, count);
++		if (subquery_conjunct.IsValid() || count != 1 || !found) {
++			return false;
++		}
++		subquery_conjunct = i;
++		subquery_ptr = found;
++	}
++	if (!subquery_conjunct.IsValid()) {
++		return false;
++	}
++	auto &subquery = (*subquery_ptr)->Cast<BoundSubqueryExpression>();
++	if (subquery.subquery_type != SubqueryType::SCALAR || !subquery.IsCorrelated() || !subquery.subquery.plan) {
++		return false;
++	}
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (col.depth != 1 || !IsSupportedPartitionType(col.type)) {
++			return false;
++		}
++	}
++	// (2) peel the subquery plan: projections of the single aggregate, then an ungrouped MIN/MAX aggregate
++	reference<LogicalOperator> sub_op = *subquery.subquery.plan;
++	optional_ptr<ColumnBinding> projected;
++	ColumnBinding target;
++	while (sub_op.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
++		auto &proj = sub_op.get().Cast<LogicalProjection>();
++		if (proj.expressions.size() != 1 || proj.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
++			return false;
++		}
++		if (projected && (projected->table_index != proj.table_index || projected->column_index != 0)) {
++			return false;
++		}
++		auto &colref = proj.expressions[0]->Cast<BoundColumnRefExpression>();
++		if (colref.depth != 0) {
++			return false;
++		}
++		target = colref.binding;
++		projected = &target;
++		sub_op = *proj.children[0];
++	}
++	if (sub_op.get().type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
++		return false;
++	}
++	auto &aggr_op = sub_op.get().Cast<LogicalAggregate>();
++	if (!aggr_op.groups.empty() || aggr_op.grouping_sets.size() > 1 || !aggr_op.grouping_functions.empty() ||
++	    aggr_op.expressions.size() != 1 || aggr_op.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
++		return false;
++	}
++	if (aggr_op.grouping_sets.size() == 1 && !aggr_op.grouping_sets[0].empty()) {
++		return false;
++	}
++	if (projected && (projected->table_index != aggr_op.aggregate_index || projected->column_index != 0)) {
++		return false;
++	}
++	auto &aggr = aggr_op.expressions[0]->Cast<BoundAggregateExpression>();
++	if ((aggr.function.name != "min" && aggr.function.name != "max") || aggr.children.size() != 1 ||
++	    aggr.IsDistinct() || aggr.filter || aggr.order_bys || aggr.return_type != subquery.return_type) {
++		return false;
++	}
++	vector<reference<LogicalGet>> sub_gets;
++	vector<reference<Expression>> sub_conjuncts;
++	if (!CollectJoinTree(*aggr_op.children[0], sub_gets, sub_conjuncts)) {
++		return false;
++	}
++	// (3) the outer FROM must be a plain join tree as well
++	vector<reference<LogicalGet>> outer_gets;
++	vector<reference<Expression>> outer_conjuncts;
++	if (!CollectJoinTree(*root, outer_gets, outer_conjuncts)) {
++		return false;
++	}
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i != subquery_conjunct.GetIndex()) {
++			outer_conjuncts.push_back(**conjuncts[i]);
++		}
++	}
++	// (4) match every subquery scan to a distinct outer scan of the same table
++	vector<bool> outer_matched(outer_gets.size(), false);
++	for (auto &sub_get_ref : sub_gets) {
++		auto &sub_get = sub_get_ref.get();
++		auto table = sub_get.GetTable();
++		if (!table || !sub_get.table_filters.filters.empty() || sub_get.dynamic_filters || sub_get.ordinality_idx.IsValid()) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t o = 0; o < outer_gets.size() && !found; o++) {
++			auto &outer_get = outer_gets[o].get();
++			if (outer_matched[o] || outer_get.GetTable().get() != table.get() ||
++			    outer_get.function.name != sub_get.function.name || !outer_get.table_filters.filters.empty() ||
++			    outer_get.dynamic_filters || outer_get.ordinality_idx.IsValid()) {
++				continue;
++			}
++			found = true;
++			outer_matched[o] = true;
++			auto &sub_ids = sub_get.GetColumnIds();
++			auto &outer_ids = outer_get.GetColumnIds();
++			for (idx_t s = 0; s < sub_ids.size(); s++) {
++				for (idx_t k = 0; k < outer_ids.size(); k++) {
++					if (sub_ids[s] == outer_ids[k]) {
++						binding_map[ColumnBinding(sub_get.table_index, s)] = ColumnBinding(outer_get.table_index, k);
++						break;
++					}
++				}
++			}
++		}
++		if (!found) {
++			return false;
++		}
++	}
++	for (idx_t o = 0; o < outer_gets.size(); o++) {
++		if (!outer_matched[o]) {
++			extra_tables.insert(outer_gets[o].get().table_index);
++		}
++	}
++	if (extra_tables.empty()) {
++		return false;
++	}
++	// (5) every subquery conjunct must be an outer conjunct after remapping
++	vector<bool> conjunct_matched(outer_conjuncts.size(), false);
++	column_binding_set_t equality_columns;
++	for (auto &sub_conjunct : sub_conjuncts) {
++		auto remapped = sub_conjunct.get().Copy();
++		if (!Remap(remapped)) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++			if (ConjunctEquals(*remapped, outer_conjuncts[k].get())) {
++				conjunct_matched[k] = true;
++				found = true;
++			}
++		}
++		if (!found) {
++			return false;
++		}
++		if (remapped->GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
++			auto &comp = remapped->Cast<BoundComparisonExpression>();
++			for (auto side : {comp.left.get(), comp.right.get()}) {
++				if (side->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++					equality_columns.insert(side->Cast<BoundColumnRefExpression>().binding);
++				}
++			}
++		}
++	}
++	// the remaining outer conjuncts may only restrict the extra tables
++	for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++		auto &conjunct = outer_conjuncts[k].get();
++		if (conjunct.IsVolatile() || conjunct.HasSubquery()) {
++			return false;
++		}
++		if (!conjunct_matched[k] && !OnlyReferencesTables(conjunct, extra_tables)) {
++			return false;
++		}
++	}
++	// every correlated column belongs to an extra table and is NULL-rejected by an equality
++	vector<unique_ptr<Expression>> partitions;
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (extra_tables.find(col.binding.table_index) == extra_tables.end() ||
++		    equality_columns.find(col.binding) == equality_columns.end()) {
++			return false;
++		}
++		partitions.push_back(make_uniq<BoundColumnRefExpression>(col.name, col.type, col.binding));
++	}
++	auto aggr_child = aggr.children[0]->Copy();
++	if (!Remap(aggr_child)) {
++		return false;
++	}
++
++	// (6) rewrite: filter(other conjuncts) -> window(min/max over partition) -> filter(subquery conjunct)
++	auto window_index = binder.GenerateTableIndex();
++	auto window_expr = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_AGGREGATE, aggr.return_type,
++	                                                    make_uniq<AggregateFunction>(aggr.function),
++	                                                    aggr.bind_info ? aggr.bind_info->Copy() : nullptr);
++	window_expr->children.push_back(std::move(aggr_child));
++	window_expr->partitions = std::move(partitions);
++	window_expr->ignore_nulls = false;
++	window_expr->distinct = false;
++	window_expr->start = WindowBoundary::UNBOUNDED_PRECEDING;
++	window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;
++	auto result_name = subquery.GetName();
++	auto result_type = subquery.return_type;
++
++	// replace the subquery by a reference to the window result (this destroys the subquery)
++	*subquery_ptr = make_uniq<BoundColumnRefExpression>(result_name, result_type, ColumnBinding(window_index, 0));
++	auto filter = make_uniq<LogicalFilter>();
++	unique_ptr<Expression> subquery_expr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i == subquery_conjunct.GetIndex()) {
++			subquery_expr = std::move(*conjuncts[i]);
++		} else {
++			filter->expressions.push_back(std::move(*conjuncts[i]));
++		}
++	}
++	if (!filter->expressions.empty()) {
++		filter->AddChild(std::move(root));
++		root = std::move(filter);
++	}
++	auto window = make_uniq<LogicalWindow>(window_index);
++	window->expressions.push_back(std::move(window_expr));
++	window->AddChild(std::move(root));
++	root = std::move(window);
++	condition = std::move(subquery_expr);
++	return true;
++}
++
++} // namespace
++
+ unique_ptr<LogicalOperator> Binder::PlanFilter(unique_ptr<Expression> condition, unique_ptr<LogicalOperator> root) {
++	SubqueryToWindowRewriter rewriter(*this);
++	rewriter.TryRewrite(condition, root);
+ 	PlanSubqueries(condition, root);
+ 	auto filter = make_uniq<LogicalFilter>(std::move(condition));
+ 	filter->AddChild(std::move(root));
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..13319c7 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -11,17 +11,97 @@ static constexpr idx_t LOG_SECTOR_SIZE = 6;             // a sector is 64 bits,
+ static constexpr idx_t SHIFT_MASK = 0x3F3F3F3F3F3F3F3F; // 6 bits for 64 positions
+ static constexpr idx_t N_BITS = 4;                      // the number of bits to set per hash
+ 
++// exact bitmap mode: at most this many bits per build row, and at most this many bits in total
++// (the join hash table's pointer table already uses at least 128 bits per build row)
++static constexpr idx_t MAX_EXACT_BITS_PER_KEY = 128;
++static constexpr idx_t MAX_EXACT_BITS = (1ULL << 29);
++
++static bool ExactKeyTypeSupported(PhysicalType type) {
++	switch (type) {
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int64_t ExactKeyValue(const Value &value) {
++	switch (value.type().InternalType()) {
++	case PhysicalType::INT8:
++		return value.GetValueUnsafe<int8_t>();
++	case PhysicalType::INT16:
++		return value.GetValueUnsafe<int16_t>();
++	case PhysicalType::INT32:
++		return value.GetValueUnsafe<int32_t>();
++	case PhysicalType::INT64:
++		return value.GetValueUnsafe<int64_t>();
++	case PhysicalType::UINT8:
++		return value.GetValueUnsafe<uint8_t>();
++	case PhysicalType::UINT16:
++		return value.GetValueUnsafe<uint16_t>();
++	case PhysicalType::UINT32:
++		return value.GetValueUnsafe<uint32_t>();
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
++void BloomFilter::SetKeyRange(const Value &min, const Value &max) {
++	has_key_range = false;
++	if (min.IsNull() || max.IsNull() || min.type() != max.type()) {
++		return;
++	}
++	const auto type = min.type().InternalType();
++	if (!ExactKeyTypeSupported(type)) {
++		return;
++	}
++	const auto min_key = ExactKeyValue(min);
++	const auto max_key = ExactKeyValue(max);
++	if (min_key > max_key) {
++		return;
++	}
++	has_key_range = true;
++	exact_type = type;
++	exact_min = min_key;
++	exact_max = max_key;
++}
++
+ void BloomFilter::Initialize(ClientContext &context_p, idx_t number_of_rows) {
+ 	BufferManager &buffer_manager = BufferManager::GetBufferManager(context_p);
+ 
+-	const idx_t min_bits = std::max<idx_t>(MIN_NUM_BITS, number_of_rows * MIN_NUM_BITS_PER_KEY);
+-	num_sectors = std::min(NextPowerOfTwo(min_bits) >> LOG_SECTOR_SIZE, MAX_NUM_SECTORS);
+-	bitmask = num_sectors - 1;
++	exact = false;
++	exact_overflow.store(false, std::memory_order_relaxed);
++	if (has_key_range) {
++		// range - 1 computed in unsigned arithmetic, min <= max is guaranteed by SetKeyRange
++		const uint64_t range_minus_one = static_cast<uint64_t>(exact_max) - static_cast<uint64_t>(exact_min);
++		if (range_minus_one < MAX_EXACT_BITS && range_minus_one < number_of_rows * MAX_EXACT_BITS_PER_KEY) {
++			exact = true;
++			exact_bits = range_minus_one + 1;
++		}
++	}
++
++	idx_t num_words;
++	if (exact) {
++		num_words = (exact_bits + 63) / 64;
++		num_sectors = 0;
++		bitmask = 0;
++	} else {
++		const idx_t min_bits = std::max<idx_t>(MIN_NUM_BITS, number_of_rows * MIN_NUM_BITS_PER_KEY);
++		num_sectors = std::min(NextPowerOfTwo(min_bits) >> LOG_SECTOR_SIZE, MAX_NUM_SECTORS);
++		bitmask = num_sectors - 1;
++		num_words = num_sectors;
++	}
+ 
+-	buf_ = buffer_manager.GetBufferAllocator().Allocate(64 + num_sectors * sizeof(uint64_t));
++	buf_ = buffer_manager.GetBufferAllocator().Allocate(64 + num_words * sizeof(uint64_t));
+ 	// make sure blocks is a 64-byte aligned pointer, i.e., cache-line aligned
+ 	bf = reinterpret_cast<uint64_t *>((64ULL + reinterpret_cast<uint64_t>(buf_.get())) & ~63ULL);
+-	std::fill_n(bf, num_sectors, 0);
++	std::fill_n(bf, num_words, 0);
+ 
+ 	initialized = true;
+ }
+@@ -93,6 +173,113 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 	}
+ }
+ 
++template <class T>
++static idx_t TemplatedFilterExact(const BloomFilter &bf, const T *data, const SelectionVector &data_sel,
++                                  const ValidityMask &validity, const SelectionVector &sel, const idx_t count,
++                                  const bool filters_null_values, SelectionVector &result_sel) {
++	idx_t found_count = 0;
++	const bool sel_set = sel.IsSet();
++	if (validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			const auto row_idx = sel_set ? sel.get_index(i) : i;
++			const auto data_idx = data_sel.get_index(i);
++			result_sel.set_index(found_count, row_idx);
++			found_count += bf.LookupKey(static_cast<int64_t>(data[data_idx]));
++		}
++	} else {
++		for (idx_t i = 0; i < count; i++) {
++			const auto row_idx = sel_set ? sel.get_index(i) : i;
++			const auto data_idx = data_sel.get_index(i);
++			result_sel.set_index(found_count, row_idx);
++			if (validity.RowIsValid(data_idx)) {
++				found_count += bf.LookupKey(static_cast<int64_t>(data[data_idx]));
++			} else {
++				found_count += !filters_null_values;
++			}
++		}
++	}
++	return found_count;
++}
++
++idx_t BFTableFilter::FilterExact(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
++                                 BFTableFilterState &state) const {
++	// get a view on the keys such that entry i corresponds to the i-th approved tuple
++	UnifiedVectorFormat vdata;
++	SelectionVector flat_sel;
++	const SelectionVector *data_sel;
++	const_data_ptr_t data;
++	const ValidityMask *validity;
++	if (keys_v.GetVectorType() == VectorType::FLAT_VECTOR) {
++		data = FlatVector::GetData(keys_v);
++		validity = &FlatVector::Validity(keys_v);
++		data_sel = sel.IsSet() ? &sel : FlatVector::IncrementalSelectionVector();
++	} else {
++		if (sel.IsSet()) {
++			state.keys_sliced_v.Slice(keys_v, sel, approved_tuple_count);
++			state.keys_sliced_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		} else {
++			keys_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		}
++		data = vdata.data;
++		validity = &vdata.validity;
++		data_sel = vdata.sel;
++	}
++
++	idx_t found_count;
++	switch (filter.ExactKeyType()) {
++	case PhysicalType::INT8:
++		found_count = TemplatedFilterExact<int8_t>(filter, reinterpret_cast<const int8_t *>(data), *data_sel, *validity,
++		                                           sel, approved_tuple_count, filters_null_values, state.bf_sel);
++		break;
++	case PhysicalType::INT16:
++		found_count = TemplatedFilterExact<int16_t>(filter, reinterpret_cast<const int16_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::INT32:
++		found_count = TemplatedFilterExact<int32_t>(filter, reinterpret_cast<const int32_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::INT64:
++		found_count = TemplatedFilterExact<int64_t>(filter, reinterpret_cast<const int64_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::UINT8:
++		found_count = TemplatedFilterExact<uint8_t>(filter, reinterpret_cast<const uint8_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::UINT16:
++		found_count = TemplatedFilterExact<uint16_t>(filter, reinterpret_cast<const uint16_t *>(data), *data_sel,
++		                                             *validity, sel, approved_tuple_count, filters_null_values,
++		                                             state.bf_sel);
++		break;
++	case PhysicalType::UINT32:
++		found_count = TemplatedFilterExact<uint32_t>(filter, reinterpret_cast<const uint32_t *>(data), *data_sel,
++		                                             *validity, sel, approved_tuple_count, filters_null_values,
++		                                             state.bf_sel);
++		break;
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++
++	if (found_count == approved_tuple_count) {
++		return approved_tuple_count;
++	}
++	// state.bf_sel holds the original row indices of the surviving tuples
++	if (sel.IsSet()) {
++		for (idx_t idx = 0; idx < found_count; idx++) {
++			sel.set_index(idx, state.bf_sel.get_index(idx));
++		}
++	} else {
++		sel.Initialize(state.bf_sel);
++	}
++	approved_tuple_count = found_count;
++	return approved_tuple_count;
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+@@ -101,6 +288,17 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		state.current_capacity = approved_tuple_count;
+ 	}
+ 
++	if (filter.IsExact()) {
++		if (filter.ExactOverflow()) {
++			return approved_tuple_count;
++		}
++		if (keys_v.GetType().InternalType() == filter.ExactKeyType()) {
++			return FilterExact(keys_v, sel, approved_tuple_count, state);
++		}
++		// unexpected key type: we cannot filter, let everything pass
++		return approved_tuple_count;
++	}
++
+ 	HashInternal(keys_v, sel, approved_tuple_count, state);
+ 
+ 	idx_t found_count;
+@@ -133,6 +331,15 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ }
+ 
+ bool BFTableFilter::FilterValue(const Value &value) const {
++	if (filter.IsExact()) {
++		if (value.IsNull()) {
++			return !filters_null_values;
++		}
++		if (filter.ExactOverflow() || value.type().InternalType() != filter.ExactKeyType()) {
++			return true;
++		}
++		return filter.LookupKey(ExactKeyValue(value));
++	}
+ 	const auto hash = value.Hash();
+ 	return filter.LookupOne(hash);
+ }
+@@ -171,6 +378,10 @@ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, con
+ }
+ 
+ FilterPropagateResult BFTableFilter::CheckStatistics(BaseStatistics &stats) const {
++	if (filter.IsExact()) {
++		// the min/max filters pushed alongside take care of range-based pruning
++		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
++	}
+ 	switch (stats.GetType().InternalType()) {
+ 	case PhysicalType::UINT8:
+ 		return TemplatedCheckStatistics<uint8_t>(filter, stats);
+diff --git a/src/storage/data_table.cpp b/src/storage/data_table.cpp
+index 456ca86..b7bb64c 100644
+--- a/src/storage/data_table.cpp
++++ b/src/storage/data_table.cpp
+@@ -15,6 +15,7 @@
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/parser/constraints/list.hpp"
+ #include "duckdb/planner/constraints/list.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+@@ -272,6 +273,10 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
+ 	idx_t parallel_scan_vector_count = row_group_size / STANDARD_VECTOR_SIZE;
+ 	if (ClientConfig::GetConfig(context).verify_parallelism) {
+ 		parallel_scan_vector_count = 1;
++	} else {
++		auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++		parallel_scan_vector_count =
++		    RowGroupCollection::GetParallelScanMorselVectors(GetTotalRows(), row_group_size, threads);
+ 	}
+ 	idx_t parallel_scan_tuple_count = STANDARD_VECTOR_SIZE * parallel_scan_vector_count;
+ 	return GetTotalRows() / parallel_scan_tuple_count + 1;
+diff --git a/src/storage/table/row_group_collection.cpp b/src/storage/table/row_group_collection.cpp
+index 9adc32f..c7b3d32 100644
+--- a/src/storage/table/row_group_collection.cpp
++++ b/src/storage/table/row_group_collection.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
+ #include "duckdb/parallel/task_executor.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
+ #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+ #include "duckdb/storage/data_table.hpp"
+@@ -275,6 +276,18 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
+ 	return row_group.GetNode().InitializeScanWithOffset(state, row_group, vector_index);
+ }
+ 
++idx_t RowGroupCollection::GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count) {
++	// aim for a few morsels per thread, but never smaller than the minimum morsel size or larger than a row group
++	static constexpr idx_t MORSELS_PER_THREAD = 4;
++	static constexpr idx_t MIN_MORSEL_VECTORS = 4;
++	auto row_group_vectors = MaxValue<idx_t>(1, row_group_size / STANDARD_VECTOR_SIZE);
++	auto total_vectors = (total_rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
++	auto target_morsels = MaxValue<idx_t>(1, thread_count) * MORSELS_PER_THREAD;
++	auto morsel_vectors = (total_vectors + target_morsels - 1) / target_morsels;
++	morsel_vectors = MaxValue<idx_t>(morsel_vectors, MIN_MORSEL_VECTORS);
++	return MinValue<idx_t>(morsel_vectors, row_group_vectors);
++}
++
+ void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
+ 	state.collection = this;
+ 	state.row_groups = GetRowGroups();
+@@ -307,12 +320,24 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
+ 			auto row_start = state.current_row_group->GetRowStart();
+ 			collection = state.collection;
+ 			row_group = state.current_row_group;
++			idx_t morsel_vectors;
+ 			if (ClientConfig::GetConfig(context).verify_parallelism) {
++				morsel_vectors = 1;
++			} else {
++				auto scan_rows = state.max_row - state.row_groups->GetBaseRowId();
++				auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++				morsel_vectors = GetParallelScanMorselVectors(scan_rows, collection->GetRowGroupSize(), threads);
++			}
++			if (morsel_vectors * STANDARD_VECTOR_SIZE < current_row_group.count || state.vector_index > 0) {
++				// scan a part of the row group
+ 				vector_index = state.vector_index;
+-				max_row = row_start + MinValue<idx_t>(current_row_group.count,
+-				                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
+-				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
+-				state.vector_index++;
++				auto morsel_start = STANDARD_VECTOR_SIZE * vector_index;
++				auto morsel_end =
++				    MinValue<idx_t>(current_row_group.count, morsel_start + STANDARD_VECTOR_SIZE * morsel_vectors);
++				D_ASSERT(morsel_start < current_row_group.count);
++				max_row = row_start + morsel_end;
++				state.processed_rows += morsel_end - morsel_start;
++				state.vector_index += morsel_vectors;
+ 				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
+ 					state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+ 					state.vector_index = 0;

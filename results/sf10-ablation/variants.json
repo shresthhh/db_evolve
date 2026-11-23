@@ -1,0 +1,18 @@
+{
+  "variants": {
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "only-E0008": "8beba2de138df5e29c1096ad20dc4c3d942fba26",
+    "v3-minus-E0008": "0fc2f6c9bd3d2f34a1bcffff92785b14cb2e85ec",
+    "only-E0009": "fc3ca7db6dff8bfcc8bbdf46453de29d4d92dd60",
+    "v3-minus-E0009": "dac10b70caa31b86c80571166882797db071a53a",
+    "only-E0010": "5411635cff6e41f484c063509c6baac6081b5e72",
+    "v3-minus-E0010": "9c967d5f82a14bb62796761975c6b9bf04a43d1c",
+    "only-E0011": "f7fd3937786944947acae951fcea211be4efce15",
+    "v3-minus-E0012": "57bc88de5e97efc2bcff4c86c5f632513b65a1de",
+    "v3": "b6929da26e9e9170936084797dd3d9e34cd54b2d"
+  },
+  "skipped": {
+    "v3-minus-E0011": "does not apply cleanly (depends on another change)",
+    "only-E0012": "does not apply cleanly (depends on another change)"
+  }
+}

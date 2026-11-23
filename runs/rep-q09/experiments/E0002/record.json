@@ -1,0 +1,27 @@
+{
+  "id": "E0002",
+  "title": "Bloom filter on first equality key of multi-condition hash joins",
+  "started": "2026-11-23T11:07:41-05:00",
+  "base": "be9721f0374e6dc16a5bde75cf58e00e80ad798d",
+  "candidate": "b27ef33b293d02e06d6d7d254506d027d3416668",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.7969044,
+  "summary": "Hash joins with more than one equality key can now push a bloom filter on their first key into the probe-side table scan. Before this, the bloom filter only existed for single-key joins. Two .cpp files changed, no header changes.\n\n1) In join_hashtable.cpp, JoinHashTable::InsertHashes: for multi-key joins, the bloom filter is no longer fed the combined row hash. Instead it gathers layout column 0 (condition 0's build key) from the chunk's row locations, hashes it with VectorOperations::Hash and inserts those hashes. Single-key joins are unchanged.\n2) In physical_hash_join.cpp, CanUseBloomFilter now requires cmp == EQUAL and ht->conditions[0].comparison == EQUAL, replacing the conditions.size()==1 check. FinalizeFilters only offers the bloom filter for the filter whose join_condition[filter_idx] == 0. All other guards are kept: filtered build side, probe estimate larger than the build count, no cast, not a perfect hash table, in-memory only. The probe-side filter already uses conditions[0] for its key name and type and NullValuesAreEqual(0).\n\nMeasured with bench (2 bindings, 4 hot runs each): q09 went from 669.6 ms to 528.3 ms (-21.1%); a separate q09-only run gave -18.4%. The geomean over the visible templates is -21.1%.\n\nCorrectness checks, each compared against the same query written with `col+0` keys so no filter can be pushed down. All results matched:\n- a 2-key INNER join of the large fact table against a filtered composite-key table;\n- the same with NULLs injected into build key 1;\n- a RIGHT join with NULLs injected into build key 0.\n\nA VARCHAR-first-key check also ran, but both versions returned 0 rows, so it tells us nothing. I did not add a sqllogictest because test/ is off limits.",
+  "notes": "The filter is only ever on condition 0. When condition 0 is unselective but a later key is selective, there is no gain. A follow-up could build the filter on whichever equality key has the most selective min/max or the fewest distinct values, but then the build-side gather has to match the probe column exactly.\n\nTesting tip: range()/CTE sources don't receive pushed-down filters, so they don't exercise the bloom filter. Use real table scans and compare against a `col+0 = col+0` version, which blocks pushdown.\n\nCorrectness depends on the build side hashing exactly layout column 0 with VectorOperations::Hash, the same function BFTableFilter uses on the probe side. Build rows with a NULL key 0 only add false positives, which is harmless.",
+  "train_ratio": 0.783331531835844,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.783331531835844
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-23T11:14:06-05:00"
+}

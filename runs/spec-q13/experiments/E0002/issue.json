@@ -1,0 +1,13 @@
+{
+  "title": "Skip redundant found-match stores in RIGHT/FULL join probe",
+  "hypothesis": "HASH_JOIN RIGHT costs 2.15s of operator CPU on q13, its second-biggest cost. The build side is 1.5M unique keys and 14.8M probe rows hit it, so each build row gets about 10 matches spread across 8 threads. In ScanStructure (src/execution/join_hashtable.cpp around line 1018-1027, inside the `PropagatesBuildSide(ht.join_type)` block), every match does an unconditional `Store<bool>(true, ptrs[idx] + ht.tuple_size)`. Each store is a write to a cache line that other cores hold in shared state. That forces an RFO/invalidation, so lines bounce between cores even though the flag is already true after the first match. The probe has just compared keys in that row, so the line is already in cache. Loading the flag first and storing only when it is false turns about 90% of these writes into cheap shared reads. The code already does this check-before-write in the RIGHT_SEMI/ANTI path (line 1145, `if (Load<bool>(ptr + ht.tuple_size))`), but the regular RIGHT/FULL path does not.",
+  "plan": "In src/execution/join_hashtable.cpp, inside the matching loop that marks build-side found flags for PropagatesBuildSide join types (the loop at about line 1021 with `Store<bool>(true, ptrs[idx] + ht.tuple_size)`), change it to: `auto loc = ptrs[idx] + ht.tuple_size; if (!Load<bool>(loc)) { Store<bool>(true, loc); }`. Also apply the same guard to the store at about line 1168 (the non-equality-predicate branch of the RIGHT_SEMI/ANTI path). Nothing else changes. Semantics are the same because the only value ever written is true. Build and run bench on q13. Then run EXPLAIN ANALYZE to compare HASH_JOIN operator time (was 2.15s).",
+  "target_files": [
+    "src/execution/join_hashtable.cpp"
+  ],
+  "expected_gain": "q13: HASH_JOIN operator time could drop substantially if coherence traffic dominates. Estimate 5-12% wall time on q13.",
+  "generality": "Any RIGHT/FULL OUTER join (including LEFT joins flipped to RIGHT by the planner) where build rows match many probe rows across threads, such as fact-to-dimension outer joins. The cost is one extra predictable branch per match. A probe where every build row matches exactly once pays a tiny load+branch, which is negligible.",
+  "risk": "Very low. It is a 3-line change with identical semantics, and the same pattern already exists in the same file.",
+  "status": "open",
+  "filed": "g1r2"
+}

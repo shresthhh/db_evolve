@@ -1,0 +1,28 @@
+{
+  "id": "E0002",
+  "title": "Sparse Select for BitPacking segments (decode only selected rows)",
+  "started": "2026-11-19T12:15:24-05:00",
+  "base": "fa5fe35db0c12f28f99bbc74bbeb251e46e774c5",
+  "candidate": "b479fe68a3fa52c72566f9477db669a259ea8595",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q02 +2.2%; needs at least -5%)",
+    "visible geomean got slower (+2.2%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.8202994,
+  "summary": "I added a `select` callback for BitpackingSelect in src/storage/compression/bitpacking.cpp and registered it in GetBitpackingFunction. With it, StandardColumnData::Select now takes its specialised path for bitpacked columns that have constant validity, where before it fell back to Scan plus Slice.\n- **Sparse selections** (sel_count*4 <= vector_count and sel ascending): the scan walks to each selected row and reads the single value. CONSTANT and CONSTANT_DELTA values are computed directly. For FOR and DELTA_FOR it unpacks only the 32-value algorithm group holding the row. For FOR groups the unpacked group is cached and reused by neighbouring rows, keyed on group pointer and width.\n- **Dense selections**, or a vector that starts in a DELTA_FOR group: the vector is decoded with BitpackingScanPartial and the selected rows are gathered in place. This is safe because sel[i] >= i when sel is ascending. If sel is not ascending, it decodes into a scratch vector instead.\n- **Scan position:** a helper, BitpackingSelectAdvance, moves the scan state the same way a scan would. It does not load the next metadata group when a skip ends exactly on a group boundary, so it never reads past the last group of a segment.\n\n**Result:** `bench` shows q02 at 73.7 ms before and 65.6 ms after (-11.0%), with results checked equal. That is about half the 15-25% the issue predicted.\n\n**Correctness checks:** on persisted lineitem and orders I compared queries using a pushed WHERE filter (sparse selections) against the same aggregates written with FILTER clauses over full scans (no pushdown), covering BIGINT, DECIMAL, DATE and INTEGER columns at about 0.15%, 1.3% and about 20% selectivity. Each hash or sum pair matched. I could not run the bitpacking sqllogic tests: the only shell command allowed is dbe-tool, which has no test runner.",
+  "notes": "The bitpacking Skip() loads the next metadata group whenever a skip ends exactly on a 1024-row group boundary. At the end of a segment that would read past the last group. That is why BitpackingSelectAdvance steps the last row by hand. Watch for this in any future caller of Skip. If a DELTA_FOR group is entered partway through a vector, the sparse path stays correct, because Skip decodes and carries current_delta_offset, but it is not faster there. Follow-up idea: a selective validity select for non-constant (uncompressed) validity would let nullable bitpacked columns use the same fast path.",
+  "train_ratio": 1.0218561304769418,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0218561304769418
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-19T12:32:55-05:00"
+}

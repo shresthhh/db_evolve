@@ -1,0 +1,13 @@
+{
+  "title": "Substring-match scan selectivity (minimal, finish E0001)",
+  "hypothesis": "q09 (123.8ms, slowest template) builds hash joins on orders (1.5M) and partsupp (800k) while the real probe side is about 324k rows. The cause is that the part scan filter contains(p_name,'ghost'), pushed down from LIKE '%ghost%', is estimated at DEFAULT_SELECTIVITY 0.2 (about 40k rows), but only about 5% of rows pass. EXPLAIN shows estimates of about 1.26M rows for lineitem\u22c8part\u22c8orders and 5.06M for the top join. E0001 did not fail as an idea: the implementer ran out of time while building, and it was never benchmarked. If the part estimate drops to about 8k, the join-order optimizer should make the filtered part/lineitem side the build side.",
+  "plan": "Keep the diff small and out of the header, so the rebuild stays short. In src/optimizer/join_order/relation_statistics_helper.cpp, add a file-local static helper IsSubstringMatchFilter(const TableFilter&). It returns true for an ExpressionFilter whose expression is contains(col, non-empty VARCHAR constant), or ~~/like_escape with a constant pattern that starts with '%' and contains a literal character. It recurses into ConjunctionAndFilter children. It never matches OR, NOT or !~~. In ExtractGetStats (around lines 146-151), when no equality filter applied and some non-optional table filter matches, use selectivity 0.04 (a file-local constexpr) instead of DEFAULT_SELECTIVITY. Leave relation_manager.cpp unchanged in this experiment. Then: build in the background, EXPLAIN q09.m0 and confirm the part estimate falls to about 8k and the join order changes, then run the full bench.",
+  "target_files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp"
+  ],
+  "expected_gain": "q09: 20-40% if the build sides flip. Other templates with LIKE '%x%' filters on a dimension table (q13-like, q16, q14 variants) may change their plans. Geomean: 1-3%.",
+  "generality": "Any query with a substring LIKE or contains filter on a table that is joined. Substring filters are usually much more selective than 0.2. A query whose substring filter matches most rows could get a worse join order, since the estimate would be about 5x too low.",
+  "risk": "Low-medium. Only estimates change, so results stay correct. Plan changes on hidden templates could regress some. Mitigation if results are mixed: apply the lower selectivity only when the literal is at least 3 characters.",
+  "status": "open",
+  "filed": "g1r2"
+}

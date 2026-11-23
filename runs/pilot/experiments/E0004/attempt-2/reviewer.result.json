@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "perfect_aggregate_hashtable.cpp: the lazy initialisation is correct. AddChunk sets the flag before it records the slot in `sel`, so a group that repeats within one chunk is initialised once. The pointers for those slots are written before InitializeStates runs, and the exception path also initialises the slots it has already flagged, so Destroy stays safe. Combine records each new target in `sel` against its index in target_addresses and initialises those targets before every CombineStates batch. Destroy and Scan only visit slots whose flag is set, and those are exactly the initialised ones. NextSetGroup skips zero words and handles a tail shorter than 8 bytes.",
+      "plan_aggregate.cpp: the extension is general. It depends on the key's statistics range (at most 18 bits) and on the per-thread table size (2^bits * (state width + 1) <= 4MB). It does not look at any query, table or literal. A user-set perfect_ht_threshold is again a hard cap, so 0 or 1 turns perfect hashing off.",
+      "Possible regressions, not blocking: the table memory comes from make_unsafe_uniq_array and is not counted against memory_limit. That was already true below 12 bits, but the cap now allows up to 4MB per thread. The default value of the setting now quietly allows more than 12 bits, which is a semantic change a maintainer might want documented.",
+      "The author's summary mentions a touched counter and a header change. Neither is in the diff, and Combine has no early return. This is only a mismatch between the summary and the code: the word-skip scan already makes an empty source cheap."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"perfect_aggregate_hashtable.cpp: the lazy initialisation is correct. AddChunk sets the flag before it records the slot in `sel`, so a group that repeats within one chunk is initialised once. The pointers for those slots are written before InitializeStates runs, and the exception path also initialises the slots it has already flagged, so Destroy stays safe. Combine records each new target in `sel` against its index in target_addresses and initialises those targets before every CombineStates batch. Destroy and Scan only visit slots whose flag is set, and those are exactly the initialised ones. NextSetGroup skips zero words and handles a tail shorter than 8 bytes.\",\"plan_aggregate.cpp: the extension is general. It depends on the key's statistics range (at most 18 bits) and on the per-thread table size (2^bits * (state width + 1) <= 4MB). It does not look at any query, table or literal. A user-set perfect_ht_threshold is again a hard cap, so 0 or 1 turns perfect hashing off.\",\"Possible regressions, not blocking: the table memory comes from make_unsafe_uniq_array and is not counted against memory_limit. That was already true below 12 bits, but the cap now allows up to 4MB per thread. The default value of the setting now quietly allows more than 12 bits, which is a semantic change a maintainer might want documented.\",\"The author's summary mentions a touched counter and a header change. Neither is in the diff, and Combine has no early return. This is only a mismatch between the summary and the code: the word-skip scan already makes an empty source cheap.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1544702,
+  "seconds": 35.487709760665894,
+  "error": ""
+}

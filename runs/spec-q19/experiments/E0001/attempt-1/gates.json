@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/optimizer.cpp: the only change is moving one existing line, the JoinDependentFilterRule registration, so it runs before DistributivityRule. Nothing in it names tables, columns, literals or the dataset.",
+      "Correctness: the rule keeps the original OR and ANDs onto it per-table ORs that the original already implies. It skips volatile expressions and only fires when every branch has a predicate on the same table. Results cannot change.",
+      "Termination: the rule returns AND(original, derived). ApplyRules then reruns with is_root=false, so the rule can't fire again inside that pass. On the next fixpoint pass the root is an AND, so the rule returns nullptr because the root is not an OR. Distributivity still factors out the shared join term from the inner OR. No loop.",
+      "Generality: this fixes a real rule-order bug. Before, the rule never fired on any root OR whose branches shared a term, because Distributivity rewrote the root first. Any OR-of-cases predicate on a join benefits, for example TPC-DS q13/q48-style filters.",
+      "Cost: when the derived filters are not selective, each row gets one extra redundant filter. That cost is small, and it is the behaviour the rule was always meant to have."
+    ],
+    "required_changes": []
+  }
+}

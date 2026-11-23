@@ -1,0 +1,194 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..156abf2 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -717,6 +717,11 @@ bool JoinFilterPushdownInfo::CanUseInFilter(const ClientContext &context, option
+ 	return ht && ht->Count() > 1 && ht->Count() <= dynamic_or_filter_threshold && cmp == ExpressionType::COMPARE_EQUAL;
+ }
+ 
++//! IN-lists with at most this many values are evaluated on rows (guarded by their selectivity)
++static constexpr idx_t SMALL_IN_FILTER_MAX_VALUES = 16;
++static constexpr float SMALL_IN_FILTER_THRESHOLD = 0.5f;
++static constexpr idx_t SMALL_IN_FILTER_CHECK_N = 30;
++
+ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht,
+                                           const PhysicalOperator &op, idx_t filter_idx, idx_t filter_col_idx) const {
+ 	// generate a "OR" filter (i.e. x=1 OR x=535 OR x=997)
+@@ -749,12 +754,41 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 		return;
+ 	}
+ 
++	// small IN-lists over types with a typed row-level path are cheap to evaluate on rows
++	bool small_in_list = in_list.size() <= SMALL_IN_FILTER_MAX_VALUES;
++	switch (in_list[0].type().InternalType()) {
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++	case PhysicalType::UINT64:
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::INT128:
++	case PhysicalType::UINT128:
++	case PhysicalType::FLOAT:
++	case PhysicalType::DOUBLE:
++	case PhysicalType::VARCHAR:
++		break;
++	default:
++		small_in_list = false;
++		break;
++	}
++
+ 	// generate the OR filter
+ 	auto in_filter = make_uniq<InFilter>(std::move(in_list));
+ 
+-	// we push the OR filter as an OptionalFilter so that we can use it for zonemap pruning only
+-	// the IN-list is expensive to execute otherwise
+-	auto filter = make_uniq<OptionalFilter>(std::move(in_filter));
++	unique_ptr<TableFilter> filter;
++	if (small_in_list) {
++		// small IN-list: also execute it on rows, but disable it if it turns out to not be selective
++		filter = make_uniq<SelectivityOptionalFilter>(std::move(in_filter), SMALL_IN_FILTER_THRESHOLD,
++		                                              SMALL_IN_FILTER_CHECK_N);
++	} else {
++		// we push the OR filter as an OptionalFilter so that we can use it for zonemap pruning only
++		// the IN-list is expensive to execute otherwise
++		filter = make_uniq<OptionalFilter>(std::move(in_filter));
++	}
+ 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
+ }
+ 
+diff --git a/src/planner/table_filter_state.cpp b/src/planner/table_filter_state.cpp
+index 258938a..d67708b 100644
+--- a/src/planner/table_filter_state.cpp
++++ b/src/planner/table_filter_state.cpp
+@@ -48,6 +48,7 @@ unique_ptr<TableFilterState> TableFilterState::Initialize(ClientContext &context
+ 		return make_uniq<ExpressionFilterState>(context, *expr_filter.expr);
+ 	}
+ 	case TableFilterType::CONSTANT_COMPARISON:
++	case TableFilterType::IN_FILTER:
+ 	case TableFilterType::IS_NULL:
+ 	case TableFilterType::IS_NOT_NULL:
+ 		// root nodes - create an empty filter state
+diff --git a/src/storage/compression/numeric_constant.cpp b/src/storage/compression/numeric_constant.cpp
+index e13a074..813ca60 100644
+--- a/src/storage/compression/numeric_constant.cpp
++++ b/src/storage/compression/numeric_constant.cpp
+@@ -148,6 +148,7 @@ void ConstantFun::FiltersNullValues(const LogicalType &type, const TableFilter &
+ 		break;
+ 	}
+ 	case TableFilterType::CONSTANT_COMPARISON:
++	case TableFilterType::IN_FILTER:
+ 		filters_nulls = true;
+ 		break;
+ 	case TableFilterType::IS_NULL:
+diff --git a/src/storage/table/column_segment.cpp b/src/storage/table/column_segment.cpp
+index d20171f..2aad364 100644
+--- a/src/storage/table/column_segment.cpp
++++ b/src/storage/table/column_segment.cpp
+@@ -6,6 +6,7 @@
+ #include "duckdb/main/config.hpp"
+ #include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/in_filter.hpp"
+ #include "duckdb/planner/filter/struct_filter.hpp"
+ #include "duckdb/storage/data_pointer.hpp"
+ #include "duckdb/storage/table/append_state.hpp"
+@@ -375,6 +376,85 @@ static void FilterSelectionSwitch(UnifiedVectorFormat &vdata, T predicate, Selec
+ 	sel.Initialize(new_sel);
+ }
+ 
++template <class T>
++static idx_t TemplatedInFilterSelection(UnifiedVectorFormat &vdata, const vector<Value> &values, SelectionVector &sel,
++                                        idx_t &approved_tuple_count) {
++	// materialize the (small) IN-list as typed constants once per call
++	vector<T> constants;
++	constants.reserve(values.size());
++	for (auto &value : values) {
++		constants.push_back(value.GetValueUnsafe<T>());
++	}
++	auto &mask = vdata.validity;
++	auto vec = UnifiedVectorFormat::GetData<T>(vdata);
++	const bool all_valid = mask.AllValid();
++	const idx_t constant_count = constants.size();
++	SelectionVector result_sel(approved_tuple_count);
++	idx_t result_count = 0;
++	for (idx_t i = 0; i < approved_tuple_count; i++) {
++		auto idx = sel.get_index(i);
++		auto vector_idx = vdata.sel->get_index(idx);
++		if (!all_valid && !mask.RowIsValid(vector_idx)) {
++			continue;
++		}
++		bool found = false;
++		for (idx_t k = 0; k < constant_count; k++) {
++			found = found || Equals::Operation(vec[vector_idx], constants[k]);
++		}
++		result_sel.set_index(result_count, idx);
++		result_count += found;
++	}
++	sel.Initialize(result_sel);
++	approved_tuple_count = result_count;
++	return result_count;
++}
++
++static idx_t InFilterSelection(SelectionVector &sel, const LogicalType &type, UnifiedVectorFormat &vdata,
++                               const InFilter &in_filter, idx_t &approved_tuple_count) {
++	// make sure all IN-list values have exactly the type of the vector
++	const vector<Value> *values = &in_filter.values;
++	vector<Value> cast_values;
++	for (auto &value : in_filter.values) {
++		if (value.type() != type) {
++			for (auto &v : in_filter.values) {
++				cast_values.push_back(v.DefaultCastAs(type));
++			}
++			values = &cast_values;
++			break;
++		}
++	}
++	switch (type.InternalType()) {
++	case PhysicalType::UINT8:
++		return TemplatedInFilterSelection<uint8_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::UINT16:
++		return TemplatedInFilterSelection<uint16_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::UINT32:
++		return TemplatedInFilterSelection<uint32_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::UINT64:
++		return TemplatedInFilterSelection<uint64_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::INT8:
++		return TemplatedInFilterSelection<int8_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::INT16:
++		return TemplatedInFilterSelection<int16_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::INT32:
++		return TemplatedInFilterSelection<int32_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::INT64:
++		return TemplatedInFilterSelection<int64_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::INT128:
++		return TemplatedInFilterSelection<hugeint_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::UINT128:
++		return TemplatedInFilterSelection<uhugeint_t>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::FLOAT:
++		return TemplatedInFilterSelection<float>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::DOUBLE:
++		return TemplatedInFilterSelection<double>(vdata, *values, sel, approved_tuple_count);
++	case PhysicalType::VARCHAR:
++		return TemplatedInFilterSelection<string_t>(vdata, *values, sel, approved_tuple_count);
++	default:
++		throw InvalidTypeException(type, "Invalid type for IN filter pushed down to table");
++	}
++}
++
+ template <bool IS_NULL>
+ static idx_t TemplatedNullSelection(UnifiedVectorFormat &vdata, SelectionVector &sel, idx_t &approved_tuple_count) {
+ 	auto &mask = vdata.validity;
+@@ -540,6 +620,10 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
+ 		}
+ 		return approved_tuple_count;
+ 	}
++	case TableFilterType::IN_FILTER: {
++		auto &in_filter = filter.Cast<InFilter>();
++		return InFilterSelection(sel, vector.GetType(), vdata, in_filter, approved_tuple_count);
++	}
+ 	case TableFilterType::IS_NULL: {
+ 		return TemplatedNullSelection<true>(vdata, sel, approved_tuple_count);
+ 	}

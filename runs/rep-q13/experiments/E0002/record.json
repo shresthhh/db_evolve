@@ -1,0 +1,27 @@
+{
+  "id": "E0002",
+  "title": "SIMD first+last-byte candidate filter in FindStrInStr with overlapping tail block",
+  "started": "2026-11-23T17:44:07-05:00",
+  "base": "a5a01aab8f9b6eee08f485765ed9dc96cd4fc0ae",
+  "candidate": "fdb504bf36daaa4102d716936ecebdc62e07d5ef",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q13 -3.0%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.375469,
+  "summary": "I added an SSE2 block search to `FindStrInStr` in `src/function/scalar/string/contains.cpp`. It takes over when the needle is at least 2 bytes and the haystack is between needle_size+15 and 256 bytes. For 16 start positions at a time it loads the haystack at the start offset and at the needle's last-byte offset, compares both against the needle's first and last bytes, and turns the combined result into a bitmask. Each set bit is then checked with a memcmp of the middle bytes. The final partial block is handled by an overlapping load that ends at the last valid start position, with the positions already checked masked off, so there is no scalar tail. All loads stay inside [0, haystack_size). Haystacks outside that size range, 1-byte needles and non-SSE2 builds keep the existing memchr path. The build is OK.\n\nResults: `dbe-tool bench q13` gave 639.0 \u2192 599.7 ms (-6.2%) on the first run and 743.3 \u2192 650.8 ms (-12.4%) on the second. The runs are noisy, but the change came out faster both times.\n\nCorrectness spot checks with SQL over a grid of generated strings all returned 0 mismatches. They covered strpos/contains/LIKE with needles at the start, middle and end, repeating-prefix needles, needles longer than 16 bytes, and haystacks of about 3 to 80 bytes. I did not run sqllogictests.",
+  "notes": "This repeats a change from an earlier run (memory: block-strsearch-tail), which gave -12% there. Two bench runs here gave -6.2% and -12.4%, so the timing is noisy. Possible follow-ups:\n- A SWAR or partial-load variant for haystacks shorter than needle_size+15, which currently fall back to memchr.\n- An AVX2 32-byte version for longer strings.",
+  "train_ratio": 0.9701219163147166,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.9701219163147166
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-23T17:49:11-05:00"
+}

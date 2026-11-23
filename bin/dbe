@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Operator CLI. Runs the framework with the project-local toolchain's Python when present.
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PY="$ROOT/.toolchain/env/bin/python"
+[ -x "$PY" ] || PY=python3
+cd "$ROOT" && exec "$PY" -m dbevolve.cli "$@"

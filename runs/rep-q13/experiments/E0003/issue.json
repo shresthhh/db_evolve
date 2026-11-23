@@ -1,0 +1,15 @@
+{
+  "title": "Large perfect hash aggregate (up to 22 bits) with parallel combine and source",
+  "hypothesis": "q13 inner HASH_GROUP_BY on c_custkey (1.5M groups, dense integer key, count) costs 2.51s CPU. The radix HT is used because the key range exceeds perfect_ht_threshold. A perfect array aggregate indexed by key-min avoids hashing/probing. The earlier run measured -18.6%, but only after the combine (striped locks) and the source (block-parallel scan) were parallelised; serial versions gave 3.6%.",
+  "plan": "physical_perfect_hash_aggregate / the planner selection in plan_aggregate.cpp: allow perfect HA when stats give a range up to 2^22 with a density/memory guard; make Combine merge in parallel over stripes, and make GetData a parallel source over blocks of slots.",
+  "target_files": [
+    "src/execution/operator/aggregate/physical_perfect_hash_aggregate.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/execution/physical_plan/plan_aggregate.cpp"
+  ],
+  "expected_gain": "q13 -15..-18%",
+  "generality": "GROUP BY on dense integer keys (PKs/FKs) with large cardinality. Sparse ranges stay on radix because of the density guard.",
+  "risk": "Medium-high: larger diff; per-thread memory of 4M slots x threads, so it needs a memory guard.",
+  "status": "open",
+  "filed": "g1r1"
+}

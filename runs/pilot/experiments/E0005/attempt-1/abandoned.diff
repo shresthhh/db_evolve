@@ -1,0 +1,200 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..8cd0012 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -741,6 +741,11 @@ void JoinHashTable::AllocatePointerTable() {
+ 	if (should_build_bloom_filter) {
+ 		bloom_filter.Initialize(context, Count());
+ 	}
++	for (auto &key_bf : key_bloom_filters) {
++		if (key_bf) {
++			key_bf->Initialize(context, Count());
++		}
++	}
+ 
+ 	if (hash_map.get()) {
+ 		// There is already a hash map
+@@ -791,6 +796,21 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+ 
++		// fill the per-key bloom filters with the hash of the individual key column
++		for (idx_t cond_idx = 0; cond_idx < key_bloom_filters.size(); cond_idx++) {
++			auto &key_bf = key_bloom_filters[cond_idx];
++			if (!key_bf || !key_bf->IsInitialized()) {
++				continue;
++			}
++			const auto &incremental_sel = *FlatVector::IncrementalSelectionVector();
++			Vector key_vector(layout_ptr->GetTypes()[cond_idx]);
++			data_collection->Gather(chunk_state.row_locations, incremental_sel, count, cond_idx, key_vector,
++			                        incremental_sel, nullptr);
++			Vector key_hashes(LogicalType::HASH);
++			VectorOperations::Hash(key_vector, key_hashes, count);
++			key_bf->InsertHashes(key_hashes, count);
++		}
++
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+ 	} while (iterator.Next());
+ }
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..c87c382 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -209,7 +209,7 @@ public:
+ 	bool skip_filter_pushdown = false;
+ 	unique_ptr<JoinFilterGlobalState> global_filter_state;
+ 	//! Bloom filter pushes deferred until HashJoinFinalizeEvent::FinishEvent, once the filter is fully populated
+-	vector<pair<reference<const JoinFilterPushdownFilter>, idx_t>> deferred_bloom_filters;
++	vector<JoinFilterDeferredBloomFilter> deferred_bloom_filters;
+ };
+ 
+ unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
+@@ -585,7 +585,8 @@ public:
+ 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
+ 		sink.hash_table->finalized = true;
+ 		for (auto &entry : sink.deferred_bloom_filters) {
+-			sink.op.filter_pushdown->PushBloomFilter(entry.first, *sink.hash_table, sink.op, entry.second);
++			sink.op.filter_pushdown->PushBloomFilter(entry.info, *sink.hash_table, sink.op, entry.filter_col_idx,
++			                                         entry.cond_idx);
+ 		}
+ 	}
+ 
+@@ -770,9 +771,9 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// bf is only supported for equality conditions. Single-key joins use the HT's bloom filter (built on the row
++	// hash), multi-key joins use a separate per-key bloom filter built on the hash of that key only
++	const bool can_use_bf = cmp == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -785,13 +786,23 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ }
+ 
+ void JoinFilterPushdownInfo::PushBloomFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht,
+-                                             const PhysicalOperator &op, idx_t filter_col_idx) const {
++                                             const PhysicalOperator &op, idx_t filter_col_idx, idx_t cond_idx) const {
++	const bool single_key = ht.conditions.size() == 1;
++	if (single_key) {
++		cond_idx = 0;
++	}
+ 	// If the nulls are equal, we let nulls pass. If not, we filter them
+-	auto filters_null_values = !ht.NullValuesAreEqual(0);
+-	const auto key_name = ht.conditions[0].right->ToString();
+-	const auto key_type = ht.conditions[0].left->return_type;
+-	auto bf_filter = make_uniq<BFTableFilter>(ht.GetBloomFilter(), filters_null_values, key_name, key_type);
+-	ht.SetBuildBloomFilter(true);
++	auto filters_null_values = !ht.NullValuesAreEqual(cond_idx);
++	const auto key_name = ht.conditions[cond_idx].right->ToString();
++	const auto key_type = ht.conditions[cond_idx].left->return_type;
++	auto &bf = single_key ? ht.GetBloomFilter() : ht.GetKeyBloomFilter(cond_idx);
++	if (!bf.IsInitialized()) {
++		return;
++	}
++	auto bf_filter = make_uniq<BFTableFilter>(bf, filters_null_values, key_name, key_type);
++	if (single_key) {
++		ht.SetBuildBloomFilter(true);
++	}
+ 
+ 	auto opt_bf_filter = make_uniq<SelectivityOptionalFilter>(
+ 	    std::move(bf_filter), SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N);
+@@ -814,7 +825,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeMinMax(JoinFilterGlobalSta
+ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+     ClientContext &context, optional_ptr<JoinHashTable> ht, const PhysicalComparisonJoin &op,
+     unique_ptr<DataChunk> final_min_max, const bool is_perfect_hashtable,
+-    optional_ptr<vector<pair<reference<const JoinFilterPushdownFilter>, idx_t>>> deferred_bloom_filters) const {
++    optional_ptr<vector<JoinFilterDeferredBloomFilter>> deferred_bloom_filters) const {
+ 	if (probe_info.empty()) {
+ 		return final_min_max; // There are not table souces in which we can push down filters
+ 	}
+@@ -900,8 +911,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+-						ht->SetBuildBloomFilter(true);
+-						deferred_bloom_filters->emplace_back(info, filter_col_idx);
++						const auto cond_idx = join_condition[filter_idx];
++						if (ht->conditions.size() == 1) {
++							ht->SetBuildBloomFilter(true);
++						} else {
++							ht->SetBuildKeyBloomFilter(cond_idx);
++						}
++						deferred_bloom_filters->emplace_back(info, filter_col_idx, cond_idx);
+ 					}
+ 				}
+ 			}
+diff --git a/src/include/duckdb/execution/join_hashtable.hpp b/src/include/duckdb/execution/join_hashtable.hpp
+index 942997d..49cbab9 100644
+--- a/src/include/duckdb/execution/join_hashtable.hpp
++++ b/src/include/duckdb/execution/join_hashtable.hpp
+@@ -343,6 +343,8 @@ private:
+ 	//! Whether or not to use a bloom filter will be determined by the operator
+ 	BloomFilter bloom_filter;
+ 	bool should_build_bloom_filter = false;
++	//! Per-key bloom filters for multi-key joins (indexed by condition index), filled with the hash of that key only
++	vector<unique_ptr<BloomFilter>> key_bloom_filters;
+ 
+ 	//! Copying not allowed
+ 	JoinHashTable(const JoinHashTable &) = delete;
+@@ -431,6 +433,21 @@ public:
+ 		return bloom_filter;
+ 	}
+ 
++	//! Request a bloom filter on the single key column of condition cond_idx (multi-key joins)
++	void SetBuildKeyBloomFilter(const idx_t cond_idx) {
++		if (key_bloom_filters.size() <= cond_idx) {
++			key_bloom_filters.resize(cond_idx + 1);
++		}
++		if (!key_bloom_filters[cond_idx]) {
++			key_bloom_filters[cond_idx] = make_uniq<BloomFilter>();
++		}
++	}
++
++	BloomFilter &GetKeyBloomFilter(const idx_t cond_idx) {
++		D_ASSERT(cond_idx < key_bloom_filters.size() && key_bloom_filters[cond_idx]);
++		return *key_bloom_filters[cond_idx];
++	}
++
+ 	//! Get total size of HT if all partitions would be built
+ 	idx_t GetTotalSize(const vector<unique_ptr<JoinHashTable>> &local_hts, idx_t &max_partition_size,
+ 	                   idx_t &max_partition_count) const;
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..af0d544 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -50,6 +50,18 @@ struct JoinFilterPushdownFilter {
+ 	vector<JoinFilterPushdownColumn> columns;
+ };
+ 
++struct JoinFilterDeferredBloomFilter {
++	JoinFilterDeferredBloomFilter(const JoinFilterPushdownFilter &info_p, idx_t filter_col_idx_p, idx_t cond_idx_p)
++	    : info(info_p), filter_col_idx(filter_col_idx_p), cond_idx(cond_idx_p) {
++	}
++
++	reference<const JoinFilterPushdownFilter> info;
++	//! The probe column index to push the filter into
++	idx_t filter_col_idx;
++	//! The join condition index the bloom filter is built on
++	idx_t cond_idx;
++};
++
+ struct PushdownFilterTarget {
+ 	PushdownFilterTarget(LogicalGet &get, vector<JoinFilterPushdownColumn> columns_p)
+ 	    : get(get), columns(std::move(columns_p)) {
+@@ -83,10 +95,10 @@ public:
+ 	unique_ptr<DataChunk> FinalizeFilters(
+ 	    ClientContext &context, optional_ptr<JoinHashTable> ht, const PhysicalComparisonJoin &op,
+ 	    unique_ptr<DataChunk> final_min_max, bool is_perfect_hashtable,
+-	    optional_ptr<vector<pair<reference<const JoinFilterPushdownFilter>, idx_t>>> deferred_bloom_filters) const;
++	    optional_ptr<vector<JoinFilterDeferredBloomFilter>> deferred_bloom_filters) const;
+ 
+ 	void PushBloomFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
+-	                     idx_t filter_col_idx) const;
++	                     idx_t filter_col_idx, idx_t cond_idx) const;
+ 
+ private:
+ 	void PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,

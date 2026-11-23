@@ -1,0 +1,10 @@
+# regenerable and large
+.toolchain/
+work/
+__pycache__/
+.pytest_cache/
+*.pyc
+# Windows download markers
+*:Zone.Identifier
+# third-party papers (linked from docs/related-work.md instead)
+docs/*.pdf

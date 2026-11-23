@@ -1,0 +1,27 @@
+{
+  "id": "E0004",
+  "title": "Exact key bitmap mode for join BF on dense integer build keys",
+  "started": "2026-11-23T11:29:47-05:00",
+  "base": "b27ef33b293d02e06d6d7d254506d027d3416668",
+  "candidate": "a496c6c900cceface52a41cb5babf2ae9f4baade",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.4700514000000002,
+  "summary": "I added an exact key-bitmap mode to the join Bloom filter (BF) and it is ready to judge. When the build keys are integers that fit in 64 bits (8/16/32/64-bit signed, or 8/16/32-bit unsigned) and their range is dense, the filter becomes a bitmap indexed by (key - min) instead of a hashed filter. The tree builds, and `dbe-tool bench` shows q09 at 566.5 \u2192 512.6 ms (-9.5%) on the first run and 553.0 \u2192 484.5 ms (-12.4%) on the full bench. The profile of q09.m0 shows the lineitem scan's CPU time falling from 5.28s to 4.55s; it now outputs exactly 3,269,453 rows because the bitmap has no false positives. The partsupp scan also gets an exact filter.\n\nWhat changed:\n- `bloom_filter.hpp/.cpp`: `SetKeyRange(min, range)` switches the filter to exact mode before `Initialize`, which then allocates one bit per value in [min, max]. `InsertKeys` sets bits atomically (fetch_or). `LookupKeys`/`LookupKey` test bits on the raw key values with no hashing, and keys outside the range are rejected.\n  - In `BFTableFilter::Filter`, exact mode reads keys through `UnifiedVectorFormat`. If a selection is set and the vector is not flat (for example a SEQUENCE vector), it slices first, as the hash path does.\n  - `FilterValue` and `CheckStatistics` have exact-mode versions. `CheckStatistics` prunes when the zone-map range does not overlap the bitmap range, and otherwise probes up to 2048 values as before. It never returns always-false if NULLs must pass (`IS NOT DISTINCT FROM`) and the segment can contain NULLs.\n- `join_hashtable.cpp` (`InsertHashes`): in exact mode it gathers layout column 0 (the first key), skips NULLs and sets the bits.\n- `physical_hash_join.cpp` (`FinalizeFilters`): when the BF is deferred, `TrySetExactBloomFilterRange` uses the build-side min/max. Exact mode is used only if build and probe have the same physical type, the min/max types match the build key type, the type is one of those above, the range is under 2^31 and at most 128 bits per key in the hash table. Otherwise the existing hashed BF is used unchanged.\n\nCorrectness checks I ran: temp-table joins with NULLs and negative keys, using `=`, `IS NOT DISTINCT FROM` and an `IN` subquery, matched the same joins on `+0` expressions (which don't push a filter into the scan). However, `EXPLAIN ANALYZE` on that temp-table query showed no BF filter on the probe scan, so the exact path's NULL and negative-key handling was not exercised. The exact path is only confirmed working by the q09 profile and the matching bench results.",
+  "notes": "- **Gain:** a sibling run found the 128 bits/key cap mattered for q21. Here the q09 build is about 436K rows over a range of about 2M, roughly 4.6 bits/key, well under the cap. The exact filter also removes the BF's false positives, so slightly fewer rows reach the lineitem\u2192part/partsupp join (0.95s).\n- **Remaining cost:** the lineitem scan is still 4.55s CPU, mostly decoding the six projected columns. The o_orderkey=l_orderkey join is 2.46s and is the next largest operator.\n- **Defensive throw:** an out-of-range insert in exact mode throws an InternalException rather than silently dropping the key. That can only happen if the build-side min/max misses some hash-table rows, which the current sink path does not allow.\n- **Review nit:** `TemplatedCheckStatisticsExact` has an unneeded extra brace block; it is harmless.",
+  "train_ratio": 0.7983499114340279,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.7983499114340279
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-23T11:38:57-05:00"
+}

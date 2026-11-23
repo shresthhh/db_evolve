@@ -1,0 +1,27 @@
+{
+  "id": "E0004",
+  "title": "avg on int32/int64/decimal(int64): int64 sum state when stats prove no overflow",
+  "started": "2026-11-19T11:24:28-05:00",
+  "base": "4d9e1c7f1f8749830c61d9ba05883fd122fc9f0e",
+  "candidate": "1e7c5bc7108fb752499525983fcc70cab59ab6fd",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.6641806000000001,
+  "summary": "In extension/core_functions/aggregate/algebraic/avg.cpp I added a statistics callback, AvgPropagateStats, to the INT32 and INT64 avg variants. Decimal avg with int32 or int64 storage also gets it, because BindDecimalAvg goes through GetAverageAggregate. The overflow check is copied from SumPropagateStats: the callback needs max_cardinality and child min/max stats, and |min| and |max| times max_cardinality must stay strictly inside int64. When that holds, the bound function's state callbacks (size, init, update, simple_update, combine, finalize, destructor, window, window_init) are replaced with the ones from a new AvgState<int64_t> aggregate, IntegerAverageOperationInt64. Its Finalize converts the int64 sum through hugeint_t before casting to long double, which gives exactly the same result as the hugeint version. Name, arguments, return type (DOUBLE), bind callback and bind_info (the decimal scale) are left as they were, and the statistics callback is cleared after the swap. Measured with `dbe-tool bench q01`: -1.7% on the first all-templates run (inside the ~5% noise band), then -7.1% and -6.2% on two later q01-only runs (338ms \u2192 314\u2013317ms). On the one profile I ran with the change, the perfect-hash group-by took 1.39s, against 1.41s in the baseline profile. A sanity SQL query covering NULLs, empty input, a large-BIGINT avg that has to stay on the hugeint path, and decimals returned the expected results.",
+  "notes": "The rewrite changes only the state callbacks inside the bound function. Name and bind stay the same, so a plan serialised and then re-bound falls back to the hugeint version, which gives the same results. The first all-templates bench run gave only -1.7%, while the two q01 reruns gave 6\u20137%, so this run looks noisy. Follow-up idea: the same stats-based int64 narrowing could be applied to other hugeint-state integer aggregates (e.g. the sum/avg pieces of stddev/var don't apply; maybe fsum and bit aggregates don't need it).",
+  "train_ratio": 0.9494463204899481,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q01": 0.9494463204899481
+  },
+  "improved": [
+    "q01"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-19T11:29:27-05:00"
+}

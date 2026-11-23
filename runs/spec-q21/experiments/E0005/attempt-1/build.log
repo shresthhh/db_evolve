@@ -1,0 +1,7 @@
+$ ninja -C /home/shresth/dev/db_evolve/work/build/slot0 -j 8
+ninja: Entering directory `/home/shresth/dev/db_evolve/work/build/slot0'
+[1/4] Updating .cache/clangd (slot0)
+[2/4] Linking CXX shared library extension/tpch/tpch.duckdb_extension
+[3/4] Linking CXX shared library extension/parquet/parquet.duckdb_extension
+[4/4] repository
+

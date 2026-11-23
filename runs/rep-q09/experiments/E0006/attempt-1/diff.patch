@@ -1,0 +1,498 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index adec6b5..00928c1 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -790,8 +790,21 @@ void JoinFilterPushdownInfo::PushBloomFilter(const JoinFilterPushdownFilter &inf
+ 	// If the nulls are equal, we let nulls pass. If not, we filter them
+ 	auto filters_null_values = !ht.NullValuesAreEqual(0);
+ 	const auto key_name = ht.conditions[0].right->ToString();
+-	const auto key_type = ht.conditions[0].left->return_type;
++	auto key_type = ht.conditions[0].left->return_type;
++	// the bloom filter is only pushed for the first join key, which is always the first pushdown column
++	D_ASSERT(!join_condition.empty() && join_condition[0] == 0);
++	const auto &column = info.columns[0];
++	if (column.HasOffset()) {
++		// the probe column holds (key + offset): only an exact filter can be probed with shifted keys
++		if (!ht.GetBloomFilter().IsExact()) {
++			return;
++		}
++		key_type = column.storage_type;
++	}
+ 	auto bf_filter = make_uniq<BFTableFilter>(ht.GetBloomFilter(), filters_null_values, key_name, key_type);
++	if (column.HasOffset()) {
++		bf_filter->SetKeyOffset(column.offset.GetValue<int64_t>());
++	}
+ 	ht.SetBuildBloomFilter(true);
+ 
+ 	auto opt_bf_filter = make_uniq<SelectivityOptionalFilter>(
+@@ -867,6 +880,40 @@ static void TrySetExactBloomFilterRange(JoinHashTable &ht, const LogicalType &pr
+ 	bf.SetKeyRange(min, range);
+ }
+ 
++//! For a probe column that holds (key + offset): convert a key value into the storage domain of the probe column
++static bool ShiftJoinFilterValue(Value &val, const JoinFilterPushdownColumn &column) {
++	if (val.IsNull()) {
++		return true;
++	}
++	Value key = val;
++	if (!key.DefaultTryCastAs(LogicalType::HUGEINT)) {
++		return false;
++	}
++	const auto shifted = key.GetValue<hugeint_t>() + hugeint_t(column.offset.GetValue<int64_t>());
++	Value result = Value::HUGEINT(shifted);
++	if (!result.DefaultTryCastAs(column.storage_type)) {
++		return false;
++	}
++	val = std::move(result);
++	return true;
++}
++
++//! Whether the exact bloom filter can be probed with (shifted) values of this type
++static bool SupportsShiftedExactLookup(const LogicalType &type) {
++	switch (type.InternalType()) {
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+     ClientContext &context, optional_ptr<JoinHashTable> ht, const PhysicalComparisonJoin &op,
+     unique_ptr<DataChunk> final_min_max, const bool is_perfect_hashtable,
+@@ -887,8 +934,14 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			auto min_val = final_min_max->data[min_idx].GetValue(0);
+ 			auto max_val = final_min_max->data[max_idx].GetValue(0);
+ 
+-			// Cast to storage type, skip if fails
+-			if (pushdown_column.storage_type.IsValid()) {
++			if (pushdown_column.HasOffset()) {
++				// the probe column holds (key + offset): shift min/max into the storage domain, skip if that fails
++				if (!pushdown_column.storage_type.IsValid() || !ShiftJoinFilterValue(min_val, pushdown_column) ||
++				    !ShiftJoinFilterValue(max_val, pushdown_column)) {
++					continue;
++				}
++			} else if (pushdown_column.storage_type.IsValid()) {
++				// Cast to storage type, skip if fails
+ 				if (!min_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+ 					continue;
+ 				}
+@@ -905,7 +958,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			}
+ 			// if the HT is small we can generate a complete "OR" filter
+ 			// but only if the join condition is equality.
+-			if (ht && CanUseInFilter(context, ht, cmp)) {
++			if (ht && !pushdown_column.HasOffset() && CanUseInFilter(context, ht, cmp)) {
+ 				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
+ 			}
+ 			if (Value::NotDistinctFrom(min_val, max_val)) {
+@@ -953,7 +1006,20 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
+ 				const bool is_first_key = join_condition[filter_idx] == 0;
+-				if (!has_cast && is_first_key && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				if (pushdown_column.HasOffset()) {
++					// with an offset, only an exact bitmap filter can be used (probed with shifted keys)
++					if (is_first_key && ht && deferred_bloom_filters &&
++					    SupportsShiftedExactLookup(pushdown_column.storage_type) &&
++					    CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++						TrySetExactBloomFilterRange(*ht, condition_type, final_min_max->data[min_idx].GetValue(0),
++						                            final_min_max->data[max_idx].GetValue(0));
++						if (ht->GetBloomFilter().IsExact()) {
++							ht->SetBuildBloomFilter(true);
++							deferred_bloom_filters->emplace_back(info, filter_col_idx);
++						}
++					}
++				} else if (!has_cast && is_first_key && ht &&
++				           CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..7ec1d1c 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -27,6 +27,12 @@ struct JoinFilterPushdownColumn {
+ 	ColumnBinding probe_column_index;
+ 	//! The type of the value in storage (LogicalGet)
+ 	LogicalType storage_type;
++	//! If not NULL (BIGINT): the join key is (storage value - offset), e.g. through an integral compression
++	Value offset;
++
++	bool HasOffset() const {
++		return !offset.IsNull();
++	}
+ };
+ 
+ struct JoinFilterGlobalState {
+diff --git a/src/include/duckdb/planner/filter/bloom_filter.hpp b/src/include/duckdb/planner/filter/bloom_filter.hpp
+index 8c9622c..12dc02c 100644
+--- a/src/include/duckdb/planner/filter/bloom_filter.hpp
++++ b/src/include/duckdb/planner/filter/bloom_filter.hpp
+@@ -39,9 +39,10 @@ public:
+ 		return exact;
+ 	}
+ 	//! Exact mode: insert/lookup the (non-NULL) integer keys
++	//! For lookups, key_offset is subtracted (wrapping) from each probe value before testing its bit
+ 	void InsertKeys(Vector &keys_v, idx_t count) const;
+ 	idx_t LookupKeys(Vector &keys_v, const SelectionVector &sel, idx_t count, bool filters_nulls,
+-	                 SelectionVector &result_sel) const;
++	                 SelectionVector &result_sel, int64_t key_offset = 0) const;
+ 	bool LookupKey(int64_t key) const {
+ 		const auto offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(key_min);
+ 		return offset <= key_range && (bf[offset >> 6] >> (offset & 63)) & 1;
+@@ -73,6 +74,10 @@ private:
+ 	bool filters_null_values;
+ 	string key_column_name;
+ 	LogicalType key_type;
++	//! If set, the filtered column holds (key + key_offset) where key is the value in the (exact) filter
++	//! A non-exact filter with a key offset lets every value pass
++	bool has_key_offset = false;
++	int64_t key_offset = 0;
+ 
+ public:
+ 	static constexpr auto TYPE = TableFilterType::BLOOM_FILTER;
+@@ -94,6 +99,11 @@ public:
+ 		return key_type;
+ 	}
+ 
++	void SetKeyOffset(int64_t offset) {
++		has_key_offset = true;
++		key_offset = offset;
++	}
++
+ 	string ToString(const string &column_name) const override;
+ 
+ 	// Filters by first hashing and then probing the bloom filter. The &sel will hold
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..efb78df 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -8,6 +8,8 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -50,6 +52,31 @@ bool PushdownJoinFilterExpression(Expression &expr, JoinFilterPushdownColumn &fi
+ 		}
+ 		return PushdownJoinFilterExpression(*bound_cast.child, filter);
+ 	}
++	case ExpressionClass::BOUND_FUNCTION: {
++		// We allow pushing through an integral compression "x - offset" (compressed materialization),
++		// as long as x is an integral of at most 64 bits (but not ubigint) and offset is a constant
++		// The filters are then shifted by the offset when they are created
++		const auto &func = expr.Cast<BoundFunctionExpression>();
++		if (!StringUtil::StartsWith(func.function.name, "__internal_compress_integral_") ||
++		    func.children.size() != 2 || filter.HasOffset()) {
++			return false;
++		}
++		auto &input = *func.children[0];
++		const auto &input_type = input.return_type;
++		if (!input_type.IsIntegral() || input_type.InternalType() == PhysicalType::UINT64 ||
++		    GetTypeIdSize(input_type.InternalType()) > GetTypeIdSize(PhysicalType::INT64)) {
++			return false;
++		}
++		if (func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto offset = func.children[1]->Cast<BoundConstantExpression>().value;
++		if (offset.IsNull() || !offset.DefaultTryCastAs(LogicalType::BIGINT)) {
++			return false;
++		}
++		filter.offset = std::move(offset);
++		return PushdownJoinFilterExpression(input, filter);
++	}
+ 	default:
+ 		return false;
+ 	}
+@@ -103,6 +130,7 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
+ 			for (auto &child_column : columns) {
+ 				JoinFilterPushdownColumn new_col;
+ 				new_col.probe_column_index = child_bindings[child_column.probe_column_index.column_index];
++				new_col.offset = child_column.offset;
+ 				child_columns.push_back(new_col);
+ 			}
+ 			// then recurse into the child
+diff --git a/src/optimizer/row_group_pruner.cpp b/src/optimizer/row_group_pruner.cpp
+index 95d15c6..530b35c 100644
+--- a/src/optimizer/row_group_pruner.cpp
++++ b/src/optimizer/row_group_pruner.cpp
+@@ -141,6 +141,11 @@ optional_ptr<LogicalGet> RowGroupPruner::FindLogicalGet(const LogicalOrder &logi
+ 	}
+ 
+ 	D_ASSERT(pushdown_targets.size() == 1);
++	for (auto &col : pushdown_targets.front().columns) {
++		if (col.HasOffset()) {
++			return nullptr;
++		}
++	}
+ 	auto &logical_get = pushdown_targets.front().get;
+ 
+ 	if (!logical_get.function.set_scan_order) {
+diff --git a/src/optimizer/topn_optimizer.cpp b/src/optimizer/topn_optimizer.cpp
+index 929f5eb..26bf21f 100644
+--- a/src/optimizer/topn_optimizer.cpp
++++ b/src/optimizer/topn_optimizer.cpp
+@@ -91,6 +91,14 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
+ 		// no pushdown targets
+ 		return;
+ 	}
++	for (auto &target : pushdown_targets) {
++		for (auto &col : target.columns) {
++			if (col.HasOffset()) {
++				// the boundary value is not shifted by an offset - bail-out
++				return;
++			}
++		}
++	}
+ 	// found pushdown targets! generate dynamic filters
+ 	ExpressionType comparison_type;
+ 	if (op.orders[0].type == OrderType::ASCENDING) {
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 39bb095..bb5b88c 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -119,21 +119,24 @@ void BloomFilter::InsertKeys(Vector &keys_v, idx_t count) const {
+ 
+ template <class T>
+ static idx_t TemplatedLookupKeys(const BloomFilter &filter, const UnifiedVectorFormat &vdata, const SelectionVector &sel,
+-                                 idx_t count, bool filters_nulls, SelectionVector &result_sel) {
++                                 idx_t count, bool filters_nulls, SelectionVector &result_sel, int64_t key_offset) {
+ 	const auto data = UnifiedVectorFormat::GetData<T>(vdata);
++	const auto shift = static_cast<uint64_t>(key_offset);
+ 	idx_t found_count = 0;
+ 	if (vdata.validity.AllValid()) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			const auto idx = vdata.sel->get_index(sel.get_index(i));
+ 			result_sel.set_index(found_count, i);
+-			found_count += filter.LookupKey(static_cast<int64_t>(data[idx]));
++			found_count += filter.LookupKey(
++			    static_cast<int64_t>(static_cast<uint64_t>(static_cast<int64_t>(data[idx])) - shift));
+ 		}
+ 	} else {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			const auto idx = vdata.sel->get_index(sel.get_index(i));
+ 			result_sel.set_index(found_count, i);
+ 			if (vdata.validity.RowIsValid(idx)) {
+-				found_count += filter.LookupKey(static_cast<int64_t>(data[idx]));
++				found_count += filter.LookupKey(
++				    static_cast<int64_t>(static_cast<uint64_t>(static_cast<int64_t>(data[idx])) - shift));
+ 			} else {
+ 				found_count += !filters_nulls;
+ 			}
+@@ -143,25 +146,25 @@ static idx_t TemplatedLookupKeys(const BloomFilter &filter, const UnifiedVectorF
+ }
+ 
+ idx_t BloomFilter::LookupKeys(Vector &keys_v, const SelectionVector &sel, idx_t count, bool filters_nulls,
+-                              SelectionVector &result_sel) const {
++                              SelectionVector &result_sel, int64_t key_offset) const {
+ 	D_ASSERT(initialized && exact);
+ 	UnifiedVectorFormat vdata;
+ 	keys_v.ToUnifiedFormat(count, vdata);
+ 	switch (keys_v.GetType().InternalType()) {
+ 	case PhysicalType::INT8:
+-		return TemplatedLookupKeys<int8_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<int8_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::INT16:
+-		return TemplatedLookupKeys<int16_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<int16_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::INT32:
+-		return TemplatedLookupKeys<int32_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<int32_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::INT64:
+-		return TemplatedLookupKeys<int64_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<int64_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::UINT8:
+-		return TemplatedLookupKeys<uint8_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<uint8_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::UINT16:
+-		return TemplatedLookupKeys<uint16_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<uint16_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	case PhysicalType::UINT32:
+-		return TemplatedLookupKeys<uint32_t>(*this, vdata, sel, count, filters_nulls, result_sel);
++		return TemplatedLookupKeys<uint32_t>(*this, vdata, sel, count, filters_nulls, result_sel, key_offset);
+ 	default:
+ 		throw InternalException("BloomFilter: unsupported type for exact key mode");
+ 	}
+@@ -202,6 +205,10 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
++	if (has_key_offset && !filter.IsExact()) {
++		// the hashed filter cannot be probed with shifted keys - let everything pass
++		return approved_tuple_count;
++	}
+ 	if (state.current_capacity < approved_tuple_count) {
+ 		state.hashes_v.Initialize(false, approved_tuple_count);
+ 		state.bf_sel.Initialize(approved_tuple_count);
+@@ -215,10 +222,10 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		if (sel.IsSet() && keys_v.GetVectorType() != VectorType::FLAT_VECTOR) {
+ 			state.keys_sliced_v.Slice(keys_v, sel, approved_tuple_count);
+ 			found_count = filter.LookupKeys(state.keys_sliced_v, lookup_sel, approved_tuple_count,
+-			                                filters_null_values, state.bf_sel);
++			                                filters_null_values, state.bf_sel, key_offset);
+ 		} else {
+ 			found_count = filter.LookupKeys(keys_v, sel.IsSet() ? sel : lookup_sel, approved_tuple_count,
+-			                                filters_null_values, state.bf_sel);
++			                                filters_null_values, state.bf_sel, key_offset);
+ 		}
+ 	} else {
+ 		HashInternal(keys_v, sel, approved_tuple_count, state);
+@@ -256,24 +263,36 @@ bool BFTableFilter::FilterValue(const Value &value) const {
+ 		if (value.IsNull()) {
+ 			return !filters_null_values;
+ 		}
++		int64_t key;
+ 		switch (value.type().InternalType()) {
+ 		case PhysicalType::INT8:
+-			return filter.LookupKey(value.GetValueUnsafe<int8_t>());
++			key = value.GetValueUnsafe<int8_t>();
++			break;
+ 		case PhysicalType::INT16:
+-			return filter.LookupKey(value.GetValueUnsafe<int16_t>());
++			key = value.GetValueUnsafe<int16_t>();
++			break;
+ 		case PhysicalType::INT32:
+-			return filter.LookupKey(value.GetValueUnsafe<int32_t>());
++			key = value.GetValueUnsafe<int32_t>();
++			break;
+ 		case PhysicalType::INT64:
+-			return filter.LookupKey(value.GetValueUnsafe<int64_t>());
++			key = value.GetValueUnsafe<int64_t>();
++			break;
+ 		case PhysicalType::UINT8:
+-			return filter.LookupKey(value.GetValueUnsafe<uint8_t>());
++			key = value.GetValueUnsafe<uint8_t>();
++			break;
+ 		case PhysicalType::UINT16:
+-			return filter.LookupKey(value.GetValueUnsafe<uint16_t>());
++			key = value.GetValueUnsafe<uint16_t>();
++			break;
+ 		case PhysicalType::UINT32:
+-			return filter.LookupKey(value.GetValueUnsafe<uint32_t>());
++			key = value.GetValueUnsafe<uint32_t>();
++			break;
+ 		default:
+ 			return true; // cannot decide - let the value pass
+ 		}
++		return filter.LookupKey(static_cast<int64_t>(static_cast<uint64_t>(key) - static_cast<uint64_t>(key_offset)));
++	}
++	if (has_key_offset) {
++		return true;
+ 	}
+ 	const auto hash = value.Hash();
+ 	return filter.LookupOne(hash);
+@@ -281,7 +300,7 @@ bool BFTableFilter::FilterValue(const Value &value) const {
+ 
+ template <class T>
+ static FilterPropagateResult TemplatedCheckStatisticsExact(const BloomFilter &bf, const BaseStatistics &stats,
+-                                                           bool filters_nulls) {
++                                                           bool filters_nulls, int64_t key_offset) {
+ 	{
+ 		if (!NumericStats::HasMinMax(stats) || (!filters_nulls && stats.CanHaveNull())) {
+ 			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+@@ -291,10 +310,11 @@ static FilterPropagateResult TemplatedCheckStatisticsExact(const BloomFilter &bf
+ 		if (min > max) {
+ 			return FilterPropagateResult::NO_PRUNING_POSSIBLE; // Invalid stats
+ 		}
+-		// the exact bitmap covers [key_min, key_max]: no overlap with the stats range means no match
+-		const auto key_min = bf.GetKeyMin();
+-		const auto key_max = static_cast<int64_t>(static_cast<uint64_t>(key_min) + bf.GetKeyRange());
+-		if (max < key_min || min > key_max) {
++		// the exact bitmap covers [key_min, key_max] (shifted by key_offset in the column's domain):
++		// no overlap with the stats range means no match
++		const auto key_min = hugeint_t(bf.GetKeyMin()) + hugeint_t(key_offset);
++		const auto key_max = key_min + hugeint_t(int64_t(0), bf.GetKeyRange());
++		if (hugeint_t(max) < key_min || hugeint_t(min) > key_max) {
+ 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+ 		}
+ 		const auto range = static_cast<uint64_t>(max) - static_cast<uint64_t>(min);
+@@ -303,7 +323,8 @@ static FilterPropagateResult TemplatedCheckStatisticsExact(const BloomFilter &bf
+ 		}
+ 		idx_t hits = 0;
+ 		for (uint64_t i = 0; i <= range; i++) {
+-			hits += bf.LookupKey(static_cast<int64_t>(static_cast<uint64_t>(min) + i));
++			hits += bf.LookupKey(
++			    static_cast<int64_t>(static_cast<uint64_t>(min) + i - static_cast<uint64_t>(key_offset)));
+ 		}
+ 		if (hits == 0) {
+ 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+@@ -352,23 +373,26 @@ FilterPropagateResult BFTableFilter::CheckStatistics(BaseStatistics &stats) cons
+ 	if (filter.IsExact()) {
+ 		switch (stats.GetType().InternalType()) {
+ 		case PhysicalType::UINT8:
+-			return TemplatedCheckStatisticsExact<uint8_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<uint8_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::UINT16:
+-			return TemplatedCheckStatisticsExact<uint16_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<uint16_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::UINT32:
+-			return TemplatedCheckStatisticsExact<uint32_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<uint32_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::INT8:
+-			return TemplatedCheckStatisticsExact<int8_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<int8_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::INT16:
+-			return TemplatedCheckStatisticsExact<int16_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<int16_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::INT32:
+-			return TemplatedCheckStatisticsExact<int32_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<int32_t>(filter, stats, filters_null_values, key_offset);
+ 		case PhysicalType::INT64:
+-			return TemplatedCheckStatisticsExact<int64_t>(filter, stats, filters_null_values);
++			return TemplatedCheckStatisticsExact<int64_t>(filter, stats, filters_null_values, key_offset);
+ 		default:
+ 			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+ 		}
+ 	}
++	if (has_key_offset) {
++		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
++	}
+ 	switch (stats.GetType().InternalType()) {
+ 	case PhysicalType::UINT8:
+ 		return TemplatedCheckStatistics<uint8_t>(filter, stats);
+@@ -402,7 +426,11 @@ bool BFTableFilter::Equals(const TableFilter &other) const {
+ 	return false;
+ }
+ unique_ptr<TableFilter> BFTableFilter::Copy() const {
+-	return make_uniq<BFTableFilter>(this->filter, this->filters_null_values, this->key_column_name, this->key_type);
++	auto result =
++	    make_uniq<BFTableFilter>(this->filter, this->filters_null_values, this->key_column_name, this->key_type);
++	result->has_key_offset = has_key_offset;
++	result->key_offset = key_offset;
++	return std::move(result);
+ }
+ 
+ unique_ptr<Expression> BFTableFilter::ToExpression(const Expression &column) const {
+@@ -415,15 +443,21 @@ void BFTableFilter::Serialize(Serializer &serializer) const {
+ 	serializer.WriteProperty<bool>(200, "filters_null_values", filters_null_values);
+ 	serializer.WriteProperty<string>(201, "key_column_name", key_column_name);
+ 	serializer.WriteProperty<LogicalType>(202, "key_type", key_type);
++	serializer.WritePropertyWithDefault<bool>(203, "has_key_offset", has_key_offset, false);
++	serializer.WritePropertyWithDefault<int64_t>(204, "key_offset", key_offset, 0);
+ }
+ 
+ unique_ptr<TableFilter> BFTableFilter::Deserialize(Deserializer &deserializer) {
+ 	auto filters_null_values = deserializer.ReadProperty<bool>(200, "filters_null_values");
+ 	auto key_column_name = deserializer.ReadProperty<string>(201, "key_column_name");
+ 	auto key_type = deserializer.ReadProperty<LogicalType>(202, "key_type");
++	auto has_key_offset = deserializer.ReadPropertyWithExplicitDefault<bool>(203, "has_key_offset", false);
++	auto key_offset = deserializer.ReadPropertyWithExplicitDefault<int64_t>(204, "key_offset", 0);
+ 
+ 	BloomFilter filter;
+ 	auto result = make_uniq<BFTableFilter>(filter, filters_null_values, key_column_name, key_type);
++	result->has_key_offset = has_key_offset;
++	result->key_offset = key_offset;
+ 	return std::move(result);
+ }
+ 

@@ -1,0 +1,81 @@
+diff --git a/src/function/scalar/string/contains.cpp b/src/function/scalar/string/contains.cpp
+index 95c53ff..9c51435 100644
+--- a/src/function/scalar/string/contains.cpp
++++ b/src/function/scalar/string/contains.cpp
+@@ -1,3 +1,4 @@
++#include "duckdb/common/bit_utils.hpp"
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/function/scalar/list_functions.hpp"
+@@ -7,6 +8,10 @@
+ #include "duckdb/function/scalar/struct_functions.hpp"
+ #include "duckdb/planner/expression/bound_function_expression.hpp"
+ 
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
+ namespace duckdb {
+ 
+ namespace {
+@@ -71,10 +76,60 @@ struct ContainsOperator {
+ 	}
+ };
+ 
++#if defined(__SSE2__)
++//! Block search for short haystacks: compare the first and last needle byte at all candidate start positions of a
++//! 16-byte block at once, and only verify the middle bytes of candidates. Requires needle_size >= 2 and at least 16
++//! candidate start positions (haystack_size >= needle_size + 15), so that all loads stay inside the haystack.
++static idx_t FindStrInStrBlock(const unsigned char *haystack, idx_t haystack_size, const unsigned char *needle,
++                               idx_t needle_size) {
++	D_ASSERT(needle_size >= 2 && haystack_size >= needle_size + 15);
++	const idx_t num_starts = haystack_size - needle_size + 1;
++	const idx_t last_offset = needle_size - 1;
++	const __m128i first = _mm_set1_epi8(static_cast<char>(needle[0]));
++	const __m128i last = _mm_set1_epi8(static_cast<char>(needle[last_offset]));
++	auto block_mask = [&](idx_t pos) -> uint32_t {
++		auto lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(haystack + pos));
++		auto hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(haystack + pos + last_offset));
++		auto eq = _mm_and_si128(_mm_cmpeq_epi8(lo, first), _mm_cmpeq_epi8(hi, last));
++		return static_cast<uint32_t>(_mm_movemask_epi8(eq));
++	};
++	auto check_candidates = [&](idx_t pos, uint32_t mask) -> idx_t {
++		while (mask) {
++			auto bit = static_cast<idx_t>(CountZeros<uint32_t>::Trailing(mask));
++			if (memcmp(haystack + pos + bit + 1, needle + 1, needle_size - 2) == 0) {
++				return pos + bit;
++			}
++			mask &= mask - 1;
++		}
++		return DConstants::INVALID_INDEX;
++	};
++	idx_t pos = 0;
++	for (; pos + 16 <= num_starts; pos += 16) {
++		auto result = check_candidates(pos, block_mask(pos));
++		if (result != DConstants::INVALID_INDEX) {
++			return result;
++		}
++	}
++	if (pos < num_starts) {
++		// overlapping final block ending at the last valid start; drop positions already checked
++		idx_t tail_pos = num_starts - 16;
++		auto skip = pos - tail_pos;
++		auto mask = block_mask(tail_pos) & ~((uint32_t(1) << skip) - 1);
++		return check_candidates(tail_pos, mask);
++	}
++	return DConstants::INVALID_INDEX;
++}
++#endif
++
+ } // namespace
+ 
+ idx_t FindStrInStr(const unsigned char *haystack, idx_t haystack_size, const unsigned char *needle, idx_t needle_size) {
+ 	D_ASSERT(needle_size > 0);
++#if defined(__SSE2__)
++	if (needle_size >= 2 && haystack_size <= 256 && haystack_size >= needle_size + 15) {
++		return FindStrInStrBlock(haystack, haystack_size, needle, needle_size);
++	}
++#endif
+ 	// start off by performing a memchr to find the first character of the
+ 	auto location = memchr(haystack, needle[0], haystack_size);
+ 	if (location == nullptr) {

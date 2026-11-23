@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/physical_plan/plan_aggregate.cpp: The change makes an existing, tested operator (PERFECT_HASH_GROUP_BY) usable in more cases, and it is a planner-level heuristic. It does not refer to any table, column, literal or row count. The conditions are general: integer keys with min/max stats, a total of at most 22 bits, an estimated group count of at least 1/4 of the slots, and a cap on per-thread memory.",
+      "Correctness: the perfect HT path still uses the existing NULL and range (+2) logic and the existing distinct and combine checks, so no new correctness surface is added. If the estimate is wrong, only performance suffers.",
+      "Memory: the tables are allocated outside the buffer manager, so the threads * 2^bits * (aligned state sizes + 1) <= max_memory/8 guard is the right protection against untracked memory growth. With a 22-bit cap the product cannot overflow. The guard respects the configured memory limit and thread count; it does not raise them.",
+      "Minor: a user who raises perfect_ht_threshold above 22 now also gets the dense path, through MaxValue. That matches the previous behaviour in that range, so it is fine. The setting's default is unchanged, and no tests or measurement code are touched."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/execution/physical_plan/plan_aggregate.cpp: The change makes an existing, tested operator (PERFECT_HASH_GROUP_BY) usable in more cases, and it is a planner-level heuristic. It does not refer to any table, column, literal or row count. The conditions are general: integer keys with min/max stats, a total of at most 22 bits, an estimated group count of at least 1/4 of the slots, and a cap on per-thread memory.\",\"Correctness: the perfect HT path still uses the existing NULL and range (+2) logic and the existing distinct and combine checks, so no new correctness surface is added. If the estimate is wrong, only performance suffers.\",\"Memory: the tables are allocated outside the buffer manager, so the threads * 2^bits * (aligned state sizes + 1) <= max_memory/8 guard is the right protection against untracked memory growth. With a 22-bit cap the product cannot overflow. The guard respects the configured memory limit and thread count; it does not raise them.\",\"Minor: a user who raises perfect_ht_threshold above 22 now also gets the dense path, through MaxValue. That matches the previous behaviour in that range, so it is fine. The setting's default is unchanged, and no tests or measurement code are touched.\"],\"required_changes\":[]}",
+  "cost_usd": 0.12375040000000001,
+  "seconds": 17.694504737854004,
+  "error": ""
+}

@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/perfect_aggregate_hashtable.cpp InitializeFusedUpdate: the eligibility conditions are general (count_star, sum_no_overflow over INT32/INT64, avg with a 16-byte AvgState<int64_t>, no filter, distinct or destructor). No names, literals or data properties are referenced.",
+      "The state layouts match: SumState<T>{bool isset; T value} (sum_helpers.hpp:27) and AvgState<T>{uint64_t count; T value} (avg.cpp:16). Static asserts and the runtime state_size check protect them. value=0 still comes from BaseSumOperation::Initialize, which is untouched.",
+      "Other avg variants are excluded correctly: TIMESTAMP/TIME avg uses AvgState<hugeint_t> (state size not 16), INT16 avg is rejected by physical type, and DOUBLE avg is rejected by input type. The INT32/INT64 int64-state avg only exists when avg.cpp:284 proves the sum cannot overflow, so overflow semantics are unchanged.",
+      "NULLs, constant vectors and dictionary vectors are handled through UnifiedVectorFormat sel/validity in the same way as the generic path (sum/avg skip NULLs, isset is set only on valid rows, count_star counts every row). The E0003 replica addressing is computed before FusedUpdate and the state offsets are built from payload_size, matching the existing AddInPlace loop.",
+      "Minor and not blocking: recognising functions by name could misfire for a user-registered aggregate named 'avg' with a 16-byte state and integer input. This is very unlikely, and the state_size check limits the risk."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/execution/perfect_aggregate_hashtable.cpp InitializeFusedUpdate: the eligibility conditions are general (count_star, sum_no_overflow over INT32/INT64, avg with a 16-byte AvgState<int64_t>, no filter, distinct or destructor). No names, literals or data properties are referenced.\",\"The state layouts match: SumState<T>{bool isset; T value} (sum_helpers.hpp:27) and AvgState<T>{uint64_t count; T value} (avg.cpp:16). Static asserts and the runtime state_size check protect them. value=0 still comes from BaseSumOperation::Initialize, which is untouched.\",\"Other avg variants are excluded correctly: TIMESTAMP/TIME avg uses AvgState<hugeint_t> (state size not 16), INT16 avg is rejected by physical type, and DOUBLE avg is rejected by input type. The INT32/INT64 int64-state avg only exists when avg.cpp:284 proves the sum cannot overflow, so overflow semantics are unchanged.\",\"NULLs, constant vectors and dictionary vectors are handled through UnifiedVectorFormat sel/validity in the same way as the generic path (sum/avg skip NULLs, isset is set only on valid rows, count_star counts every row). The E0003 replica addressing is computed before FusedUpdate and the state offsets are built from payload_size, matching the existing AddInPlace loop.\",\"Minor and not blocking: recognising functions by name could misfire for a user-registered aggregate named 'avg' with a 16-byte state and integer input. This is very unlikely, and the state_size check limits the risk.\"],\"required_changes\":[]}",
+  "cost_usd": 0.3038092,
+  "seconds": 85.31920385360718,
+  "error": ""
+}

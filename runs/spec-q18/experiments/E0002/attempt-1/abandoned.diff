@@ -1,0 +1,282 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..7e40428 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -915,6 +915,141 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
+ 	Verify();
+ }
+ 
++void GroupedAggregateHashTable::CombineInPlace(TupleDataCollection &other_data, unsafe_vector<data_ptr_t> &live_rows,
++                                               optional_ptr<atomic<double>> progress) {
++	D_ASSERT(other_data.GetLayout().GetRowWidth() == layout_ptr->GetRowWidth());
++	D_ASSERT(!layout_ptr->HasDestructor());
++	D_ASSERT(Count() == 0);
++	D_ASSERT(!skip_lookups);
++	live_rows.clear();
++	if (other_data.Count() == 0) {
++		return;
++	}
++
++	// The pointer table must be able to hold every row of the collection, as we cannot resize (rows are not ours)
++	const auto required_capacity = GetCapacityForCount(other_data.Count());
++	if (capacity < required_capacity) {
++		Resize(required_capacity);
++	}
++
++	const auto hash_col_idx = layout_ptr->ColumnCount() - 1;
++	vector<column_t> column_ids;
++	column_ids.reserve(hash_col_idx);
++	for (idx_t col_idx = 0; col_idx < hash_col_idx; col_idx++) {
++		column_ids.emplace_back(col_idx);
++	}
++	TupleDataScanState scan_state;
++	other_data.InitializeScan(scan_state, column_ids, TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
++	DataChunk groups;
++	other_data.InitializeScanChunk(scan_state, groups);
++
++	Vector hashes_v(LogicalType::HASH);
++	Vector addresses_v(LogicalType::POINTER);
++	Vector sources_v(LogicalType::POINTER);
++	Vector targets_v(LogicalType::POINTER);
++	SelectionVector empty_vector(STANDARD_VECTOR_SIZE);
++	if (state.group_chunk.ColumnCount() == 0) {
++		state.group_chunk.InitializeEmpty(layout_ptr->GetTypes());
++	}
++
++	idx_t chunk_idx = 0;
++	const auto chunk_count = other_data.ChunkCount();
++	while (other_data.Scan(scan_state, groups)) {
++		if (context.interrupted.load(std::memory_order_relaxed)) {
++			throw InterruptException();
++		}
++		const auto chunk_size = groups.size();
++		auto &row_locations_v = scan_state.chunk_state.row_locations;
++		const auto row_locations = FlatVector::GetData<data_ptr_t>(row_locations_v);
++		other_data.Gather(row_locations_v, *FlatVector::IncrementalSelectionVector(), chunk_size, hash_col_idx,
++		                  hashes_v, *FlatVector::IncrementalSelectionVector(), nullptr);
++
++		for (idx_t grp_idx = 0; grp_idx < groups.ColumnCount(); grp_idx++) {
++			state.group_chunk.data[grp_idx].Reference(groups.data[grp_idx]);
++		}
++		state.group_chunk.data[groups.ColumnCount()].Reference(hashes_v);
++		state.group_chunk.SetCardinality(chunk_size);
++		TupleDataCollection::ToUnifiedFormat(state.partitioned_append_state.chunk_state, state.group_chunk);
++
++		hashes_v.Flatten(chunk_size);
++		const auto hashes = FlatVector::GetData<hash_t>(hashes_v);
++		addresses_v.Flatten(chunk_size);
++		const auto addresses = FlatVector::GetData<data_ptr_t>(addresses_v);
++		const auto sources = FlatVector::GetData<data_ptr_t>(sources_v);
++		const auto targets = FlatVector::GetData<data_ptr_t>(targets_v);
++		const auto ht_offsets = FlatVector::GetData<uint64_t>(state.ht_offsets);
++		const auto hash_salts = FlatVector::GetData<hash_t>(state.hash_salts);
++		for (idx_t r = 0; r < chunk_size; r++) {
++			ht_offsets[r] = ApplyBitMask(hashes[r]);
++			hash_salts[r] = ht_entry_t::ExtractSalt(hashes[r]);
++		}
++
++		idx_t combine_count = 0;
++		const SelectionVector *sel_vector = FlatVector::IncrementalSelectionVector();
++		idx_t remaining_entries = chunk_size;
++		idx_t iteration_count;
++		for (iteration_count = 0; remaining_entries > 0 && iteration_count < capacity; iteration_count++) {
++			idx_t new_entry_count = 0;
++			idx_t need_compare_count = 0;
++			idx_t no_match_count = 0;
++			if (sel_vector->IsSet()) {
++				GroupedAggregateHashTableInnerLoop<true>(entries, capacity, bitmask, hash_salts, ht_offsets, sel_vector,
++				                                         remaining_entries, empty_vector, state.group_compare_vector,
++				                                         new_entry_count, need_compare_count);
++			} else {
++				GroupedAggregateHashTableInnerLoop<false>(entries, capacity, bitmask, hash_salts, ht_offsets, sel_vector,
++				                                          remaining_entries, empty_vector, state.group_compare_vector,
++				                                          new_entry_count, need_compare_count);
++			}
++
++			// First-seen groups: the source row itself becomes the target
++			for (idx_t new_entry_idx = 0; new_entry_idx < new_entry_count; new_entry_idx++) {
++				const auto index = empty_vector.get_index_unsafe(new_entry_idx);
++				const auto row_location = row_locations[index];
++				entries[ht_offsets[index]].SetPointer(row_location);
++				addresses[index] = row_location;
++				live_rows.push_back(row_location);
++			}
++
++			if (need_compare_count != 0) {
++				for (idx_t need_compare_idx = 0; need_compare_idx < need_compare_count; need_compare_idx++) {
++					const auto index = state.group_compare_vector.get_index_unsafe(need_compare_idx);
++					addresses[index] = entries[ht_offsets[index]].GetPointer();
++				}
++				const auto match_count =
++				    row_matcher.Match(state.group_chunk, state.partitioned_append_state.chunk_state.vector_data,
++				                      state.group_compare_vector, need_compare_count, addresses_v,
++				                      &state.no_match_vector, no_match_count);
++				// Matching groups: combine the source row into the existing target
++				for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
++					const auto index = state.group_compare_vector.get_index_unsafe(match_idx);
++					sources[combine_count] = row_locations[index];
++					targets[combine_count] = addresses[index];
++					combine_count++;
++				}
++			}
++
++			for (idx_t i = 0; i < no_match_count; i++) {
++				const auto index = state.no_match_vector.get_index_unsafe(i);
++				SaltIncrementAndWrap(ht_offsets[index], hash_salts[index], bitmask);
++			}
++			sel_vector = &state.no_match_vector;
++			remaining_entries = no_match_count;
++		}
++		if (iteration_count == capacity) {
++			throw InternalException("Maximum outer iteration count reached in GroupedAggregateHashTable");
++		}
++
++		RowOperations::CombineStates(state.row_state, *layout_ptr, sources_v, targets_v, combine_count);
++
++		if (progress) {
++			*progress = static_cast<double>(++chunk_idx) / static_cast<double>(chunk_count);
++		}
++	}
++	count = live_rows.size();
++	Verify();
++}
++
+ void GroupedAggregateHashTable::InitializeScan(AggregateHTScanState &scan_state) {
+ 	scan_state.partition_idx = 0;
+ 	vector<idx_t> group_indexes(layout_ptr->ColumnCount() - 1);
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..4212af7 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -95,6 +95,10 @@ struct AggregatePartition : StateWithBlockableTasks {
+ 
+ 	unique_ptr<TupleDataCollection> data;
+ 	atomic<double> progress;
++
++	//! Whether the partition was combined in-place (rows of "data" are pinned, "live_rows" point to the groups)
++	bool combined_in_place = false;
++	unsafe_vector<data_ptr_t> live_rows;
+ };
+ 
+ class RadixHTGlobalSinkState;
+@@ -776,6 +780,10 @@ private:
+ 	//! State and chunk for scanning
+ 	TupleDataScanState scan_state;
+ 	DataChunk scan_chunk;
++
++	//! State for scanning a partition that was combined in-place
++	idx_t live_row_idx;
++	Vector live_row_locations;
+ };
+ 
+ unique_ptr<GlobalSourceState> RadixPartitionedHashTable::GetGlobalSourceState(ClientContext &context) const {
+@@ -826,7 +834,7 @@ SourceResultType RadixHTGlobalSourceState::AssignTask(RadixHTGlobalSinkState &si
+ RadixHTLocalSourceState::RadixHTLocalSourceState(ExecutionContext &context, const RadixPartitionedHashTable &radix_ht)
+     : task(RadixHTSourceTaskType::NO_TASK), task_idx(DConstants::INVALID_INDEX), scan_status(RadixHTScanStatus::DONE),
+       layout(radix_ht.GetLayout().Copy()), aggregate_allocator(BufferAllocator::Get(context.client)),
+-      row_state(aggregate_allocator) {
++      row_state(aggregate_allocator), live_row_idx(0), live_row_locations(LogicalType::POINTER) {
+ 	auto &allocator = BufferAllocator::Get(context.client);
+ 	auto scan_chunk_types = radix_ht.group_types;
+ 	for (auto &aggr_type : radix_ht.op.aggregate_return_types) {
+@@ -875,14 +883,23 @@ void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlob
+ 		ht->Abandon();
+ 	}
+ 
+-	// Now combine the uncombined data using this thread's HT
+-	ht->Combine(*partition.data, &partition.progress);
+-	partition.progress = 1;
+-
+-	// Move the combined data back to the partition
+-	partition.data = make_uniq<TupleDataCollection>(BufferManager::GetBufferManager(gstate.context),
+-	                                                sink.radix_ht.GetLayoutPtr(), MemoryTag::HASH_TABLE);
+-	partition.data->Combine(*ht->AcquirePartitionedData()->GetPartitions()[0]);
++	// If the data is in memory, is scanned only once, and the states need no destruction, we can combine in-place:
++	// the first row of each group is used as the target, and duplicates are combined into it
++	const auto in_place = !sink.external && !layout.HasDestructor() &&
++	                      sink.scan_pin_properties == TupleDataPinProperties::DESTROY_AFTER_DONE;
++	if (in_place) {
++		ht->CombineInPlace(*partition.data, partition.live_rows, &partition.progress);
++		partition.combined_in_place = true;
++		partition.progress = 1;	} else {
++		// Now combine the uncombined data using this thread's HT
++		ht->Combine(*partition.data, &partition.progress);
++		partition.progress = 1;
++
++		// Move the combined data back to the partition
++		partition.data = make_uniq<TupleDataCollection>(BufferManager::GetBufferManager(gstate.context),
++		                                                sink.radix_ht.GetLayoutPtr(), MemoryTag::HASH_TABLE);
++		partition.data->Combine(*ht->AcquirePartitionedData()->GetPartitions()[0]);
++	}
+ 
+ 	// Update thread-global state
+ 	auto guard = sink.Lock();
+@@ -916,14 +933,23 @@ void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSo
+ 	auto &data_collection = *partition.data;
+ 
+ 	if (scan_status == RadixHTScanStatus::INIT) {
+-		data_collection.InitializeScan(scan_state, gstate.column_ids, sink.scan_pin_properties);
++		if (partition.combined_in_place) {
++			live_row_idx = 0;
++		} else {
++			data_collection.InitializeScan(scan_state, gstate.column_ids, sink.scan_pin_properties);
++		}
+ 		scan_status = RadixHTScanStatus::IN_PROGRESS;
+ 	}
+ 
+-	if (!data_collection.Scan(scan_state, scan_chunk)) {
++	const bool scan_done = partition.combined_in_place ? live_row_idx >= partition.live_rows.size()
++	                                                   : !data_collection.Scan(scan_state, scan_chunk);
++	if (scan_done) {
+ 		if (sink.scan_pin_properties == TupleDataPinProperties::DESTROY_AFTER_DONE) {
+ 			data_collection.Reset();
+ 		}
++		if (partition.combined_in_place) {
++			partition.live_rows = unsafe_vector<data_ptr_t>();
++		}
+ 		scan_status = RadixHTScanStatus::DONE;
+ 		auto guard = sink.Lock();
+ 		if (++gstate.task_done == sink.partitions.size()) {
+@@ -932,8 +958,25 @@ void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSo
+ 		return;
+ 	}
+ 
++	Vector *row_locations = &scan_state.chunk_state.row_locations;
++	if (partition.combined_in_place) {
++		// Gather the groups directly from the (pinned) live rows of the partition
++		const auto scan_count = MinValue<idx_t>(partition.live_rows.size() - live_row_idx, STANDARD_VECTOR_SIZE);
++		memcpy(FlatVector::GetData<data_ptr_t>(live_row_locations), partition.live_rows.data() + live_row_idx,
++		       scan_count * sizeof(data_ptr_t));
++		live_row_idx += scan_count;
++		scan_chunk.Reset();
++		for (idx_t col_idx = 0; col_idx < gstate.column_ids.size(); col_idx++) {
++			data_collection.Gather(live_row_locations, *FlatVector::IncrementalSelectionVector(), scan_count,
++			                       gstate.column_ids[col_idx], scan_chunk.data[col_idx],
++			                       *FlatVector::IncrementalSelectionVector(), nullptr);
++		}
++		scan_chunk.SetCardinality(scan_count);
++		row_locations = &live_row_locations;
++	}
++
+ 	const auto group_cols = layout.ColumnCount() - 1;
+-	RowOperations::FinalizeStates(row_state, layout, scan_state.chunk_state.row_locations, scan_chunk, group_cols);
++	RowOperations::FinalizeStates(row_state, layout, *row_locations, scan_chunk, group_cols);
+ 
+ 	if (sink.scan_pin_properties == TupleDataPinProperties::DESTROY_AFTER_DONE && layout.HasDestructor()) {
+ 		RowOperations::DestroyStates(row_state, layout, scan_state.chunk_state.row_locations, scan_chunk.size());
+diff --git a/src/include/duckdb/execution/aggregate_hashtable.hpp b/src/include/duckdb/execution/aggregate_hashtable.hpp
+index 5846343..dd95a21 100644
+--- a/src/include/duckdb/execution/aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/aggregate_hashtable.hpp
+@@ -125,6 +125,11 @@ public:
+ 	//! Executes the filter(if any) and update the aggregates
+ 	void Combine(GroupedAggregateHashTable &other);
+ 	void Combine(TupleDataCollection &other_data, optional_ptr<atomic<double>> progress = nullptr);
++	//! Combines the rows of "other_data" in-place: the first row of each group becomes the target and is appended to
++	//! "live_rows", the states of subsequent rows are combined into it. Requires an empty HT, keeps "other_data"
++	//! fully pinned, and must only be used if the layout has no destructors.
++	void CombineInPlace(TupleDataCollection &other_data, unsafe_vector<data_ptr_t> &live_rows,
++	                    optional_ptr<atomic<double>> progress = nullptr);
+ 
+ private:
+ 	ClientContext &context;

@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp: the new IsStringPatternFilter only matches generic function names (contains, like, ilike, regexp_matches, suffix/ends_with and their operator aliases) that take a constant pattern. It names no tables, columns, literals or data sizes, and it applies to any LIKE '%x%' or contains-style table filter.",
+      "Only the cardinality estimate changes (0.05 instead of 0.2 when there is no equality filter), so plan choice changes but results cannot. The existing rules still apply: an equality-filter estimate wins, the result is clamped to at least 1, and an empty table still gives 0.",
+      "Performance risk: when a pattern matches most rows (e.g. LIKE '%a%'), the estimate will be too low and could pick the wrong build side. The author states this risk. Postgres-style estimators make the same trade-off, and maintainers would accept it as a heuristic.",
+      "The diff is small and focused, with no duplicated code, test changes or settings changes."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/optimizer/join_order/relation_statistics_helper.cpp: the new IsStringPatternFilter only matches generic function names (contains, like, ilike, regexp_matches, suffix/ends_with and their operator aliases) that take a constant pattern. It names no tables, columns, literals or data sizes, and it applies to any LIKE '%x%' or contains-style table filter.\",\"Only the cardinality estimate changes (0.05 instead of 0.2 when there is no equality filter), so plan choice changes but results cannot. The existing rules still apply: an equality-filter estimate wins, the result is clamped to at least 1, and an empty table still gives 0.\",\"Performance risk: when a pattern matches most rows (e.g. LIKE '%a%'), the estimate will be too low and could pick the wrong build side. The author states this risk. Postgres-style estimators make the same trade-off, and maintainers would accept it as a heuristic.\",\"The diff is small and focused, with no duplicated code, test changes or settings changes.\"],\"required_changes\":[]}",
+  "cost_usd": 0.07557620000000001,
+  "seconds": 22.08735466003418,
+  "error": ""
+}

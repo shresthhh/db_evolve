@@ -1,0 +1,67 @@
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 9134893..2954192 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -11,6 +11,8 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/function/function_binder.hpp"
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
++#include "duckdb/storage/buffer_manager.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+@@ -124,11 +126,15 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
++//! Hard cap on the number of bits for a perfect hash aggregate above perfect_ht_threshold (dense key ranges only)
++static constexpr idx_t DENSE_PERFECT_HT_MAX_BITS = 22;
++
+ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, vector<idx_t> &bits_per_group) {
+ 	if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+ 		return false;
+ 	}
+ 	idx_t perfect_hash_bits = 0;
++	const idx_t threshold = Settings::Get<PerfectHtThresholdSetting>(context);
+ 	for (idx_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
+ 		auto &group = op.groups[group_idx];
+ 		auto &stats = op.group_stats[group_idx];
+@@ -227,17 +233,36 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 		bits_per_group.push_back(required_bits);
+ 		perfect_hash_bits += required_bits;
+ 		// check if we have exceeded the bits for the hash
+-		if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)) {
++		if (perfect_hash_bits > MaxValue<idx_t>(threshold, DENSE_PERFECT_HT_MAX_BITS)) {
+ 			// too many bits for perfect hash
+ 			return false;
+ 		}
+ 	}
++	idx_t state_size = 0;
+ 	for (auto &expression : op.expressions) {
+ 		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+ 		if (aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback()) {
+ 			// distinct aggregates are not supported in perfect hash aggregates
+ 			return false;
+ 		}
++		state_size += AlignValue(aggregate.function.GetStateSizeCallback()(aggregate.function));
++	}
++	if (perfect_hash_bits <= threshold) {
++		return true;
++	}
++	// beyond the threshold, only use a perfect hash table if the key range is dense:
++	// the estimated number of groups must fill at least a quarter of the slots, so we never allocate a mostly
++	// empty array. The tables are allocated per thread outside of the buffer manager (they cannot spill), so their
++	// combined size must also stay within a small fraction of the memory limit.
++	const idx_t total_groups = idx_t(1) << perfect_hash_bits;
++	if (op.estimated_cardinality < total_groups / 4) {
++		return false;
++	}
++	const idx_t threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++	const idx_t tuple_size = state_size + 1;
++	const idx_t max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
++	if (threads * total_groups * tuple_size > max_memory / 8) {
++		return false;
+ 	}
+ 	return true;
+ }

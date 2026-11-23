@@ -1,0 +1,27 @@
+{
+  "id": "E0006",
+  "title": "Re-land exact-bitmap join filter through CM compress (E0005) plus group prefetch in the HT probe and build",
+  "started": "2026-11-23T17:16:53-05:00",
+  "base": "a496c6c900cceface52a41cb5babf2ae9f4baade",
+  "candidate": "d4af50c12be752c02f83e37d0ad2dc389024599d",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -5.7%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 3.691794,
+  "summary": "I re-landed Part A (the join filter through compressed-materialization integral compression) and dropped Part B (prefetch) because it had no measurable effect.\n\nMeasured q09 bench against the current best across three runs: -11.8% (502\u2192443 ms), -15.6% (525\u2192444, that build had prefetch compiled in but switched off), and the final tree -9.2% (508\u2192461). In the q09 profile, the orders scan now gets a shifted min/max filter plus an exact-bitmap BF and drops from 15.0M to 2.92M rows. The orders hash join goes from 1.59s to 1.28s CPU.\n\nWhat changed:\n(1) The join filter optimizer now follows the probe key through `__internal_compress_integral_*(x, const)`. It requires x to be an integral of at most 64 bits, not UBIGINT, and the constant to be non-NULL and castable to BIGINT. It records a `Value offset` on JoinFilterPushdownColumn, copies it into UNION child rewrites, and allows only one offset per column. TopN and RowGroupPruner bail out when a target has an offset.\n(2) In FinalizeFilters, for offset columns, min/max are cast to HUGEINT, the offset is added, and the result is cast to the storage type; the column is skipped if a cast fails. The IN filter is skipped. A BF is pushed only after TrySetExactBloomFilterRange makes the HT filter exact and the storage type is INT8..INT64 or UINT8..UINT32. A hashed BF is never pushed for an offset column.\n(3) BFTableFilter gets has_key_offset/key_offset, serialized as optional fields 203/204. Filter, FilterValue and CheckStatistics test the bit for (v - offset) in wrapping uint64 arithmetic, and the statistics range check uses hugeint. A non-exact filter with an offset lets every row through.\n(4) PushBloomFilter passes the offset and the storage key type.\n\nPart B, prefetch in join_hashtable.cpp (HT entries during probe and build, row pointers before RowMatcher, gated on a pointer table of at least 1MB), was implemented and measured: +0.1% on its own, and 443.0 vs 443.5 ms with and without it on top of Part A. I removed it entirely.\n\nCorrectness: the bench result check passes. Two q09-shaped variants with different offsets (o_orderkey > 1234567, and BETWEEN 30M AND 45M with other p_name patterns) give results identical to `+0` (no-compression) versions of the same queries, checked with EXCEPT ALL in both directions; the second check ran on the final tree. EXPLAIN ANALYZE shows the offset of 1234567 being applied to the min/max filter: the dynamic filter reads l_orderkey>=1234592.",
+  "notes": "- At session start, `dbe-tool profile` showed the previous session's E0005 binary: the orders scan already had a BF and 2.94M rows. After `dbe-tool build` the real current best showed 15M rows. Rebuild before trusting a baseline profile.\n- Software prefetch (group pre-pass) in the join HT probe and build gave 0% on q09, with a 3.27M-row build and an ~8M-entry pointer table. The orders HJ cost is not bound by cache misses that software prefetch can fix; out-of-order execution already overlaps the independent per-row misses. Don't retry it.\n- The offset arithmetic can only cause false positives, never false negatives: matching rows have exact in-range bit indices, and wrap-around only makes extra rows pass.\n- Next targets in q09: the lineitem scan (~2.5-3.6s CPU), the 1.28s orders HJ (mostly build-side inserts of 3.27M rows), and the l_partkey/l_suppkey HJ (0.5s).",
+  "train_ratio": 0.9432860125588338,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9432860125588338
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-23T17:34:58-05:00"
+}

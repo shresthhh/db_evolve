@@ -1,0 +1,24 @@
+{
+  "systems": {
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "q01": "212b144ff9a3fb8a0eb07b06f31ef518e7804c48",
+    "q02": "cef9fd6aec98f7462c0cc3d125770f03d3623427",
+    "q09": "f0d9e1f9517988ef435167cd958db3ecb9b74267",
+    "q13": "6d8309dd1704585b563824468a1591c78480b328",
+    "q16": "084cba35c5dc243f7353ec8dcacb699f227beeda",
+    "q18": "d6c752b412f9acc366532f9729c2ddbffe9bd8f1",
+    "q19": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+    "q21": "b0c83377573d23a5cb80c654f47d99b957e40d93"
+  },
+  "unchanged_from_v0": [],
+  "runs": [
+    "spec-q01",
+    "spec-q02",
+    "spec-q09",
+    "spec-q13",
+    "spec-q16",
+    "spec-q18",
+    "spec-q19",
+    "spec-q21"
+  ]
+}

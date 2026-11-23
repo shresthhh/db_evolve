@@ -1,0 +1,16 @@
+{
+  "id": "E0006",
+  "title": "Collapse adjacent duplicate group keys before hash-table probe in aggregation",
+  "started": "2026-11-17T12:20:27-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.5760573999999999,
+  "summary": "I built the run-head collapse in GroupedAggregateHashTable::FindOrCreateGroupsInternal and it works, but q18 does not get measurably faster, so I'm abandoning it.\n\nWhat it does: a file-local helper finds rows whose group is identical to the row before. It checks the hash first, then each group column through the existing UnifiedVectorFormat. NULLs must match, values are compared bit for bit, and strings use string_t ==. Supported types are numerics, hugeint/uhugeint, float/double, interval and varchar; any other group type turns the check off. If at least 1/8 of the chunk are duplicates, only the run heads are probed (through the existing HAS_SEL inner loop), and afterwards each duplicate copies its head's address. Over a 16-chunk trial, if fewer than half the chunks benefit, the check is turned off for that table. The bookkeeping (a heads SelectionVector and counters) lives in AggregateHTAppendState in the header.\n\nIt builds (BUILD OK). Spot checks gave the expected results: the q18 subquery returns 10 rows; GROUP BY on (orderkey, linenumber) gives 6,001,215 groups whose counts sum to the input; a GROUP BY with NULL keys returns a correct NULL group; a varchar plus boolean key works.\n\nMeasurements:\n- **Aggregate CPU:** EXPLAIN ANALYZE puts HASH_GROUP_BY at 0.83s before and 0.75s after, summed over threads, about 10% less.\n- **q18 wall time:** across four bench runs the change was -2.1%, -5.4%, -0.9% and +1.5%, about -1.7% on average. That is inside the stated noise of about 5% and far from the predicted -15 to -25%.\n- **Geomean:** the full-suite numbers (-2.6% and -5.0%) were also noise. Queries that barely aggregate moved the same amount, and a rerun of q03, q14, q18 and q19 came out at +0.6%.",
+  "notes": "The premise was wrong. A duplicate row next to its run head was already cheap: its probe hits the same table slot and group row the head had just touched, so both are in cache, and the salt and RowMatcher compare cost little. Most of the aggregate's time is not in probing repeat rows. It goes to creating 1.5M new groups (append, partitioning, InitializeStates), UpdateAggregates, and the combine/finalize phase for 1.5M groups. Removing the probes for about 75% of rows saved roughly 10% of the aggregate's CPU and almost no wall time.\n\nIf someone picks this up again:\n1. Profile how sink time splits against combine/finalize for high-cardinality aggregates before attacking the probe.\n2. For clustered input, a bigger saving might come from pre-aggregating each run (summing payloads inside a run before updating state, so the state is touched once per run), but UpdateAggregates is generic across aggregate functions, which makes that harder.\n3. Look at the cost of the partitioned append and of the finalize phase for 1.5M groups.\n\nThe diff is saved for the record. It is correct and low risk if a later change makes the probe the bottleneck.",
+  "finished": "2026-11-17T12:25:14-05:00"
+}

@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "relation_manager.cpp: FilterHasAggregateRangePredicate matches the general shape `aggregate_result <op> foldable` for range ops, walks nested ANDs, and applies one extra DEFAULT_SELECTIVITY factor with a floor of 1. It uses no names, literals or dataset knowledge. It changes only the relation estimate, not the aggregate's SetEstimatedCardinality.",
+      "cardinality_estimator.cpp: SEMI selectivity becomes max(5, tdom/rhs_card), and only when the RHS estimate is smaller than the key domain. This is a standard containment-style estimate: a semi join keeps about rhs/tdom of the LHS. ANTI joins keep the old path. The guards rule out division by zero (tdom > 0, rhs >= 1).",
+      "Only cardinality estimates change, so results stay correct for all inputs, including NULLs, empty inputs and spilling. The possible downside is plan regressions on queries with non-selective HAVING clauses. That is acceptable under the specialisation rules."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"relation_manager.cpp: FilterHasAggregateRangePredicate matches the general shape `aggregate_result <op> foldable` for range ops, walks nested ANDs, and applies one extra DEFAULT_SELECTIVITY factor with a floor of 1. It uses no names, literals or dataset knowledge. It changes only the relation estimate, not the aggregate's SetEstimatedCardinality.\",\"cardinality_estimator.cpp: SEMI selectivity becomes max(5, tdom/rhs_card), and only when the RHS estimate is smaller than the key domain. This is a standard containment-style estimate: a semi join keeps about rhs/tdom of the LHS. ANTI joins keep the old path. The guards rule out division by zero (tdom > 0, rhs >= 1).\",\"Only cardinality estimates change, so results stay correct for all inputs, including NULLs, empty inputs and spilling. The possible downside is plan regressions on queries with non-selective HAVING clauses. That is acceptable under the specialisation rules.\"],\"required_changes\":[]}",
+  "cost_usd": 0.108676,
+  "seconds": 19.21197533607483,
+  "error": ""
+}

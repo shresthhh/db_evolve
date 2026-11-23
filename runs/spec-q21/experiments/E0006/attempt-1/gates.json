@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "bloom_filter.cpp: the exact-bitmap mode is gated only on general properties: a single integral key type (INT8..INT64, UINT8..UINT32), a known build min/max, range < 2^29 bits, and range < 128 bits per build row. Nothing refers to tables, columns, literals or dataset sizes.",
+      "Correctness: InsertKey/LookupKey compute (key - min) in uint64, so the range check cannot overflow, including near INT64 limits. A build key outside the recorded range sets exact_overflow, and the filter then lets every row through. NULL build rows are skipped through the row validity bits. Probe NULLs follow filters_null_values. If the probe vector's type differs from the key type, all rows pass. CheckStatistics stays conservative.",
+      "join_hashtable.cpp: reading layout column 0 as the key is valid. ReorderConditions puts the equality condition first, and PushBloomFilter already uses conditions[0]. The equality_predicate_columns.size()==1 relaxation is consistent, because both the HT hashes and the BF hashes use only the equality key.",
+      "physical_hash_join.cpp: SetKeyRange runs in FinalizeFilters before AllocatePointerTable/Initialize. The bitmap is filled inside the existing parallel finalize tasks with fetch_or. The filter only becomes visible to scans through the deferred FinishEvent push, so it is never read half-filled. Spilling (external) joins do not reach this path.",
+      "join_filter_pushdown_optimizer.cpp: treating a DELIM_GET build side as filtering is a reasonable, general heuristic, since the build side is the deduplicated set of correlated values.",
+      "Memory: the bitmap is capped at 64MB and bounded at 128 bits per build row, which is comparable to the pointer table. This is not an unreasonable resource increase."
+    ],
+    "required_changes": []
+  }
+}

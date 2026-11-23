@@ -1,0 +1,167 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..ad9500b 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -278,6 +278,40 @@ idx_t GroupedAggregateHashTable::GetHLLUpperBound() const {
+ 	return LossyNumericCast<idx_t>((1 + HyperLogLog::GetErrorRate()) * static_cast<double>(hll.Count()));
+ }
+ 
++void GroupedAggregateHashTable::SetPartitionKeyCount(idx_t count_p) {
++	D_ASSERT(Count() == 0);
++	// Only useful if the partition key is a strict prefix of the group columns
++	partition_key_count = count_p < layout_ptr->ColumnCount() - 1 ? count_p : 0;
++}
++
++void GroupedAggregateHashTable::HashGroups(DataChunk &groups, Vector &hashes) {
++	groups.Hash(hashes);
++	if (partition_key_count == 0) {
++		return;
++	}
++	D_ASSERT(partition_key_count < groups.ColumnCount());
++	if (!partition_key_hashes) {
++		partition_key_hashes = make_uniq<Vector>(LogicalType::HASH);
++	}
++	auto &key_hashes = *partition_key_hashes;
++	const auto count = groups.size();
++	// Same hash function (and column order) as DataChunk::Hash on the key columns
++	VectorOperations::Hash(groups.data[0], key_hashes, count);
++	for (idx_t col_idx = 1; col_idx < partition_key_count; col_idx++) {
++		VectorOperations::CombineHash(key_hashes, groups.data[col_idx], count);
++	}
++	hashes.Flatten(count);
++	key_hashes.Flatten(count);
++	// Splice the radix bits of the key hash into the full hash, so that all rows of a key end up in the same
++	// partition. Salt and pointer table bits keep coming from the full hash.
++	static constexpr hash_t RADIX_MASK = RadixPartitioning::Mask(RadixPartitioning::MAX_RADIX_BITS);
++	auto hash_data = FlatVector::GetData<hash_t>(hashes);
++	const auto key_hash_data = FlatVector::GetData<hash_t>(key_hashes);
++	for (idx_t i = 0; i < count; i++) {
++		hash_data[i] = (hash_data[i] & ~RADIX_MASK) | (key_hash_data[i] & RADIX_MASK);
++	}
++}
++
+ void GroupedAggregateHashTable::Resize(idx_t size) {
+ 	D_ASSERT(size >= STANDARD_VECTOR_SIZE);
+ 	D_ASSERT(IsPowerOfTwo(size));
+@@ -520,12 +554,14 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
+ 	sink_count += groups.size();
+ 
+ 	// check if we can use an optimized path that utilizes compressed vectors
+-	auto result = TryAddCompressedGroups(groups, payload, filter);
+-	if (result.IsValid()) {
+-		return result.GetIndex();
++	if (partition_key_count == 0) {
++		auto result = TryAddCompressedGroups(groups, payload, filter);
++		if (result.IsValid()) {
++			return result.GetIndex();
++		}
+ 	}
+ 	// otherwise append the raw values
+-	groups.Hash(state.hashes);
++	HashGroups(groups, state.hashes);
+ 
+ 	return AddChunk(groups, state.hashes, payload, filter);
+ }
+@@ -827,7 +863,7 @@ void GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &ad
+ 
+ idx_t GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &addresses_out,
+                                                     SelectionVector &new_groups_out) {
+-	groups.Hash(state.hashes);
++	HashGroups(groups, state.hashes);
+ 	return FindOrCreateGroups(groups, state.hashes, addresses_out, new_groups_out);
+ }
+ 
+diff --git a/src/execution/operator/aggregate/physical_hash_aggregate.cpp b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+index 4eda5cb..4620e9f 100644
+--- a/src/execution/operator/aggregate/physical_hash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+@@ -185,6 +185,24 @@ PhysicalHashAggregate::PhysicalHashAggregate(PhysicalPlan &physical_plan, Client
+ 		groupings.emplace_back(grouping_sets[i], grouped_aggregate_data, distinct_collection_info, group_validity,
+ 		                       distinct_validity);
+ 	}
++
++	// With many groups, partition the distinct HTs on the hash of the group columns only (which are the first
++	// columns of the distinct HTs). Every distinct partition then holds complete groups, so re-aggregating the
++	// distinct tuples into the main HT sees far fewer groups per task. With few groups, this would skew partitions.
++	static constexpr idx_t DISTINCT_PARTITION_ON_GROUPS_MIN_CARDINALITY = 4096;
++	if (estimated_cardinality >= DISTINCT_PARTITION_ON_GROUPS_MIN_CARDINALITY) {
++		for (idx_t i = 0; i < groupings.size(); i++) {
++			auto &distinct_data = groupings[i].distinct_data;
++			if (!distinct_data || grouping_sets[i].empty()) {
++				continue;
++			}
++			for (auto &radix_table : distinct_data->radix_tables) {
++				if (radix_table) {
++					radix_table->partition_key_count = grouping_sets[i].size();
++				}
++			}
++		}
++	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..7fdb023 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -70,8 +70,12 @@ const TupleDataLayout &RadixPartitionedHashTable::GetLayout() const {
+ 
+ unique_ptr<GroupedAggregateHashTable> RadixPartitionedHashTable::CreateHT(ClientContext &context, const idx_t capacity,
+                                                                           const idx_t radix_bits) const {
+-	return make_uniq<GroupedAggregateHashTable>(context, BufferAllocator::Get(context), group_types, op.payload_types,
+-	                                            op.bindings, capacity, radix_bits, group_validity);
++	auto ht = make_uniq<GroupedAggregateHashTable>(context, BufferAllocator::Get(context), group_types,
++	                                               op.payload_types, op.bindings, capacity, radix_bits, group_validity);
++	if (partition_key_count != 0) {
++		ht->SetPartitionKeyCount(partition_key_count);
++	}
++	return ht;
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/include/duckdb/execution/aggregate_hashtable.hpp b/src/include/duckdb/execution/aggregate_hashtable.hpp
+index 5846343..ff79039 100644
+--- a/src/include/duckdb/execution/aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/aggregate_hashtable.hpp
+@@ -121,6 +121,8 @@ public:
+ 	bool HLLEnabled() const;
+ 	//! Get HLL count
+ 	idx_t GetHLLUpperBound() const;
++	//! Take the radix (partition) bits of the group hash from the first 'count' group columns only (0 = off)
++	void SetPartitionKeyCount(idx_t count);
+ 
+ 	//! Executes the filter(if any) and update the aggregates
+ 	void Combine(GroupedAggregateHashTable &other);
+@@ -176,6 +178,10 @@ private:
+ 	bool enable_hll;
+ 	//! The associated HLL
+ 	HyperLogLog hll;
++	//! If > 0, the radix bits of the group hashes are computed from the first partition_key_count group columns
++	idx_t partition_key_count = 0;
++	//! Scratch vector for hashing the partition key columns
++	unique_ptr<Vector> partition_key_hashes;
+ 
+ 	//! The active arena allocator used by the aggregates for their internal state
+ 	shared_ptr<ArenaAllocator> aggregate_allocator;
+@@ -218,6 +224,8 @@ private:
+ 	void ReinsertTuples(PartitionedTupleData &data);
+ 
+ 	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter);
++	//! Computes the hashes of the groups (respecting partition_key_count)
++	void HashGroups(DataChunk &groups, Vector &hashes);
+ 
+ 	//! Does the actual group matching / creation
+ 	idx_t FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes, Vector &addresses,
+diff --git a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+index cf294cf..2cb308d 100644
+--- a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
++++ b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+@@ -35,6 +35,8 @@ public:
+ 	vector<Value> grouping_values;
+ 	//! Whether there are no NULLs in the groups
+ 	const TupleDataValidityType group_validity;
++	//! If > 0, partition the HTs on the hash of the first partition_key_count group columns only
++	idx_t partition_key_count = 0;
+ 
+ public:
+ 	//! Sink Interface

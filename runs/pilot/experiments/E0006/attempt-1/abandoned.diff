@@ -1,0 +1,248 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..d89ece6 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -36,7 +36,8 @@ GroupedAggregateHashTable::GroupedAggregateHashTable(ClientContext &context, All
+ GroupedAggregateHashTable::AggregateHTAppendState::AggregateHTAppendState(ArenaAllocator &allocator)
+     : hashes(LogicalType::HASH), ht_offsets(LogicalType::UBIGINT), hash_salts(LogicalType::HASH),
+       new_groups(STANDARD_VECTOR_SIZE), group_compare_vector(STANDARD_VECTOR_SIZE),
+-      no_match_vector(STANDARD_VECTOR_SIZE), addresses(LogicalType::POINTER), row_state(allocator) {
++      no_match_vector(STANDARD_VECTOR_SIZE), addresses(LogicalType::POINTER), run_head_sel(STANDARD_VECTOR_SIZE),
++      row_state(allocator) {
+ }
+ 
+ GroupedAggregateHashTable::GroupedAggregateHashTable(ClientContext &context_p, Allocator &allocator,
+@@ -638,6 +639,143 @@ static void GroupedAggregateHashTableInnerLoop(ht_entry_t *const entries, const
+ 	}
+ }
+ 
++template <class T>
++static bool AdjacentValuesEqual(const T &a, const T &b) {
++	// Bitwise comparison: only claims equality when values are identical, which implies group equality
++	return memcmp(&a, &b, sizeof(T)) == 0;
++}
++
++template <>
++bool AdjacentValuesEqual(const string_t &a, const string_t &b) {
++	return a == b;
++}
++
++//! Keeps the candidate rows (row r, compared to row r - 1) for which the group column values are equal
++template <class T>
++static idx_t FilterAdjacentEqual(const UnifiedVectorFormat &format, SelectionVector &candidates,
++                                 const idx_t candidate_count) {
++	const auto data = UnifiedVectorFormat::GetData<T>(format);
++	const auto &sel = *format.sel;
++	const auto &validity = format.validity;
++	idx_t result_count = 0;
++	if (validity.AllValid()) {
++		for (idx_t i = 0; i < candidate_count; i++) {
++			const auto r = candidates.get_index_unsafe(i);
++			const auto idx_cur = sel.get_index(r);
++			const auto idx_prev = sel.get_index(r - 1);
++			candidates.set_index(result_count, r);
++			result_count += AdjacentValuesEqual<T>(data[idx_cur], data[idx_prev]);
++		}
++	} else {
++		for (idx_t i = 0; i < candidate_count; i++) {
++			const auto r = candidates.get_index_unsafe(i);
++			const auto idx_cur = sel.get_index(r);
++			const auto idx_prev = sel.get_index(r - 1);
++			const auto valid_cur = validity.RowIsValid(idx_cur);
++			const auto valid_prev = validity.RowIsValid(idx_prev);
++			bool equal;
++			if (valid_cur != valid_prev) {
++				equal = false;
++			} else if (!valid_cur) {
++				equal = true; // both NULL
++			} else {
++				equal = AdjacentValuesEqual<T>(data[idx_cur], data[idx_prev]);
++			}
++			candidates.set_index(result_count, r);
++			result_count += equal;
++		}
++	}
++	return result_count;
++}
++
++//! Finds rows whose group equals the group of the previous row ("duplicates"), stored in ascending order in
++//! "duplicates". Returns the number of duplicates, or DConstants::INVALID_INDEX if the group types are not supported
++static idx_t FindAdjacentDuplicateGroups(const vector<LogicalType> &group_types,
++                                         const vector<TupleDataVectorFormat> &vector_data, const hash_t *hashes,
++                                         const idx_t count, SelectionVector &duplicates) {
++	for (auto &type : group_types) {
++		switch (type.InternalType()) {
++		case PhysicalType::BOOL:
++		case PhysicalType::INT8:
++		case PhysicalType::INT16:
++		case PhysicalType::INT32:
++		case PhysicalType::INT64:
++		case PhysicalType::INT128:
++		case PhysicalType::UINT8:
++		case PhysicalType::UINT16:
++		case PhysicalType::UINT32:
++		case PhysicalType::UINT64:
++		case PhysicalType::UINT128:
++		case PhysicalType::FLOAT:
++		case PhysicalType::DOUBLE:
++		case PhysicalType::INTERVAL:
++		case PhysicalType::VARCHAR:
++			break;
++		default:
++			return DConstants::INVALID_INDEX;
++		}
++	}
++
++	// Candidates: rows with the same hash as the previous row
++	idx_t dup_count = 0;
++	for (idx_t r = 1; r < count; r++) {
++		duplicates.set_index(dup_count, r);
++		dup_count += hashes[r] == hashes[r - 1];
++	}
++
++	for (idx_t col_idx = 0; col_idx < group_types.size() && dup_count != 0; col_idx++) {
++		const auto &format = vector_data[col_idx].unified;
++		switch (group_types[col_idx].InternalType()) {
++		case PhysicalType::BOOL:
++		case PhysicalType::INT8:
++			dup_count = FilterAdjacentEqual<int8_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::INT16:
++			dup_count = FilterAdjacentEqual<int16_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::INT32:
++			dup_count = FilterAdjacentEqual<int32_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::INT64:
++			dup_count = FilterAdjacentEqual<int64_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::INT128:
++			dup_count = FilterAdjacentEqual<hugeint_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::UINT8:
++			dup_count = FilterAdjacentEqual<uint8_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::UINT16:
++			dup_count = FilterAdjacentEqual<uint16_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::UINT32:
++			dup_count = FilterAdjacentEqual<uint32_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::UINT64:
++			dup_count = FilterAdjacentEqual<uint64_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::UINT128:
++			dup_count = FilterAdjacentEqual<uhugeint_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::FLOAT:
++			dup_count = FilterAdjacentEqual<float>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::DOUBLE:
++			dup_count = FilterAdjacentEqual<double>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::INTERVAL:
++			dup_count = FilterAdjacentEqual<interval_t>(format, duplicates, dup_count);
++			break;
++		case PhysicalType::VARCHAR:
++			dup_count = FilterAdjacentEqual<string_t>(format, duplicates, dup_count);
++			break;
++		default:
++			throw InternalException("Unsupported type in FindAdjacentDuplicateGroups");
++		}
++	}
++	return dup_count;
++}
++
+ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes_v,
+                                                             Vector &addresses_v, SelectionVector &new_groups_out) {
+ 	D_ASSERT(groups.ColumnCount() + 1 == layout_ptr->ColumnCount());
+@@ -719,9 +857,52 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
+ 		hash_salts[r] = ht_entry_t::ExtractSalt(hash);
+ 	}
+ 
++	// If the input has runs of equal groups (e.g., clustered or sorted input), only probe the first row of each run.
++	// The other rows of the run take the address of the previous row after probing.
++	idx_t remaining_entries = chunk_size;
++	bool use_run_heads = false;
++	if (!state.run_check_disabled && chunk_size > 1) {
++		auto &duplicates = state.no_match_vector; // Used as scratch space here, overwritten in the loop below
++		const auto dup_count = FindAdjacentDuplicateGroups(groups.GetTypes(),
++		                                                   state.partitioned_append_state.chunk_state.vector_data,
++		                                                   hashes, chunk_size, duplicates);
++		if (dup_count == DConstants::INVALID_INDEX) {
++			state.run_check_disabled = true;
++		} else {
++			static constexpr idx_t RUN_CHECK_TRIAL_CHUNKS = 16;
++			const auto beneficial = dup_count != 0 && dup_count >= chunk_size / 8;
++			if (state.run_check_chunks < RUN_CHECK_TRIAL_CHUNKS) {
++				state.run_check_chunks++;
++				state.run_check_hits += beneficial;
++				if (state.run_check_chunks == RUN_CHECK_TRIAL_CHUNKS &&
++				    state.run_check_hits < RUN_CHECK_TRIAL_CHUNKS / 2) {
++					state.run_check_disabled = true;
++				}
++			}
++			if (beneficial) {
++				// Build the selection of run heads (complement of the duplicates)
++				idx_t head_count = 0;
++				idx_t dup_idx = 0;
++				for (idx_t r = 0; r < chunk_size; r++) {
++					if (dup_idx < dup_count && duplicates.get_index_unsafe(dup_idx) == r) {
++						dup_idx++;
++						continue;
++					}
++					state.run_head_sel.set_index(head_count++, r);
++				}
++				D_ASSERT(head_count + dup_count == chunk_size);
++				sel_vector = &state.run_head_sel;
++				remaining_entries = head_count;
++				use_run_heads = true;
++				// The duplicates were included in the occupied count, but are not probed
++				occupied_count = 0;
++			}
++		}
++	}
++	const auto head_count = remaining_entries;
++
+ 	SelectionVector empty_vector;
+ 	idx_t new_group_count = 0;
+-	idx_t remaining_entries = chunk_size;
+ 	idx_t iteration_count;
+ 	for (iteration_count = 0; remaining_entries > 0 && iteration_count < capacity; iteration_count++) {
+ 		idx_t new_entry_count = 0;
+@@ -809,6 +990,17 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
+ 		throw InternalException("Maximum outer iteration count reached in GroupedAggregateHashTable");
+ 	}
+ 
++	if (use_run_heads) {
++		// Rows between consecutive run heads have the same group as the head before them
++		for (idx_t i = 0; i < head_count; i++) {
++			const auto head = state.run_head_sel.get_index_unsafe(i);
++			const auto end = i + 1 < head_count ? state.run_head_sel.get_index_unsafe(i + 1) : chunk_size;
++			for (idx_t r = head + 1; r < end; r++) {
++				addresses[r] = addresses[head];
++			}
++		}
++	}
++
+ 	count += new_group_count;
+ 	return new_group_count;
+ }
+diff --git a/src/include/duckdb/execution/aggregate_hashtable.hpp b/src/include/duckdb/execution/aggregate_hashtable.hpp
+index 5846343..449b42c 100644
+--- a/src/include/duckdb/execution/aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/aggregate_hashtable.hpp
+@@ -199,6 +199,14 @@ private:
+ 		DataChunk group_chunk;
+ 		AggregateDictionaryState dict_state;
+ 
++		//! Selection of rows whose group differs from the previous row (run heads)
++		SelectionVector run_head_sel;
++		//! Number of chunks checked for adjacent duplicate groups, and how many had enough duplicates
++		idx_t run_check_chunks = 0;
++		idx_t run_check_hits = 0;
++		//! Whether the adjacent duplicate check is disabled (input does not have runs of equal groups)
++		bool run_check_disabled = false;
++
+ 		RowOperationsState row_state;
+ 	} state;

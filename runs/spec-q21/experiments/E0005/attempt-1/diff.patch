@@ -1,0 +1,138 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..28141f8 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -772,7 +772,9 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 
+ 	// bf is only supported for single key joins with equality condition as the Filter API only allows
+ 	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// single-column filters so far. Residual non-equality conditions are fine: the bloom filter only
++	// hashes the (single) equality key, which is always conditions[0]
++	const bool can_use_bf = ht->equality_predicate_columns.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..15c8480 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -302,7 +302,8 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// a DELIM_GET carries the distinct join keys of the (possibly filtered) outer side
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..ebf5d2c 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -1,6 +1,7 @@
+ #include "duckdb/planner/filter/bloom_filter.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+ #include "duckdb/common/operator/subtract.hpp"
++#include "duckdb/common/types/hash.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -93,8 +94,96 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 	}
+ }
+ 
++template <class T>
++static idx_t TemplatedFilterFlatRuns(const BloomFilter &bf, Vector &keys_v, SelectionVector &sel,
++                                     idx_t &approved_tuple_count, BFTableFilterState &state) {
++	// Keys are flat and NULL-free: hash inline and reuse the lookup result for runs of equal keys
++	const auto keys = FlatVector::GetData<T>(keys_v);
++	idx_t found_count = 0;
++	if (sel.IsSet()) {
++		if (approved_tuple_count == 0) {
++			return 0;
++		}
++		T prev_key = keys[sel.get_index(0)];
++		bool prev_found = bf.LookupOne(Hash<T>(prev_key));
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			const auto idx = sel.get_index(i);
++			const T key = keys[idx];
++			if (key != prev_key) {
++				prev_key = key;
++				prev_found = bf.LookupOne(Hash<T>(key));
++			}
++			sel.set_index(found_count, idx);
++			found_count += prev_found;
++		}
++	} else {
++		if (approved_tuple_count == 0) {
++			return 0;
++		}
++		if (state.current_capacity < approved_tuple_count) {
++			state.bf_sel.Initialize(approved_tuple_count);
++			state.hashes_v.Initialize(false, approved_tuple_count);
++			state.current_capacity = approved_tuple_count;
++		}
++		T prev_key = keys[0];
++		bool prev_found = bf.LookupOne(Hash<T>(prev_key));
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			const T key = keys[i];
++			if (key != prev_key) {
++				prev_key = key;
++				prev_found = bf.LookupOne(Hash<T>(key));
++			}
++			state.bf_sel.set_index(found_count, i);
++			found_count += prev_found;
++		}
++		if (found_count != approved_tuple_count) {
++			sel.Initialize(state.bf_sel);
++		}
++	}
++	approved_tuple_count = found_count;
++	return found_count;
++}
++
++static bool FlatKeysHaveNoNulls(Vector &keys_v, const SelectionVector &sel, idx_t approved_tuple_count) {
++	auto &validity = FlatVector::Validity(keys_v);
++	if (validity.AllValid()) {
++		return true;
++	}
++	if (!sel.IsSet()) {
++		return validity.CountValid(approved_tuple_count) == approved_tuple_count;
++	}
++	for (idx_t i = 0; i < approved_tuple_count; i++) {
++		if (!validity.RowIsValid(sel.get_index(i))) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
++	if (keys_v.GetVectorType() == VectorType::FLAT_VECTOR && FlatKeysHaveNoNulls(keys_v, sel, approved_tuple_count)) {
++		switch (keys_v.GetType().InternalType()) {
++		case PhysicalType::INT8:
++			return TemplatedFilterFlatRuns<int8_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::INT16:
++			return TemplatedFilterFlatRuns<int16_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::INT32:
++			return TemplatedFilterFlatRuns<int32_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::INT64:
++			return TemplatedFilterFlatRuns<int64_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::UINT8:
++			return TemplatedFilterFlatRuns<uint8_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::UINT16:
++			return TemplatedFilterFlatRuns<uint16_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::UINT32:
++			return TemplatedFilterFlatRuns<uint32_t>(filter, keys_v, sel, approved_tuple_count, state);
++		case PhysicalType::UINT64:
++			return TemplatedFilterFlatRuns<uint64_t>(filter, keys_v, sel, approved_tuple_count, state);
++		default:
++			break;
++		}
++	}
+ 	if (state.current_capacity < approved_tuple_count) {
+ 		state.hashes_v.Initialize(false, approved_tuple_count);
+ 		state.bf_sel.Initialize(approved_tuple_count);

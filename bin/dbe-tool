@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Agent-facing tool. Keeps the caller's directory as the slot, runs the framework from the project root.
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PY="$ROOT/.toolchain/env/bin/python"
+[ -x "$PY" ] || PY=python3
+export DBE_SLOT="${DBE_SLOT:-$PWD}"
+cd "$ROOT" && exec "$PY" -m dbevolve.tool "$@"

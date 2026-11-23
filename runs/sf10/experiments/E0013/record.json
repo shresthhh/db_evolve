@@ -1,0 +1,16 @@
+{
+  "id": "E0013",
+  "title": "Perfect hash join for RIGHT joins on dense integer keys (range up to 4M)",
+  "started": "2026-11-17T22:49:17-05:00",
+  "base": "b6929da26e9e9170936084797dd3d9e34cd54b2d",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.7842122,
+  "summary": "Implemented the perfect hash join for RIGHT joins and for dense INNER builds with ranges up to 4M. Files: perfect_hash_join_executor.cpp/.hpp, plus a hook in physical_hash_join.cpp PrepareScanHT. (1) CanDoPerfectHashJoin accepts INNER or RIGHT with one integer equality condition. Ranges over 1M (cap 4M), and every RIGHT join, need ht.Count()*2 >= range+1. (2) The build fill now skips NULL keys; before, it read garbage values for them. RIGHT joins only reach this code since this change. (3) For RIGHT joins: a uint8 matched flag per slot is set in the probe, plus a uint32 slot index per build row in scan order. (4) PropagateMatches() re-scans the data collection pinned (KEEP_EVERYTHING_PINNED) and stores found_match=true for matched rows before ScanFullOuter. I avoided keeping row pointers from finalize because I couldn't be sure the rows stay pinned until the outer scan. Measured: q13 RIGHT join CPU 2.06s -> 1.68s in EXPLAIN ANALYZE, but q13 wall time only -1.0% / -1.4% / -0.8% over three runs. The full bench was dominated by noise: run 1 showed q03 -24%, q07 -23%, q09 +11%; run 2 showed q03 +27%, q04 +33%, q22 -18%; a targeted rerun gave q03 -2.8%, q09 +0.5%. No template showed an effect I could attribute to the change. Correctness check: a RIGHT join with NULL build keys, negative keys, a 2M range at about 99.9% density, duplicate probe keys and unmatched build rows gave the hand-computed counts and sum (3,498,600 total, 501,600 unmatched).",
+  "notes": "q13 is limited by the orders scan with the NOT LIKE '%..%..%' filter (3.01s CPU) and the HASH_GROUP_BY count(o_orderkey) over 15.3M join output rows (3.05s CPU), not by the join. The perfect-HT join still costs 1.68s CPU. Much of that is probably building dictionary/slice output and the decompress/compress projections, not the lookup itself. A q13 follow-up should target the LIKE-filtered scan or the group-by over join output, for example an aggregate pushed below the join or a perfect-hash aggregate on the dense key. The bench machine was very noisy this session: whole blocks of templates moved \u00b125% in opposite directions between back-to-back full runs. Use targeted reruns before trusting any delta. The implementation is in the saved tree and passed the one RIGHT-join test. The NULL-key validity check in TemplatedFillSelectionVectorBuild is needed for any future RIGHT, OUTER or SEMI perfect-HT work.",
+  "finished": "2026-11-17T22:58:19-05:00"
+}

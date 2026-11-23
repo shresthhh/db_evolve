@@ -1,0 +1,16 @@
+{
+  "id": "E0005",
+  "title": "Cost-aware initial scan filter order: run Bloom/dynamic join filters after cheap constant predicates",
+  "started": "2026-11-21T12:00:17-05:00",
+  "base": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.46104860000000003,
+  "summary": "I tried the cost-aware initial scan filter order and abandoned it because bench shows no measurable gain on q19. The tree builds.\n\nChanges in ExpressionHeuristics::Cost(const TableFilter&):\n- BLOOM_FILTER costs 50.\n- SelectivityOptionalFilter takes its child's cost (plain OptionalFilter stays 0).\n- EXPRESSION_FILTER takes Cost(expr) instead of 1000.\n- Fixed the BOUND_REF case in Cost(Expression&). It cast a BoundReferenceExpression to BoundColumnRefExpression, and Cast throws even in release builds.\n\nResults:\n- Steps (1)+(2) alone: bench q19 +3.0%, so no effect.\n- With (3) added, the Bloom filter now runs after the cheap predicates. In the q19.m0 profile the lineitem scan's cumulative time fell from 5.88s to 4.70s, and total time from 0.792s to 0.651s.\n- Bench q19 over five runs: -5.9%, -3.2%, +9.4%, +2.3%, +1.7%. That is within noise; wall time did not improve.",
+  "notes": "- Filter ordering is not the bottleneck for q19's lineitem scan. The profile gain did not show up in bench wall time.\n- Bench noise on q19 is about \u00b110% between runs. The baseline itself moved between 128 and 174ms.\n- Latent bug: ExpressionHeuristics::Cost(Expression&) BOUND_REF does Cast<BoundColumnRefExpression>(), which throws InternalException. Any future change that sends ExpressionFilter expressions (which contain BoundReferenceExpression) through Cost must fix that case first.\n- In the profile with the change, the plan showed the shipmode optional filter twice (\"optional: l_shipmode IN (...) AND optional: l_shipmode IN (...)\"). It is probably a re-planning or pushdown artefact, not caused by this change, but it may be worth checking.\n- Next things to look at: per-row decode and Bloom-filter probe cost, not ordering.",
+  "finished": "2026-11-21T12:04:59-05:00"
+}

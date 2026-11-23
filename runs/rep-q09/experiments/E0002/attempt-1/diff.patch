@@ -1,0 +1,52 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..2ee50f9 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -718,7 +718,18 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
+                                  InsertState &insert_state, bool parallel) {
+ 	// Insert Hashes into the BF
+ 	if (bloom_filter.IsInitialized()) {
+-		bloom_filter.InsertHashes(hashes_v, count);
++		if (conditions.size() == 1) {
++			bloom_filter.InsertHashes(hashes_v, count);
++		} else {
++			// multi-key join: the BF is only on the first key column, so hash that column alone
++			// (the row hash combines all key columns)
++			Vector key_v(layout_ptr->GetTypes()[0]);
++			Vector key_hashes_v(LogicalType::HASH);
++			const auto &sel = *FlatVector::IncrementalSelectionVector();
++			data_collection->Gather(chunk_state.row_locations, sel, count, 0, key_v, sel, nullptr);
++			VectorOperations::Hash(key_v, key_hashes_v, count);
++			bloom_filter.InsertHashes(key_hashes_v, count);
++		}
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+ 	auto row_locations = chunk_state.row_locations;
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..61f8037 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -770,9 +770,10 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// bf is only supported on the first key with equality condition as the Filter API only allows
++	// single-column filters so far (for multi-key joins the BF is built on the first key column only)
++	const bool can_use_bf =
++	    cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -896,7 +897,8 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
+-				if (!has_cast && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				const bool is_first_key = join_condition[filter_idx] == 0;
++				if (!has_cast && is_first_key && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.

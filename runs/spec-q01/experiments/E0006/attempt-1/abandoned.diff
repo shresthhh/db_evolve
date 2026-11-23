@@ -1,0 +1,18 @@
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index deb1c5f..f245d36 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -41,8 +41,12 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 			can_replicate = false;
+ 		}
+ 	}
+-	if (can_replicate && total_groups * tuple_size * MAX_REPLICA_COUNT <= MAX_REPLICATED_HT_SIZE) {
++	if (can_replicate) {
++		// use the largest power of two replica count for which the replicated states fit the size cap
+ 		replica_count = MAX_REPLICA_COUNT;
++		while (replica_count > 1 && total_groups * tuple_size * replica_count > MAX_REPLICATED_HT_SIZE) {
++			replica_count /= 2;
++		}
+ 	}
+ 
+ 	// allocate and null initialize the data

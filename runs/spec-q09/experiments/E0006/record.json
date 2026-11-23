@@ -1,0 +1,16 @@
+{
+  "id": "E0006",
+  "title": "Hash join prefetch distance tuning (16 -> 32) plus prefetch on the probe-retry path",
+  "started": "2026-11-20T00:58:41-05:00",
+  "base": "f0d9e1f9517988ef435167cd958db3ecb9b74267",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.1610944,
+  "summary": "Changed HT_PREFETCH_DISTANCE in src/execution/join_hashtable.cpp, which sets the distance for both the probe and build-insert loops. Timed q09 against the current best (distance 16). Distance 32 over three runs: -2.7%, +9.1%, -7.6%, a mean of about -0.4%. Distance 64 over one run: +6.7%. The quick bench's spread here is about \u00b19%, so 32 is indistinguishable from 16 and 64 looks worse. In the profile at distance 32, the o_orderkey=l_orderkey HASH_JOIN took 1.43s, against 1.31s in .dbe/profile.md at distance 16. That is no improvement, though the two numbers come from different runs. Nothing came close to the 5% bar, so the tree is left as is.",
+  "notes": "Prefetch distance tuning is a dead end: 16 to 32 shows no measurable gain, and 64 looks slower, probably from line-fill-buffer pressure or prefetched lines being evicted before use. I didn't try 48 or separate probe and build distances, since 32 showed nothing. In the profile the orders join is the probe side: 15M orders rows probe a hash table built from the 3.27M lineitem rows that survive the earlier joins. The time there is not only probe latency; it also includes the 15M-row scan feeding it and the hashing. A better lever is probably to cut the 15M probe rows before they reach the join: push a bloom filter or min/max filter from the lineitem-side build keys into the orders scan. Only 3.27M of 15M rows match, so a filter on the build keys should drop about 78% of probes. The dynamic filters listed on the orders scan show none on o_orderkey. That likely comes down to the E0002 bloom pushdown not firing for this single-key join, or the build side being too large for the bloom size gate. Worth checking.",
+  "finished": "2026-11-20T01:01:03-05:00"
+}

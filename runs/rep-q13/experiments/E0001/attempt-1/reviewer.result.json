@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "perfect_hash_join_executor.cpp: extending CanDoPerfectHashJoin to JoinType::RIGHT is a general change. It uses only the join type, the condition shape, the integer key type, a structural range cap (2^22) and a density guard (count >= range/4). Nothing refers to names, literals or row counts.",
+      "NULL build keys are handled: TemplatedFillSelectionVectorBuild now skips invalid keys, so for RIGHT joins (has_null=false, NULL-key rows kept) they never get a slot. They are still emitted by ScanFullOuter because their found-match flag starts false when rows are appended (join_hashtable.cpp:415).",
+      "The dup check change (Count() > range+1) is only an early bail-out. Exact duplicate detection still happens through bitmap_build_idx in the build fill. For RIGHT joins Count() includes NULL-key rows, which only makes the check more conservative.",
+      "Slots are only marked matched when they hold a build row: the probe selects only slots that are valid in the bitmap (or all slots when dense), so the uninitialised entries in build_row_locations are never dereferenced.",
+      "Parallel probe threads write the matched byte unsynchronised, but always with the value 1. This is the same harmless race the regular HT has on its found-match flag. MarkMatchedBuildRows runs once in PrepareScanHT, after all probing and before the outer scan.",
+      "Spilling joins reset perfect_join_executor; FULL, SEMI and ANTI joins are still excluded; enabling compute_aggregates_anyway for RIGHT joins only adds a cheap build min/max."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"perfect_hash_join_executor.cpp: extending CanDoPerfectHashJoin to JoinType::RIGHT is a general change. It uses only the join type, the condition shape, the integer key type, a structural range cap (2^22) and a density guard (count >= range/4). Nothing refers to names, literals or row counts.\",\"NULL build keys are handled: TemplatedFillSelectionVectorBuild now skips invalid keys, so for RIGHT joins (has_null=false, NULL-key rows kept) they never get a slot. They are still emitted by ScanFullOuter because their found-match flag starts false when rows are appended (join_hashtable.cpp:415).\",\"The dup check change (Count() > range+1) is only an early bail-out. Exact duplicate detection still happens through bitmap_build_idx in the build fill. For RIGHT joins Count() includes NULL-key rows, which only makes the check more conservative.\",\"Slots are only marked matched when they hold a build row: the probe selects only slots that are valid in the bitmap (or all slots when dense), so the uninitialised entries in build_row_locations are never dereferenced.\",\"Parallel probe threads write the matched byte unsynchronised, but always with the value 1. This is the same harmless race the regular HT has on its found-match flag. MarkMatchedBuildRows runs once in PrepareScanHT, after all probing and before the outer scan.\",\"Spilling joins reset perfect_join_executor; FULL, SEMI and ANTI joins are still excluded; enabling compute_aggregates_anyway for RIGHT joins only adds a cheap build min/max.\"],\"required_changes\":[]}",
+  "cost_usd": 0.3166302,
+  "seconds": 52.27868318557739,
+  "error": ""
+}

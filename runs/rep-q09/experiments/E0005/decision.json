@@ -1,0 +1,17 @@
+{
+  "accept": false,
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -7.9%; needs at least -5%)"
+  ],
+  "rule": "templates",
+  "train_ratio": 0.9212442941772758,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "improved": [],
+  "regressed": [],
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9212442941772758
+  },
+  "passes": 8
+}

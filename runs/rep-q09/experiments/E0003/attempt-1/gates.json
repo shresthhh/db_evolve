@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "join_filter_pushdown_optimizer.cpp: the new BOUND_FUNCTION case matches by structure, not by name or value. It needs the `__internal_compress_integral_*` prefix, exactly 2 children, a non-NULL constant offset that casts to BIGINT, and an integral input of at most 64 bits that is not UBIGINT. It allows only one level of compression. Decompress functions do not match the prefix. Any compressed-materialization integer join key qualifies, so this is general.",
+      "compress_integral.cpp: compression is `input - min_val`. So storage = key + offset, and ApplyJoinFilterOffset (key + offset in HUGEINT, then cast to the storage type) is correct. Adding an offset preserves order, so the inequality and single-value filters stay valid. If the translated value does not fit the storage type, the filter is skipped, which is the safe choice.",
+      "bloom_filter.cpp: the hashes match the hash table's. Hash<uint8/16/32>(c) = MurmurHash64(zero-extended c), and Hash<uint64>(masked c) gives the same value because the result is masked to the key width. For BIGINT keys (a cast above the compress), Hash<int64> = MurmurHash64(uint64), which is also the same. NULLs keep their validity in the scratch vector, as in the original path. Reusing found_v as scratch is safe: it is allocated alongside hashes_v and only read as hashes afterwards.",
+      "CheckStatistics returns NO_PRUNING_POSSIBLE when an offset is set, so zone maps are never pruned using values from the wrong domain. The IN-list path is skipped when there is an offset. TopN and RowGroupPruner bail out on offset columns. The UNION child rewrite copies the offset. Serialize uses optional fields that default to off, so it stays backward compatible.",
+      "Minor: the author could not test negative-min, large-min or NULL keys. I traced the arithmetic by hand for these and found no breaking input. The narrowing-cast case (TINYINT sign extension) can only happen with values that already raise a cast error."
+    ],
+    "required_changes": []
+  }
+}

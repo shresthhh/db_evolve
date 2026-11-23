@@ -1,0 +1,134 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..0e07c69 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -265,6 +265,15 @@ void GroupedAggregateHashTable::SkipLookups() {
+ 	skip_lookups = true;
+ }
+ 
++void GroupedAggregateHashTable::EnableLookups() {
++	D_ASSERT(Count() == 0);
++	skip_lookups = false;
++}
++
++bool GroupedAggregateHashTable::LookupsSkipped() const {
++	return skip_lookups;
++}
++
+ void GroupedAggregateHashTable::EnableHLL(bool enable) {
+ 	enable_hll = enable;
+ }
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..31c1fe9 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -382,6 +382,10 @@ public:
+ 	static constexpr idx_t ADAPTIVITY_THRESHOLD = 1048576;
+ 	//! Whether we have decided to adapt our strategy
+ 	bool adapted;
++	//! After seeing this many tuples, we check once whether the data is near-unique (before the first abandon)
++	static constexpr idx_t EARLY_ADAPTIVITY_THRESHOLD = 4 * STANDARD_VECTOR_SIZE;
++	//! Whether we have done the early check
++	bool early_checked;
+ 	//! Sink capacity for this thread
+ 	idx_t local_sink_capacity;
+ 
+@@ -390,7 +394,7 @@ public:
+ };
+ 
+ RadixHTLocalSinkState::RadixHTLocalSinkState(ClientContext &, const RadixPartitionedHashTable &radix_ht)
+-    : adapted(false), local_sink_capacity(DConstants::INVALID_INDEX) {
++    : adapted(false), early_checked(false), local_sink_capacity(DConstants::INVALID_INDEX) {
+ 	// If there are no groups we create a fake group so everything has the same group
+ 	group_chunk.InitializeEmpty(radix_ht.group_types);
+ 	if (radix_ht.grouping_set.empty()) {
+@@ -449,6 +453,14 @@ void DecideAdaptation(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lst
+ 		return;
+ 	}
+ 
++	if (ht.LookupsSkipped()) {
++		// Lookups were skipped tentatively (DecideEarlyAdaptation), but the data is not unique enough, turn them on
++		// The deduplicated count is meaningless while skipping lookups, so we don't try to increase capacity here
++		ht.Abandon();
++		ht.EnableLookups();
++		return;
++	}
++
+ 	const auto potential_increase_rate = deduplicated_percentage / hll_percentage;
+ 	if (potential_increase_rate > CAPACITY_INCREASE_DEDUPLICATION_RATE_THRESHOLD) {
+ 		// We could be deduplicating a lot better, increase HT capacity
+@@ -461,6 +473,32 @@ void DecideAdaptation(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lst
+ 	}
+ }
+ 
++//! Before the adaptivity threshold is reached, decide (reversibly) after every abandoned HT fill whether lookups are
++//! worth doing. If both the HLL estimate and the actual deduplication so far say almost every row is unique, we skip
++//! lookups and just append - the deduplication is done in the finalize phase anyway. Must be called right after Abandon
++bool IsNearUnique(GroupedAggregateHashTable &ht) {
++	static constexpr double SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD = 0.95;
++	const auto sink_count = ht.GetSinkCount();
++	if (sink_count == 0 || !ht.HLLEnabled()) {
++		return false;
++	}
++	const auto hll_count = MinValue(ht.GetHLLUpperBound(), sink_count);
++	const auto materialized_count = ht.GetMaterializedCount();
++	const auto hll_percentage = static_cast<double>(hll_count) / static_cast<double>(sink_count);
++	const auto materialized_percentage = static_cast<double>(materialized_count) / static_cast<double>(sink_count);
++	return hll_percentage > SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD &&
++	       materialized_percentage > SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD;
++}
++
++void DecideEarlyAdaptation(GroupedAggregateHashTable &ht) {
++	D_ASSERT(ht.Count() == 0);
++	if (IsNearUnique(ht)) {
++		ht.SkipLookups();
++	} else if (ht.LookupsSkipped()) {
++		ht.EnableLookups();
++	}
++}
++
+ // Grow abandoned_data (frozen at the radix bits of when we first went external) up to the current radix bits, so it
+ // never has fewer partitions than the data merged into it - Repartition/Combine only handle new >= old.
+ void GrowAbandonedDataToRadixBits(ClientContext &context, RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate,
+@@ -575,6 +613,16 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 		lstate.adapted = true;
+ 	}
+ 
++	if (!lstate.adapted && !lstate.early_checked && !gstate.external &&
++	    ht.GetSinkCount() >= RadixHTLocalSinkState::EARLY_ADAPTIVITY_THRESHOLD) {
++		// Check once, early during the first HT fill, so near-unique data doesn't have to wait for the first abandon
++		lstate.early_checked = true;
++		if (IsNearUnique(ht)) {
++			ht.Abandon();
++			ht.SkipLookups();
++		}
++	}
++
+ 	if (ht.Count() + STANDARD_VECTOR_SIZE < GroupedAggregateHashTable::ResizeThreshold(lstate.local_sink_capacity)) {
+ 		return; // We can fit another chunk
+ 	}
+@@ -584,6 +632,9 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 		// This only works because we never resize the HT
+ 		// We don't do this when running with 1 or 2 threads, it only makes sense when there's many threads
+ 		ht.Abandon();
++		if (!lstate.adapted && !gstate.external) {
++			DecideEarlyAdaptation(ht);
++		}
+ 	}
+ 
+ 	// Check if we need to repartition
+diff --git a/src/include/duckdb/execution/aggregate_hashtable.hpp b/src/include/duckdb/execution/aggregate_hashtable.hpp
+index 5846343..4d578e0 100644
+--- a/src/include/duckdb/execution/aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/aggregate_hashtable.hpp
+@@ -115,6 +115,10 @@ public:
+ 	idx_t GetMaterializedCount() const;
+ 	//! Skips lookups from here on out
+ 	void SkipLookups();
++	//! Re-enables lookups (only allowed when the pointer table is empty, e.g., right after Abandon)
++	void EnableLookups();
++	//! Whether lookups are currently skipped
++	bool LookupsSkipped() const;
+ 	//! Enable/disable HLL
+ 	void EnableHLL(bool enable);
+ 	//! Whether HLL is enabled

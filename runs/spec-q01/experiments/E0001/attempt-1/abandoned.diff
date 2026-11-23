@@ -1,0 +1,140 @@
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 30f66c0..68b7784 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -114,6 +114,112 @@ static void ComputeGroupLocation(Vector &group, Value &min, uintptr_t *address_d
+ 	}
+ }
+ 
++//! Fast path for chunks whose rows fall into only a few distinct groups: instead of scattering every row into its
++//! state, rows are (stably) partitioned by group and every aggregate's state is updated once per group with the
++//! aggregate's simple_update callback. Returns false (without side effects) if the fast path does not apply.
++bool PerfectAggregateHashTable::TryAddChunkFewGroups(DataChunk &payload, const uintptr_t *group_data, idx_t count) {
++	static constexpr idx_t MAX_FEW_GROUPS = 8;
++	static constexpr idx_t MAX_DIRECT_GROUPS = 4096;
++	if (count == 0) {
++		return false;
++	}
++	auto &aggregates = layout_ptr->GetAggregates();
++	for (auto &aggregate : aggregates) {
++		if (aggregate.filter || !aggregate.function.HasStateSimpleUpdateCallback()) {
++			return false;
++		}
++	}
++	for (auto &vec : payload.data) {
++		// constant inputs take a different (count-multiplying) code path in simple_update than in the scatter update
++		if (vec.GetVectorType() == VectorType::CONSTANT_VECTOR) {
++			return false;
++		}
++	}
++
++	// find the range of group indices in this chunk
++	uintptr_t min_group = group_data[0];
++	uintptr_t max_group = group_data[0];
++	for (idx_t i = 1; i < count; i++) {
++		min_group = MinValue(min_group, group_data[i]);
++		max_group = MaxValue(max_group, group_data[i]);
++	}
++	if (max_group >= total_groups || max_group - min_group >= MAX_DIRECT_GROUPS) {
++		// out-of-range groups are reported by the regular path
++		return false;
++	}
++
++	// histogram of the group indices of this chunk, indexed directly by (group - min_group)
++	const auto group_range = max_group - min_group + 1;
++	uint32_t histogram[MAX_DIRECT_GROUPS];
++	memset(histogram, 0, group_range * sizeof(uint32_t));
++	for (idx_t i = 0; i < count; i++) {
++		histogram[group_data[i] - min_group]++;
++	}
++
++	// collect the distinct groups present in this chunk
++	uintptr_t group_ids[MAX_FEW_GROUPS];
++	idx_t group_counts[MAX_FEW_GROUPS];
++	idx_t group_offsets[MAX_FEW_GROUPS];
++	idx_t group_count = 0;
++	idx_t offset = 0;
++	for (idx_t entry = 0; entry < group_range; entry++) {
++		if (histogram[entry] == 0) {
++			continue;
++		}
++		if (group_count == MAX_FEW_GROUPS) {
++			return false;
++		}
++		group_ids[group_count] = min_group + entry;
++		group_counts[group_count] = histogram[entry];
++		group_offsets[group_count] = offset;
++		// re-use the histogram as the write offset of the group
++		histogram[entry] = UnsafeNumericCast<uint32_t>(offset);
++		offset += group_counts[group_count];
++		group_count++;
++	}
++
++	// stable counting sort of the row indices by group
++	if (group_count > 1) {
++		auto sel_data = sel.data();
++		for (idx_t i = 0; i < count; i++) {
++			sel_data[histogram[group_data[i] - min_group]++] = UnsafeNumericCast<sel_t>(i);
++		}
++	}
++
++	vector<Vector> sliced_inputs;
++	for (idx_t slot = 0; slot < group_count; slot++) {
++		const auto group = group_ids[slot];
++		const auto group_count_rows = group_counts[slot];
++		group_is_set[group] = true;
++		auto state_ptr = data + group * tuple_size;
++
++		// slice the payload for this group (if there is more than one group)
++		Vector *inputs = payload.data.data();
++		SelectionVector group_sel;
++		if (group_count > 1) {
++			group_sel.Initialize(sel.data() + group_offsets[slot]);
++			sliced_inputs.clear();
++			sliced_inputs.reserve(payload.ColumnCount());
++			for (auto &vec : payload.data) {
++				sliced_inputs.emplace_back(vec, group_sel, group_count_rows);
++			}
++			inputs = sliced_inputs.data();
++		}
++
++		idx_t payload_idx = 0;
++		for (auto &aggregate : aggregates) {
++			auto input_count = UnsafeNumericCast<idx_t>(aggregate.child_count);
++			AggregateInputData aggr_input_data(aggregate.GetFunctionData(), *aggregate_allocator);
++			aggregate.function.GetStateSimpleUpdateCallback()(input_count == 0 ? nullptr : inputs + payload_idx,
++			                                                  aggr_input_data, input_count, state_ptr,
++			                                                  group_count_rows);
++			payload_idx += input_count;
++			state_ptr += aggregate.payload_size;
++		}
++	}
++	return true;
++}
++
+ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload) {
+ 	// first we need to find the location in the HT of each of the groups
+ 	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
+@@ -128,6 +234,9 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 		ComputeGroupLocation(groups.data[i], group_minima[i], address_data, current_shift, groups.size());
+ 	}
+ 	// now we have the HT entry number for every tuple
++	if (TryAddChunkFewGroups(payload, address_data, groups.size())) {
++		return;
++	}
+ 	// compute the actual pointer to the data by adding it to the base HT pointer and multiplying by the tuple size
+ 	for (idx_t i = 0; i < groups.size(); i++) {
+ 		const auto group = address_data[i];
+diff --git a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+index 211c27b..7db4975 100644
+--- a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+@@ -64,6 +64,8 @@ protected:
+ private:
+ 	//! Destroy the perfect aggregate HT (called automatically by the destructor)
+ 	void Destroy();
++	//! Update the aggregates per group if the chunk only touches a few groups; returns false if not applicable
++	bool TryAddChunkFewGroups(DataChunk &payload, const uintptr_t *group_data, idx_t count);
+ };
+ 
+ } // namespace duckdb

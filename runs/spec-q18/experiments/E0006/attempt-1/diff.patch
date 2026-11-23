@@ -1,0 +1,98 @@
+diff --git a/src/optimizer/join_order/cardinality_estimator.cpp b/src/optimizer/join_order/cardinality_estimator.cpp
+index f09070c..e9d2a9c 100644
+--- a/src/optimizer/join_order/cardinality_estimator.cpp
++++ b/src/optimizer/join_order/cardinality_estimator.cpp
+@@ -263,12 +263,22 @@ double CardinalityEstimator::CalculateUpdatedDenom(Subgraph2Denominator left, Su
+ 	}
+ 	case JoinType::SEMI:
+ 	case JoinType::ANTI: {
++		double selectivity = CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		if (filter.filter_info->join_type == JoinType::SEMI && filter.filter_info->right_set) {
++			// a semi join keeps at most the fraction of the key domain present in its (small) RHS
++			auto tdom = filter.has_distinct_count_hll ? static_cast<double>(filter.distinct_count_hll)
++			                                          : static_cast<double>(filter.distinct_count_no_hll);
++			auto rhs_cardinality = GetNumerator(*filter.filter_info->right_set);
++			if (tdom > 0 && rhs_cardinality >= 1 && rhs_cardinality < tdom) {
++				selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);
++			}
++		}
+ 		if (JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&
+ 		    JoinRelationSet::IsSubset(*right.relations, *filter.filter_info->right_set)) {
+-			new_denom = left.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++			new_denom = left.denom * selectivity;
+ 			return new_denom;
+ 		}
+-		new_denom = right.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		new_denom = right.denom * selectivity;
+ 		return new_denom;
+ 	}
+ 	default:
+diff --git a/src/optimizer/join_order/relation_manager.cpp b/src/optimizer/join_order/relation_manager.cpp
+index 18498c9..6b054a9 100644
+--- a/src/optimizer/join_order/relation_manager.cpp
++++ b/src/optimizer/join_order/relation_manager.cpp
+@@ -202,6 +202,50 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
+ 	AddRelation(input_op, parent, child_stats);
+ }
+ 
++static bool IsAggregateRangeComparison(const Expression &expr, idx_t aggregate_index) {
++	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
++	    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		for (auto &child : conj.children) {
++			if (IsAggregateRangeComparison(*child, aggregate_index)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++		return false;
++	}
++	switch (expr.GetExpressionType()) {
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		break;
++	default:
++		return false;
++	}
++	auto &comp = expr.Cast<BoundComparisonExpression>();
++	auto is_aggr_ref = [&](const Expression &side) {
++		return side.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
++		       side.Cast<BoundColumnRefExpression>().binding.table_index == aggregate_index;
++	};
++	return (is_aggr_ref(*comp.left) && comp.right->IsFoldable()) ||
++	       (is_aggr_ref(*comp.right) && comp.left->IsFoldable());
++}
++
++static bool FilterHasAggregateRangePredicate(const vector<reference<LogicalOperator>> &filters,
++                                             idx_t aggregate_index) {
++	for (auto &filter : filters) {
++		for (auto &expr : filter.get().expressions) {
++			if (IsAggregateRangeComparison(*expr, aggregate_index)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
+ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, LogicalOperator &input_op,
+                                            vector<reference<LogicalOperator>> &filter_operators,
+                                            optional_ptr<LogicalOperator> parent) {
+@@ -274,6 +318,13 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
+ 		if (!datasource_filters.empty()) {
+ 			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
+ 			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
++			if (FilterHasAggregateRangePredicate(datasource_filters, aggr.aggregate_index)) {
++				// range predicates on aggregate results (HAVING sum(x) > c) usually keep few groups
++				operator_stats.cardinality =
++				    MaxValue<idx_t>(LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
++				                                            RelationStatisticsHelper::DEFAULT_SELECTIVITY),
++				                    1);
++			}
+ 		}
+ 		ModifyStatsIfLimit(limit_op.get(), child_stats);
+ 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);

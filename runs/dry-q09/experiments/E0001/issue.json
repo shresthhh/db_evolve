@@ -1,0 +1,13 @@
+{
+  "title": "mock change (noop)",
+  "hypothesis": "No-op change used to exercise the pipeline.",
+  "plan": "Add a comment to one source file.",
+  "target_files": [
+    "src/common"
+  ],
+  "expected_gain": "none",
+  "generality": "Not workload specific.",
+  "risk": "none",
+  "status": "open",
+  "filed": "g1r1"
+}

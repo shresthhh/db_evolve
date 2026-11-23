@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "Dense-range perfect hash aggregate beyond perfect_ht_threshold",
+  "started": "2026-11-20T13:26:27-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "9625130f7a55400a4fd047726045b45dbf9bc812",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q13 -3.6%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.5795228,
+  "summary": "I changed CanUsePerfectHashAggregate in src/execution/physical_plan/plan_aggregate.cpp. The existing perfect_ht_threshold check works as before. Above that threshold, a GROUP BY can still use the perfect hash aggregate if three guards hold: (1) the total key bits are at most max(threshold, 22); (2) the key range is dense, meaning op.estimated_cardinality is at least 2^bits/4; (3) the tables fit in memory: threads * 2^bits * (sum of aligned aggregate state sizes + 1) must be at most 1/8 of the buffer manager's max memory, because these tables are allocated outside the buffer manager and cannot spill. The distinct and combine checks still apply to both paths. A user who sets the threshold above 22 sees the same behaviour as before. The setting's default is unchanged. On q13 the inner aggregate is now a PERFECT_HASH_GROUP_BY and its operator time fell from 3.14s to 0.53s. In the profile, total time went from 1.09s to 0.92s. `bench` (a quick check: 2 bindings, 4 hot runs each) measured q13 at 781.4ms before and 716.8ms after, 8.3% faster; it reported matching results. The build passes.",
+  "notes": "The group key in q13 is the compressed uinteger form of the key (range about 1.5M, so 21 bits with the +2). The estimated cardinality was about 1.15M groups against 2.1M slots, about 55% full, so it passes the density guard comfortably. The memory guard only counts fixed state sizes; any extra memory an aggregate allocates in its arena (strings, lists) is not counted, which is also true of the existing perfect hash path. Each thread allocates and initialises 2^bits slots, and Combine/finalize scan every slot. If more threads ever make that overhead show up, a follow-up could make the 1/4 density factor or the 22-bit cap scale with the thread count. In q13 the next big costs are the HASH_JOIN (1.9s) and the LIKE filter in the orders scan (2.7s).",
+  "train_ratio": 0.9637819848100547,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.9637819848100547
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-20T13:33:03-05:00"
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Perfect HT: up to 8 replicas, largest power of two that fits the cap",
+  "hypothesis": "PERFECT_HASH_GROUP_BY is still 1.13s CPU (second largest operator) for ~470M state updates. E0003 (K=4 replicas) cut 12.3% by breaking same-state read-modify-write chains. E0005 made each aggregate's update a tight typed loop, so store-to-load forwarding latency on the same state address is now a larger share of each iteration. In q01 one group holds 49% of rows: with K=4, row i and row i+4 hit the same state ~half the time, so the chain is still only 4 rows long. K=8 doubles the independent chains. Also, the current code (perfect_aggregate_hashtable.cpp:44) drops straight to replica_count=1 when total_groups*tuple_size*4 exceeds the 1MiB cap. Choosing the largest power of two that fits keeps some replication for mid-sized domains.",
+  "plan": "In src/execution/perfect_aggregate_hashtable.cpp: set MAX_REPLICA_COUNT (line 10) to 8. In the constructor (~line 36-45), when can_replicate, start at MAX_REPLICA_COUNT and halve while total_groups*tuple_size*replica_count > MAX_REPLICATED_HT_SIZE and replica_count > 1. The replica mask at line 312 (replica_count-1) already assumes a power of two; keep that invariant. Check that CombineReplicas and the Scan-time fold loop over replica_count rather than a hard-coded 4 (grep for 4 or MAX_REPLICA_COUNT in the replica loops). No other changes. Bench q01 several times; if K=8 is not better than K=4 beyond noise, try K=8 with the fallback only, or report neutral.",
+  "target_files": [
+    "src/execution/perfect_aggregate_hashtable.cpp"
+  ],
+  "expected_gain": "q01 2-5% (HT CPU 1.13s -> ~0.95s if the chains are the remaining bottleneck).",
+  "generality": "Any perfect-hash group-by with few groups and skewed or low-cardinality keys (common in reporting queries). The halving fallback also helps mid-sized group domains that currently get no replication. Possible slowdown: Init/Combine/fold costs scale with 8x states, which is negligible for tiny domains, and the extra cache footprint is bounded by the 1MiB cap.",
+  "risk": "Low. The semantics are unchanged because replication is already gated on order-independent, non-DISTINCT aggregates. The only correctness hazard is a replica loop that hard-codes 4.",
+  "status": "open",
+  "filed": "g1r6"
+}

@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "join_filter_pushdown_optimizer.cpp: lets join filters pass through compressed-materialization `__internal_compress_integral_*` projections and records the constant offset. This is general and applies to any probe side whose integral join key was compressed by CM. It does not refer to any tables, columns, literals or data sizes.",
+      "The semantics check out. TemplatedIntegralCompress computes (input - min_val). FinalizeFilters adds the offset back to the min/max in hugeint arithmetic before casting to the storage type. The exact-bitmap lookup subtracts the shift with uint64 wrapping arithmetic. Because CM's min_val is a statistics lower bound, (v - offset) is never negative and never exceeds the uint64 range, so the wrapped range check gives no false positives or false negatives. NULL handling is unchanged.",
+      "Offset keys are guarded against the hashed BF: they only go to the exact bitmap, and only when the BF is actually exact. The IN-filter is skipped for them. UBIGINT and HUGEINT inputs and storage types are excluded. Filter(), FilterValue() and CheckStatistics() all account for the offset, as do Copy() and serialization. TopN and RowGroupPruner now bail out when a column has an offset, so their boundary values stay in the correct domain.",
+      "Small point, not blocking: the `else if (has_key_offset)` fallback in BFTableFilter::Filter/FilterValue is unreachable defensive code (D_ASSERT(false), then everything passes). That is safe."
+    ],
+    "required_changes": []
+  }
+}

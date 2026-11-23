@@ -1,0 +1,27 @@
+{
+  "id": "E0003",
+  "title": "Perfect HT: replicate group states (K=4) to break same-state dependency chains",
+  "started": "2026-11-19T11:17:39-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "4d9e1c7f1f8749830c61d9ba05883fd122fc9f0e",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.9947849999999998,
+  "summary": "The perfect-hash aggregate table now keeps 4 copies of each group's aggregate state when that is safe. Row i updates copy (i & 3) of its group. Rows of the same group therefore no longer form one serial read-modify-write chain through a single state; they form 4 independent chains. Changes: (1) In PerfectAggregateHashTable (.cpp and .hpp), new members `replica_count` and `replicas_folded`. `replica_count` is 4 only if every aggregate is NOT_ORDER_DEPENDENT, none is DISTINCT, and total_groups*tuple_size*4 <= 1MiB; otherwise it is 1. The states are allocated, initialised and destroyed for total_groups*replica_count tuples. AddChunk only changes the address computation; the group bounds check and the update, filtered-update and AddInPlace paths are unchanged. Combine goes through a new CombineReplicas(source, first_replica) that combines every replica of the source into the target's copy 0. Scan first folds the table's own copies 1..3 into copy 0, once, guarded by a flag. (2) avg.cpp: GetAverageAggregate now wraps the old function and marks the result NOT_ORDER_DEPENDENT. These variants (integer, hugeint, decimal through BindDecimalAvg, and interval) all keep exact integer states. The double avg is left order-dependent, and so is double sum, so floating-point results are unchanged. Measured: bench q01 went from 357.7ms to 327.1ms (\u22128.6%, a quick check with 2 bindings and 4 hot runs each). PERFECT_HASH_GROUP_BY CPU in the q01.m0 profile went from 1.50s to 1.37s. I also ran one SQL spot-check: NULL group keys, FILTER, min/max, integer and decimal avg, plus list and string_agg with ORDER BY and double sum on the non-replicated path. Results looked plausible, but I did not compare them against the original engine; the harness does that.",
+  "notes": "The gain (~9% wall on q01) is smaller than the hypothesis predicted (perfect HT CPU fell only 1.50s \u2192 1.37s). The per-row cost that remains is probably the scatter itself (one pass per aggregate, plus AddInPlace) rather than the dependency chains. A possible follow-up is fusing the update loops of several aggregates into one pass over the rows. Two side effects of marking integer/decimal avg NOT_ORDER_DEPENDENT: the optimizer may now drop ORDER BY inside avg(...), and other order-sensitive gates will treat avg as order-independent. Both are safe because the states are exact. Separately, the spot-check showed list(i ORDER BY i) being rewritten to list_sort. That comes from an existing optimizer rule, not from this change. K=8 was not tried.",
+  "train_ratio": 0.8768337139684915,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q01": 0.8768337139684915
+  },
+  "improved": [
+    "q01"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-19T11:23:17-05:00"
+}

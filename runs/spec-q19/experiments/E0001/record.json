@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "Run JoinDependentFilterRule before DistributivityRule",
+  "started": "2026-11-20T23:45:53-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "19d14c8bae37d370aec82fe6e64b9c9447568ecf",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.33676779999999995,
+  "summary": "I moved the registration of JoinDependentFilterRule so it runs before DistributivityRule in src/optimizer/optimizer.cpp. This is a one-line move plus a comment. Now the rule sees the root OR before Distributivity pulls the shared join equality out of it. It returns AND(original OR, derived per-table ORs). Distributivity then still factors the join key out of the inner OR. On the next fixpoint pass the root is an AND, so the rule returns nullptr and there is no loop. EXPLAIN on my build shows the expected plan. The part scan now has a FILTER with the OR of the part predicates (2M -> 4,862 rows). The lineitem scan has the l_quantity OR range filter pushed in, and the shared shipmode/shipinstruct filters are still pushed. Join output dropped from 2.14M to 2,672 rows, and join time from 0.87s to 0.01s. bench: q19 went from 336.1 ms to 157.0 ms (-53.3%), and results matched.",
+  "notes": "The expression rewriter runs only once per optimization (optimizer.cpp RunOptimizer EXPRESSION_REWRITER), so later passes cannot derive the filters twice. I did not need the fallback (extending Apply to a root AND). Only q19 was benchmarked. I did not run the existing optimizer tests (they are outside the dbe-tool commands I can use). Plans may now differ, with extra derived filters, for other queries whose OR branches share common terms.",
+  "train_ratio": 0.5372678964054037,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q19": 0.5372678964054037
+  },
+  "improved": [
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T23:49:46-05:00"
+}

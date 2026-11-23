@@ -1,0 +1,208 @@
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 30f66c0..c56b9a2 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -32,20 +32,27 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 	// set up the empty payloads for every tuple, and initialize the "occupied" flag to false
+ 	group_is_set = make_unsafe_uniq_array_uninitialized<bool>(total_groups);
+ 	memset(group_is_set.get(), 0, total_groups * sizeof(bool));
++	// aggregate states are initialized lazily: a slot's state is initialized when its group_is_set flag is first set
++}
+ 
+-	// initialize the hash table for each entry
+-	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
+-	idx_t init_count = 0;
+-	for (idx_t i = 0; i < total_groups; i++) {
+-		address_data[init_count] = uintptr_t(data) + (tuple_size * i);
+-		init_count++;
+-		if (init_count == STANDARD_VECTOR_SIZE) {
+-			RowOperations::InitializeStates(*layout_ptr, addresses, *FlatVector::IncrementalSelectionVector(),
+-			                                init_count);
+-			init_count = 0;
++//! Finds the next set entry in the group_is_set array starting from "position", skipping empty 8-byte words
++//! Returns "count" if there is no further set entry
++static idx_t NextSetGroup(const bool *group_is_set, idx_t position, idx_t count) {
++	while (position < count) {
++		if (position % sizeof(uint64_t) == 0 && position + sizeof(uint64_t) <= count) {
++			uint64_t word;
++			memcpy(&word, group_is_set + position, sizeof(uint64_t));
++			if (word == 0) {
++				position += sizeof(uint64_t);
++				continue;
++			}
++		}
++		if (group_is_set[position]) {
++			return position;
+ 		}
++		position++;
+ 	}
+-	RowOperations::InitializeStates(*layout_ptr, addresses, *FlatVector::IncrementalSelectionVector(), init_count);
++	return count;
+ }
+ 
+ PerfectAggregateHashTable::~PerfectAggregateHashTable() {
+@@ -129,17 +136,26 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 	}
+ 	// now we have the HT entry number for every tuple
+ 	// compute the actual pointer to the data by adding it to the base HT pointer and multiplying by the tuple size
++	// groups that are seen for the first time are collected in "sel" so their states can be initialized
++	// (the flag is set first, so a group occurring multiple times in this chunk is only initialized once)
++	idx_t new_count = 0;
+ 	for (idx_t i = 0; i < groups.size(); i++) {
+ 		const auto group = address_data[i];
+ 		if (group >= total_groups) {
++			// initialize the states already flagged as set, so they can be safely destroyed
++			RowOperations::InitializeStates(*layout_ptr, addresses, sel, new_count);
+ 			throw InvalidInputException("Perfect hash aggregate: aggregate group %llu exceeded total groups %llu. This "
+ 			                            "likely means that the statistics in your data source are corrupt.\n* PRAGMA "
+ 			                            "disable_optimizer to disable optimizations that rely on correct statistics",
+ 			                            group, total_groups);
+ 		}
+-		group_is_set[group] = true;
++		if (!group_is_set[group]) {
++			group_is_set[group] = true;
++			sel.set_index(new_count++, i);
++		}
+ 		address_data[i] = uintptr_t(data) + group * tuple_size;
+ 	}
++	RowOperations::InitializeStates(*layout_ptr, addresses, sel, new_count);
+ 
+ 	// after finding the group location we update the aggregates
+ 	idx_t payload_idx = 0;
+@@ -169,27 +185,28 @@ void PerfectAggregateHashTable::Combine(PerfectAggregateHashTable &other) {
+ 	auto source_addresses_ptr = FlatVector::GetData<data_ptr_t>(source_addresses);
+ 	auto target_addresses_ptr = FlatVector::GetData<data_ptr_t>(target_addresses);
+ 
+-	// iterate over all entries of both hash tables and call combine for all entries that can be combined
+-	data_ptr_t source_ptr = other.data;
+-	data_ptr_t target_ptr = data;
++	// iterate over all set entries of the source hash table and combine them into this one
++	// target entries that are not set yet have uninitialized states: initialize them before combining
+ 	idx_t combine_count = 0;
++	idx_t new_count = 0;
+ 	RowOperationsState row_state(*aggregate_allocator);
+-	for (idx_t i = 0; i < total_groups; i++) {
+-		auto has_entry_source = other.group_is_set[i];
+-		// we only have any work to do if the source has an entry for this group
+-		if (has_entry_source) {
++	for (idx_t i = NextSetGroup(other.group_is_set.get(), 0, total_groups); i < total_groups;
++	     i = NextSetGroup(other.group_is_set.get(), i + 1, total_groups)) {
++		if (!group_is_set[i]) {
+ 			group_is_set[i] = true;
+-			source_addresses_ptr[combine_count] = source_ptr;
+-			target_addresses_ptr[combine_count] = target_ptr;
+-			combine_count++;
+-			if (combine_count == STANDARD_VECTOR_SIZE) {
+-				RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
+-				combine_count = 0;
+-			}
++			sel.set_index(new_count++, combine_count);
++		}
++		source_addresses_ptr[combine_count] = other.data + i * tuple_size;
++		target_addresses_ptr[combine_count] = data + i * tuple_size;
++		combine_count++;
++		if (combine_count == STANDARD_VECTOR_SIZE) {
++			RowOperations::InitializeStates(*layout_ptr, target_addresses, sel, new_count);
++			RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
++			combine_count = 0;
++			new_count = 0;
+ 		}
+-		source_ptr += tuple_size;
+-		target_ptr += tuple_size;
+ 	}
++	RowOperations::InitializeStates(*layout_ptr, target_addresses, sel, new_count);
+ 	RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
+ 
+ 	// FIXME: after moving the arena allocator, we currently have to ensure that the pointer is not nullptr, because the
+@@ -258,16 +275,15 @@ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
+ 
+ 	// iterate over the HT until we either have exhausted the entire HT, or
+ 	idx_t entry_count = 0;
+-	for (; scan_position < total_groups; scan_position++) {
+-		if (group_is_set[scan_position]) {
+-			// this group is set: add it to the set of groups to extract
+-			data_pointers[entry_count] = data + tuple_size * scan_position;
+-			group_values[entry_count] = NumericCast<uint32_t>(scan_position);
+-			entry_count++;
+-			if (entry_count == STANDARD_VECTOR_SIZE) {
+-				scan_position++;
+-				break;
+-			}
++	for (scan_position = NextSetGroup(group_is_set.get(), scan_position, total_groups); scan_position < total_groups;
++	     scan_position = NextSetGroup(group_is_set.get(), scan_position + 1, total_groups)) {
++		// this group is set: add it to the set of groups to extract
++		data_pointers[entry_count] = data + tuple_size * scan_position;
++		group_values[entry_count] = NumericCast<uint32_t>(scan_position);
++		entry_count++;
++		if (entry_count == STANDARD_VECTOR_SIZE) {
++			scan_position++;
++			break;
+ 		}
+ 	}
+ 	if (entry_count == 0) {
+@@ -304,14 +320,14 @@ void PerfectAggregateHashTable::Destroy() {
+ 
+ 	// iterate over all initialised slots of the hash table
+ 	RowOperationsState row_state(*aggregate_allocator);
+-	data_ptr_t payload_ptr = data;
+-	for (idx_t i = 0; i < total_groups; i++) {
+-		data_pointers[count++] = payload_ptr;
++	// only slots that have their group set have been initialized
++	for (idx_t i = NextSetGroup(group_is_set.get(), 0, total_groups); i < total_groups;
++	     i = NextSetGroup(group_is_set.get(), i + 1, total_groups)) {
++		data_pointers[count++] = data + i * tuple_size;
+ 		if (count == STANDARD_VECTOR_SIZE) {
+ 			RowOperations::DestroyStates(row_state, *layout_ptr, addresses, count);
+ 			count = 0;
+ 		}
+-		payload_ptr += tuple_size;
+ 	}
+ 	RowOperations::DestroyStates(row_state, *layout_ptr, addresses, count);
+ }
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 9134893..d9a232f 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -124,6 +124,11 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
++//! Perfect hash tables beyond the configured threshold are accepted up to this many bits...
++static constexpr idx_t PERFECT_HASH_EXTENDED_MAX_BITS = 18;
++//! ...as long as the per-thread table stays below this size
++static constexpr idx_t PERFECT_HASH_EXTENDED_MAX_BYTES = 4ULL * 1024ULL * 1024ULL;
++
+ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, vector<idx_t> &bits_per_group) {
+ 	if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+ 		return false;
+@@ -227,19 +232,28 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 		bits_per_group.push_back(required_bits);
+ 		perfect_hash_bits += required_bits;
+ 		// check if we have exceeded the bits for the hash
+-		if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)) {
++		if (perfect_hash_bits > MaxValue<idx_t>(Settings::Get<PerfectHtThresholdSetting>(context),
++		                                        PERFECT_HASH_EXTENDED_MAX_BITS)) {
+ 			// too many bits for perfect hash
+ 			return false;
+ 		}
+ 	}
++	idx_t state_width = 0;
+ 	for (auto &expression : op.expressions) {
+ 		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+ 		if (aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback()) {
+ 			// distinct aggregates are not supported in perfect hash aggregates
+ 			return false;
+ 		}
++		state_width += AlignValue(aggregate.function.GetStateSizeCallback()(aggregate.function));
+ 	}
+-	return true;
++	if (perfect_hash_bits <= Settings::Get<PerfectHtThresholdSetting>(context)) {
++		return true;
++	}
++	// beyond the configured threshold we still accept a bounded table: states are initialized lazily,
++	// so the fixed cost per thread is the (uninitialized) allocation plus one byte of flags per slot
++	const idx_t slot_width = state_width + 1;
++	return (idx_t(1) << perfect_hash_bits) * slot_width <= PERFECT_HASH_EXTENDED_MAX_BYTES;
+ }
+ 
+ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {

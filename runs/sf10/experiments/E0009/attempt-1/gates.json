@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The change makes the existing bloom-filter pushdown work for multi-key hash joins. Each COMPARE_EQUAL condition gets its own bloom filter. That filter only has to be a necessary condition for a probe row to match, so pushing it into the probe scan is sound even when the join has other conditions, including non-equality ones.",
+      "Build and probe hash the same way. In src/execution/join_hashtable.cpp Finalize, layout column cond_idx holds condition cond_idx: the layout is condition_types, then build_types, then the hash (constructor lines 72-80). Its values are hashed with VectorOperations::Hash, which is what BFTableFilter::HashInternal uses on the probe side. condition_types[i] equals the left key's return type, which the constructor asserts. For single-key joins the stored row hash is still used, and it is also VectorOperations::Hash of key 0, so that path is unchanged.",
+      "NULL handling is per condition: filters_null_values = !NullValuesAreEqual(cond_idx). NOT DISTINCT FROM conditions are excluded. If build rows with NULL keys are stored (for example in outer joins), they only add extra bloom-filter bits. That can cause false positives but never false negatives, so results stay correct.",
+      "Parallel Finalize only reads the pinned data collection (Gather) and calls BloomFilter::InsertHashes, the same insert the single-key path already used in parallel. When the join spills, no filter is pushed, as before.",
+      "The filter is still wrapped in SelectivityOptionalFilter, and the build_side_has_filter, probe-larger-than-build and no-perfect-hash-table checks are kept. The cap of 2 per-key filters per join is a generic cost bound, not tuned to a workload. No query, table, literal or scale-factor logic was added. Timing, settings and tests are not touched.",
+      "The code stays clean: the old single bloom_filter and should_build_bloom_filter members were replaced rather than duplicated, the deferred pair became a small named struct, and there is no dead code."
+    ],
+    "required_changes": []
+  }
+}

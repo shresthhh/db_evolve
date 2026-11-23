@@ -1,0 +1,27 @@
+{
+  "id": "E0003",
+  "title": "Software prefetch of hash-table entries and rows in hash join probe",
+  "started": "2026-11-20T00:29:36-05:00",
+  "base": "0c47211ada6381cbc3ea87d7518b4c41a8a9556e",
+  "candidate": "f38426c926dbb1cb3d419d51ba7cf84f1470c244",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -4.7%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.33499239999999997,
+  "summary": "Added software prefetching to the hash-join paths in src/execution/join_hashtable.cpp. Prefetching is only a hint and the logic is unchanged, so results are identical. (1) In ProbeForPointersInternal, before the main loop, a pass prefetches entries[hashes_dense[i] & bitmask] for every probe row. (2) In GetRowPointersInternal, before row_matcher_build.Match, a pass prefetches the row pointers for keys_to_compare_sel. (3) In InsertHashesLoop, before each probing round, the target entries are prefetched for writing. All three are guarded by GCC/Clang and run only when capacity*sizeof(ht_entry_t) is above a fixed 1MB (L2-scale) constant. The build passes and results check out. Bench on q09 against the current best, four runs: -5.7% and -4.8% with probe prefetch only (1)+(2); then -9.9% and -5.6% after adding the build prefetch (3).",
+  "notes": "The gain is real but modest (about 5-10% on q09) and close to the noise bar. Out-of-order execution apparently already overlaps some of the misses. Prefetching for the whole vector at once is crude: it issues up to 2048 prefetches, more than the hardware can keep in flight. A possible next step is distance-based prefetching inside the loop (prefetch i+16 while processing i), which could do better. The build-side prefetch added visible gain, so the build phase matters for q09 as well. A separate idea that was not tried: prefetching chained rows in ScanStructure::Next/AdvancePointers for chains longer than one.",
+  "train_ratio": 0.9533882588703887,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9533882588703887
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-20T00:34:52-05:00"
+}

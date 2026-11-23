@@ -1,0 +1,52 @@
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 9134893..085faa5 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -11,6 +11,7 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/function/function_binder.hpp"
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+@@ -124,10 +125,30 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
++// Hard cap on the number of bits for a perfect hash table that is accepted based on the input cardinality
++// (i.e., when the number of bits exceeds the perfect_ht_threshold setting)
++static constexpr idx_t PERFECT_HT_CARDINALITY_MAX_BITS = 20;
++// Maximum ratio of the total number of slots over all thread-local perfect hash tables to the estimated input rows
++// (cardinality estimates of filtered inputs are often low, and initializing/combining a slot is much cheaper than
++// probing a hash table with a row)
++static constexpr idx_t PERFECT_HT_SLOTS_PER_INPUT_ROW = 8;
++
+ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, vector<idx_t> &bits_per_group) {
+ 	if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+ 		return false;
+ 	}
++	// beyond the perfect_ht_threshold setting, we still use a perfect hash table if the per-thread tables
++	// are small relative to the estimated input cardinality (the tables are allocated, combined and scanned in full)
++	idx_t max_bits = Settings::Get<PerfectHtThresholdSetting>(context);
++	auto &child = *op.children[0];
++	if (child.has_estimated_cardinality && max_bits < PERFECT_HT_CARDINALITY_MAX_BITS) {
++		auto num_threads = MaxValue<idx_t>(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()), 1);
++		idx_t input_cardinality = child.estimated_cardinality;
++		while (max_bits < PERFECT_HT_CARDINALITY_MAX_BITS &&
++		       (idx_t(1) << (max_bits + 1)) * num_threads / PERFECT_HT_SLOTS_PER_INPUT_ROW <= input_cardinality) {
++			max_bits++;
++		}
++	}
+ 	idx_t perfect_hash_bits = 0;
+ 	for (idx_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
+ 		auto &group = op.groups[group_idx];
+@@ -227,7 +248,7 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 		bits_per_group.push_back(required_bits);
+ 		perfect_hash_bits += required_bits;
+ 		// check if we have exceeded the bits for the hash
+-		if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)) {
++		if (perfect_hash_bits > max_bits) {
+ 			// too many bits for perfect hash
+ 			return false;
+ 		}

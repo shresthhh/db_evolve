@@ -1,0 +1,16 @@
+{
+  "id": "E0006",
+  "title": "Skip pure-optional ConjunctionAnd scan filters (zonemap-only) in the per-row filter loop",
+  "started": "2026-11-21T12:06:44-05:00",
+  "base": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.3097868,
+  "summary": "I'm abandoning this one: the change builds and works but made q19 no faster (144.9 ms \u2192 144.6 ms, -0.2%, within noise).\n\nWhat I changed: in src/storage/table/row_group.cpp I added a static helper, IsZonemapOnlyFilter. It returns true for a plain OptionalFilter (it excludes SelectivityOptionalFilter with a dynamic_cast) and for a CONJUNCTION_AND whose children are all such filters, checked recursively. RowGroup::CheckZonemap now also marks those filters always-true. The existing handling of a top-level OPTIONAL_FILTER is unchanged and no headers were touched.\n\nThe profile after the change still shows the filters on the lineitem scan. The scan still outputs 82,782 rows, so the dynamic join filters on the join key (an AND of SelectivityOptionalFilters) still filter rows as before.",
+  "notes": "The hypothesis that this no-op filter costs a full decode of the dictionary column was wrong for this query. The no-op filter on the ship-mode column runs after the selective quantity and shipinstruct filters, which keep only about 0.14% of rows. Filtering a Dictionary column outputs dictionary vectors cheaply, so the no-op pass costs very little. The ~0.46s figure from E0003 does not carry over here. Scan cumulative time was 4.86s in this profile, versus 5.84s in the issue's profile, but that is from a different run and the timed bench shows no difference. Do not retry skipping no-op per-row optional filters on dictionary columns. The remaining scan cost is probably in decoding the filter columns themselves (quantity, shipinstruct) and in the join-key Bloom filter.",
+  "finished": "2026-11-21T12:09:20-05:00"
+}

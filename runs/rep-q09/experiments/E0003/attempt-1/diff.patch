@@ -1,0 +1,385 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index 61f8037..976faf5 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -791,7 +791,15 @@ void JoinFilterPushdownInfo::PushBloomFilter(const JoinFilterPushdownFilter &inf
+ 	auto filters_null_values = !ht.NullValuesAreEqual(0);
+ 	const auto key_name = ht.conditions[0].right->ToString();
+ 	const auto key_type = ht.conditions[0].left->return_type;
+-	auto bf_filter = make_uniq<BFTableFilter>(ht.GetBloomFilter(), filters_null_values, key_name, key_type);
++	// the bloom filter is built on the first join condition
++	Value key_offset;
++	for (idx_t filter_idx = 0; filter_idx < join_condition.size(); filter_idx++) {
++		if (join_condition[filter_idx] == 0) {
++			key_offset = info.columns[filter_idx].offset;
++			break;
++		}
++	}
++	auto bf_filter = make_uniq<BFTableFilter>(ht.GetBloomFilter(), filters_null_values, key_name, key_type, key_offset);
+ 	ht.SetBuildBloomFilter(true);
+ 
+ 	auto opt_bf_filter = make_uniq<SelectivityOptionalFilter>(
+@@ -812,6 +820,32 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeMinMax(JoinFilterGlobalSta
+ 	return final_min_max;
+ }
+ 
++//! Translates a join key value "storage_value - offset" back into the storage value domain
++static bool ApplyJoinFilterOffset(Value &val, const JoinFilterPushdownColumn &column) {
++	if (val.IsNull()) {
++		return true;
++	}
++	if (!val.DefaultTryCastAs(LogicalType::HUGEINT)) {
++		return false;
++	}
++	auto storage_val = Value::HUGEINT(val.GetValue<hugeint_t>() + hugeint_t(column.offset.GetValue<int64_t>()));
++	if (!storage_val.DefaultTryCastAs(column.storage_type)) {
++		return false;
++	}
++	val = std::move(storage_val);
++	return true;
++}
++
++//! Whether a bloom filter on join keys "storage_value - offset" can be probed with the storage values
++static bool BloomFilterSupportsOffset(const LogicalType &key_type, const LogicalType &storage_type) {
++	if (!key_type.IsIntegral() || !storage_type.IsIntegral()) {
++		return false;
++	}
++	return GetTypeIdSize(key_type.InternalType()) <= GetTypeIdSize(PhysicalType::INT64) &&
++	       GetTypeIdSize(storage_type.InternalType()) <= GetTypeIdSize(PhysicalType::INT64) &&
++	       storage_type.InternalType() != PhysicalType::UINT64;
++}
++
+ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+     ClientContext &context, optional_ptr<JoinHashTable> ht, const PhysicalComparisonJoin &op,
+     unique_ptr<DataChunk> final_min_max, const bool is_perfect_hashtable,
+@@ -832,6 +866,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			auto min_val = final_min_max->data[min_idx].GetValue(0);
+ 			auto max_val = final_min_max->data[max_idx].GetValue(0);
+ 
++			if (pushdown_column.HasOffset()) {
++				// the probe expression is "storage_value - offset": translate min/max back to storage values
++				if (!pushdown_column.storage_type.IsValid() || !ApplyJoinFilterOffset(min_val, pushdown_column) ||
++				    !ApplyJoinFilterOffset(max_val, pushdown_column)) {
++					continue;
++				}
++			}
+ 			// Cast to storage type, skip if fails
+ 			if (pushdown_column.storage_type.IsValid()) {
+ 				if (!min_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+@@ -850,7 +891,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			}
+ 			// if the HT is small we can generate a complete "OR" filter
+ 			// but only if the join condition is equality.
+-			if (ht && CanUseInFilter(context, ht, cmp)) {
++			if (ht && !pushdown_column.HasOffset() && CanUseInFilter(context, ht, cmp)) {
+ 				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
+ 			}
+ 			if (Value::NotDistinctFrom(min_val, max_val)) {
+@@ -897,6 +938,10 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
++				if (pushdown_column.HasOffset()) {
++					// the bloom filter can re-apply the offset to the storage values before hashing
++					has_cast = !BloomFilterSupportsOffset(condition_type, pushdown_column.storage_type);
++				}
+ 				const bool is_first_key = join_condition[filter_idx] == 0;
+ 				if (!has_cast && is_first_key && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..a9d927a 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -27,6 +27,13 @@ struct JoinFilterPushdownColumn {
+ 	ColumnBinding probe_column_index;
+ 	//! The type of the value in storage (LogicalGet)
+ 	LogicalType storage_type;
++	//! If not NULL (BIGINT): the probe expression is an integral compression "storage_value - offset"
++	//! i.e., storage values equal join key values + offset
++	Value offset;
++
++	bool HasOffset() const {
++		return !offset.IsNull();
++	}
+ };
+ 
+ struct JoinFilterGlobalState {
+diff --git a/src/include/duckdb/planner/filter/bloom_filter.hpp b/src/include/duckdb/planner/filter/bloom_filter.hpp
+index bff73c0..7c74c14 100644
+--- a/src/include/duckdb/planner/filter/bloom_filter.hpp
++++ b/src/include/duckdb/planner/filter/bloom_filter.hpp
+@@ -48,15 +48,20 @@ private:
+ 	bool filters_null_values;
+ 	string key_column_name;
+ 	LogicalType key_type;
++	//! If set, the bloom filter contains hashes of (integral) keys "value - key_offset" (in key_type), and the
++	//! filtered (integral) values are translated before hashing
++	bool has_key_offset;
++	int64_t key_offset;
+ 
+ public:
+ 	static constexpr auto TYPE = TableFilterType::BLOOM_FILTER;
+ 
+ public:
+ 	explicit BFTableFilter(BloomFilter &filter_p, const bool filters_null_values_p, const string &key_column_name_p,
+-	                       const LogicalType &key_type_p)
++	                       const LogicalType &key_type_p, const Value &key_offset_p = Value())
+ 	    : TableFilter(TYPE), filter(filter_p), filters_null_values(filters_null_values_p),
+-	      key_column_name(key_column_name_p), key_type(key_type_p) {
++	      key_column_name(key_column_name_p), key_type(key_type_p), has_key_offset(!key_offset_p.IsNull()),
++	      key_offset(has_key_offset ? key_offset_p.GetValue<int64_t>() : 0) {
+ 	}
+ 
+ 	//! If the join condition is e.g. "A = B", the bf will filter null values.
+@@ -79,8 +84,11 @@ public:
+ 	FilterPropagateResult CheckStatistics(BaseStatistics &stats) const override;
+ 
+ private:
+-	static void HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
+-	                         BFTableFilterState &state);
++	void HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
++	                  BFTableFilterState &state) const;
++	void HashWithOffset(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
++	                    BFTableFilterState &state) const;
++	uint64_t ApplyKeyOffset(int64_t value) const;
+ 
+ 	bool Equals(const TableFilter &other) const override;
+ 	unique_ptr<TableFilter> Copy() const override;
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..bd29285 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -8,6 +8,8 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -50,6 +52,27 @@ bool PushdownJoinFilterExpression(Expression &expr, JoinFilterPushdownColumn &fi
+ 		}
+ 		return PushdownJoinFilterExpression(*bound_cast.child, filter);
+ 	}
++	case ExpressionClass::BOUND_FUNCTION: {
++		// We allow pushing through a single integral compression "input - offset" (compressed materialization),
++		// the offset is applied to the filter values when the filters are generated
++		const auto &func = expr.Cast<BoundFunctionExpression>();
++		if (filter.HasOffset() || !StringUtil::StartsWith(func.function.name, "__internal_compress_integral_") ||
++		    func.children.size() != 2 || func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		const auto &src = func.children[0]->return_type;
++		if (!src.IsIntegral() || !expr.return_type.IsIntegral() ||
++		    GetTypeIdSize(src.InternalType()) > GetTypeIdSize(PhysicalType::INT64) ||
++		    src.InternalType() == PhysicalType::UINT64) {
++			return false;
++		}
++		Value offset = func.children[1]->Cast<BoundConstantExpression>().value;
++		if (offset.IsNull() || !offset.DefaultTryCastAs(LogicalType::BIGINT)) {
++			return false;
++		}
++		filter.offset = std::move(offset);
++		return PushdownJoinFilterExpression(*func.children[0], filter);
++	}
+ 	default:
+ 		return false;
+ 	}
+@@ -102,6 +125,7 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
+ 			child_columns.reserve(columns.size());
+ 			for (auto &child_column : columns) {
+ 				JoinFilterPushdownColumn new_col;
++				new_col.offset = child_column.offset;
+ 				new_col.probe_column_index = child_bindings[child_column.probe_column_index.column_index];
+ 				child_columns.push_back(new_col);
+ 			}
+diff --git a/src/optimizer/row_group_pruner.cpp b/src/optimizer/row_group_pruner.cpp
+index 95d15c6..bf017ee 100644
+--- a/src/optimizer/row_group_pruner.cpp
++++ b/src/optimizer/row_group_pruner.cpp
+@@ -139,6 +139,12 @@ optional_ptr<LogicalGet> RowGroupPruner::FindLogicalGet(const LogicalOrder &logi
+ 	if (pushdown_targets.empty()) {
+ 		return nullptr;
+ 	}
++	for (auto &target_col : pushdown_targets.front().columns) {
++		if (target_col.HasOffset()) {
++			// values are offset by an integral compression - not supported here
++			return nullptr;
++		}
++	}
+ 
+ 	D_ASSERT(pushdown_targets.size() == 1);
+ 	auto &logical_get = pushdown_targets.front().get;
+diff --git a/src/optimizer/topn_optimizer.cpp b/src/optimizer/topn_optimizer.cpp
+index 929f5eb..dea613b 100644
+--- a/src/optimizer/topn_optimizer.cpp
++++ b/src/optimizer/topn_optimizer.cpp
+@@ -91,6 +91,14 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
+ 		// no pushdown targets
+ 		return;
+ 	}
++	for (auto &target : pushdown_targets) {
++		for (auto &target_col : target.columns) {
++			if (target_col.HasOffset()) {
++				// values are offset by an integral compression - not supported here
++				return;
++			}
++		}
++	}
+ 	// found pushdown targets! generate dynamic filters
+ 	ExpressionType comparison_type;
+ 	if (op.orders[0].type == OrderType::ASCENDING) {
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..3cdee83 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -83,8 +83,82 @@ string BFTableFilter::ToString(const string &column_name) const {
+ 	return column_name + " IN BF(" + key_column_name + ")";
+ }
+ 
++static uint64_t KeyOffsetMask(const LogicalType &key_type) {
++	const auto key_width = GetTypeIdSize(key_type.InternalType());
++	return key_width < sizeof(uint64_t) ? (1ULL << (key_width * 8)) - 1 : ~0ULL;
++}
++
++uint64_t BFTableFilter::ApplyKeyOffset(const int64_t value) const {
++	// mirrors the integral compression: (value - offset) truncated to the width of the key type
++	return (static_cast<uint64_t>(value) - static_cast<uint64_t>(key_offset)) & KeyOffsetMask(key_type);
++}
++
++template <class T>
++static void TemplatedApplyKeyOffset(const UnifiedVectorFormat &vdata, Vector &result, const idx_t count,
++                                    const uint64_t offset, const uint64_t mask) {
++	const auto data = UnifiedVectorFormat::GetData<T>(vdata);
++	auto result_data = FlatVector::GetData<uint64_t>(result);
++	auto &result_validity = FlatVector::Validity(result);
++	for (idx_t i = 0; i < count; i++) {
++		const auto idx = vdata.sel->get_index(i);
++		if (!vdata.validity.RowIsValid(idx)) {
++			result_validity.SetInvalid(i);
++			result_data[i] = 0;
++			continue;
++		}
++		result_data[i] = (static_cast<uint64_t>(static_cast<int64_t>(data[idx])) - offset) & mask;
++	}
++}
++
++void BFTableFilter::HashWithOffset(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
++                                   BFTableFilterState &state) const {
++	UnifiedVectorFormat vdata;
++	if (sel.IsSet()) {
++		Vector sliced(keys_v, sel, approved_count);
++		sliced.ToUnifiedFormat(approved_count, vdata);
++	} else {
++		keys_v.ToUnifiedFormat(approved_count, vdata);
++	}
++	// the (UBIGINT) found_v vector is used as scratch space for the translated keys
++	auto &offset_keys = state.found_v;
++	offset_keys.SetVectorType(VectorType::FLAT_VECTOR);
++	FlatVector::Validity(offset_keys).Reset(approved_count);
++	const auto offset = static_cast<uint64_t>(key_offset);
++	const auto mask = KeyOffsetMask(key_type);
++	switch (keys_v.GetType().InternalType()) {
++	case PhysicalType::INT8:
++		TemplatedApplyKeyOffset<int8_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::INT16:
++		TemplatedApplyKeyOffset<int16_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::INT32:
++		TemplatedApplyKeyOffset<int32_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::INT64:
++		TemplatedApplyKeyOffset<int64_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::UINT8:
++		TemplatedApplyKeyOffset<uint8_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::UINT16:
++		TemplatedApplyKeyOffset<uint16_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	case PhysicalType::UINT32:
++		TemplatedApplyKeyOffset<uint32_t>(vdata, offset_keys, approved_count, offset, mask);
++		break;
++	default:
++		throw InternalException("Unsupported type for bloom filter with key offset");
++	}
++	VectorOperations::Hash(offset_keys, state.hashes_v, approved_count);
++}
++
+ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
+-                                 BFTableFilterState &state) {
++                                 BFTableFilterState &state) const {
++	if (has_key_offset) {
++		HashWithOffset(keys_v, sel, approved_count, state);
++		return;
++	}
+ 	if (sel.IsSet()) {
+ 		state.keys_sliced_v.Slice(keys_v, sel, approved_count);
+ 		VectorOperations::Hash(state.keys_sliced_v, state.hashes_v, approved_count);
+@@ -97,6 +171,7 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+ 		state.hashes_v.Initialize(false, approved_tuple_count);
++		state.found_v.Initialize(false, approved_tuple_count);
+ 		state.bf_sel.Initialize(approved_tuple_count);
+ 		state.current_capacity = approved_tuple_count;
+ 	}
+@@ -133,6 +208,13 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ }
+ 
+ bool BFTableFilter::FilterValue(const Value &value) const {
++	if (has_key_offset && !value.IsNull()) {
++		Value key_value = value;
++		if (!key_value.DefaultTryCastAs(LogicalType::BIGINT)) {
++			return true; // cannot translate - let the value pass
++		}
++		return filter.LookupOne(Hash<uint64_t>(ApplyKeyOffset(key_value.GetValue<int64_t>())));
++	}
+ 	const auto hash = value.Hash();
+ 	return filter.LookupOne(hash);
+ }
+@@ -171,6 +253,10 @@ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, con
+ }
+ 
+ FilterPropagateResult BFTableFilter::CheckStatistics(BaseStatistics &stats) const {
++	if (has_key_offset) {
++		// statistics are in the storage domain, the bloom filter is in the (offset) key domain
++		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
++	}
+ 	switch (stats.GetType().InternalType()) {
+ 	case PhysicalType::UINT8:
+ 		return TemplatedCheckStatistics<uint8_t>(filter, stats);
+@@ -204,7 +290,8 @@ bool BFTableFilter::Equals(const TableFilter &other) const {
+ 	return false;
+ }
+ unique_ptr<TableFilter> BFTableFilter::Copy() const {
+-	return make_uniq<BFTableFilter>(this->filter, this->filters_null_values, this->key_column_name, this->key_type);
++	return make_uniq<BFTableFilter>(this->filter, this->filters_null_values, this->key_column_name, this->key_type,
++	                                has_key_offset ? Value::BIGINT(key_offset) : Value());
+ }
+ 
+ unique_ptr<Expression> BFTableFilter::ToExpression(const Expression &column) const {
+@@ -217,15 +304,20 @@ void BFTableFilter::Serialize(Serializer &serializer) const {
+ 	serializer.WriteProperty<bool>(200, "filters_null_values", filters_null_values);
+ 	serializer.WriteProperty<string>(201, "key_column_name", key_column_name);
+ 	serializer.WriteProperty<LogicalType>(202, "key_type", key_type);
++	serializer.WritePropertyWithDefault<bool>(203, "has_key_offset", has_key_offset, false);
++	serializer.WritePropertyWithDefault<int64_t>(204, "key_offset", key_offset, 0);
+ }
+ 
+ unique_ptr<TableFilter> BFTableFilter::Deserialize(Deserializer &deserializer) {
+ 	auto filters_null_values = deserializer.ReadProperty<bool>(200, "filters_null_values");
+ 	auto key_column_name = deserializer.ReadProperty<string>(201, "key_column_name");
+ 	auto key_type = deserializer.ReadProperty<LogicalType>(202, "key_type");
++	auto has_key_offset = deserializer.ReadPropertyWithExplicitDefault<bool>(203, "has_key_offset", false);
++	auto key_offset = deserializer.ReadPropertyWithExplicitDefault<int64_t>(204, "key_offset", 0);
+ 
+ 	BloomFilter filter;
+-	auto result = make_uniq<BFTableFilter>(filter, filters_null_values, key_column_name, key_type);
++	auto result = make_uniq<BFTableFilter>(filter, filters_null_values, key_column_name, key_type,
++	                                       has_key_offset ? Value::BIGINT(key_offset) : Value());
+ 	return std::move(result);
+ }
+ 

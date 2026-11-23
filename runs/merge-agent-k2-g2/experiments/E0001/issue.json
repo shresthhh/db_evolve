@@ -1,0 +1,27 @@
+{
+  "title": "Merge 3 specialised systems: q13, q16, q21",
+  "hypothesis": "Each source change was accepted in a run specialised to its own templates. One engine that contains all of them should be fast on every template of this group.",
+  "plan": "Your working tree already contains the changes that applied cleanly. Bring in the rest from their patch files. Where two changes touch the same logic, combine them so that each applies in the situations it was written for, deciding from general properties of the query or plan, never from which query is running. Then build and run `bench` on all visible templates. If one change clearly hurts another template of the group, guard it or drop it, and say which and why. Sources:\n- `q13`: already applied in your working tree (`.dbe/merge/q13.patch`)\n- `q16`: already applied in your working tree (`.dbe/merge/q16.patch`)\n- `q21`: already applied in your working tree (`.dbe/merge/q21.patch`)",
+  "target_files": [
+    "src/execution/aggregate_hashtable.cpp",
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/aggregate/physical_hash_aggregate.cpp",
+    "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp",
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/execution/physical_plan/plan_aggregate.cpp",
+    "src/execution/radix_partitioned_hashtable.cpp",
+    "src/include/duckdb/execution/aggregate_hashtable.hpp",
+    "src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp",
+    "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp",
+    "src/include/duckdb/execution/radix_partitioned_hashtable.hpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp",
+    "src/planner/filter/bloom_filter.cpp"
+  ],
+  "expected_gain": "close to the best specialised system on each template of the group",
+  "generality": "same rules as the source changes",
+  "risk": "interactions between changes"
+}

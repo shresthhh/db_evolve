@@ -1,0 +1,395 @@
+diff --git a/src/planner/binder/query_node/plan_select_node.cpp b/src/planner/binder/query_node/plan_select_node.cpp
+index 335ccdb..7abd4cf 100644
+--- a/src/planner/binder/query_node/plan_select_node.cpp
++++ b/src/planner/binder/query_node/plan_select_node.cpp
+@@ -1,4 +1,14 @@
+ #include "duckdb/planner/binder.hpp"
++#include "duckdb/function/aggregate_function.hpp"
++#include "duckdb/planner/column_binding_map.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_subquery_expression.hpp"
++#include "duckdb/planner/expression/bound_window_expression.hpp"
++#include "duckdb/planner/expression_iterator.hpp"
++#include "duckdb/planner/operator/logical_window.hpp"
++#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/planner/operator/list.hpp"
+@@ -8,7 +18,375 @@
+ 
+ namespace duckdb {
+ 
++namespace {
++
++//! Rewrites a WHERE conjunct "... (SELECT min/max(x) FROM <subset of the outer FROM> WHERE <subset of the outer
++//! conjuncts> AND <equalities on outer columns>) ..." into a window aggregate over the outer join, partitioned by the
++//! correlated outer columns. This is valid when the tables of the subquery map onto distinct outer tables, every
++//! subquery conjunct is also an outer conjunct, and the remaining ("extra") outer tables and conjuncts only connect
++//! to the subquery tables through the correlated columns: then the rows of a partition are copies of the rows the
++//! subquery aggregates over, and MIN/MAX is insensitive to duplicates.
++class SubqueryToWindowRewriter {
++public:
++	explicit SubqueryToWindowRewriter(Binder &binder) : binder(binder) {
++	}
++
++	bool TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root);
++
++private:
++	static void CollectConjuncts(unique_ptr<Expression> &expr, vector<unique_ptr<Expression> *> &out) {
++		if (expr->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++			for (auto &child : expr->Cast<BoundConjunctionExpression>().children) {
++				CollectConjuncts(child, out);
++			}
++			return;
++		}
++		out.push_back(&expr);
++	}
++	static bool CollectJoinTree(LogicalOperator &op, vector<reference<LogicalGet>> &gets,
++	                            vector<reference<Expression>> &conjuncts) {
++		switch (op.type) {
++		case LogicalOperatorType::LOGICAL_GET:
++			gets.push_back(op.Cast<LogicalGet>());
++			return true;
++		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
++			return CollectJoinTree(*op.children[0], gets, conjuncts) && CollectJoinTree(*op.children[1], gets, conjuncts);
++		case LogicalOperatorType::LOGICAL_FILTER: {
++			auto &filter = op.Cast<LogicalFilter>();
++			if (!filter.projection_map.empty()) {
++				return false;
++			}
++			for (auto &expr : filter.expressions) {
++				conjuncts.push_back(*expr);
++			}
++			return CollectJoinTree(*op.children[0], gets, conjuncts);
++		}
++		default:
++			return false;
++		}
++	}
++	static bool OnlyReferencesTables(const Expression &expr, const unordered_set<idx_t> &tables) {
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			return false;
++		}
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr.Cast<BoundColumnRefExpression>();
++			return colref.depth == 0 && tables.find(colref.binding.table_index) != tables.end();
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
++			if (!OnlyReferencesTables(child, tables)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	//! Remap the bindings of a (copied) subquery expression to the outer bindings
++	bool Remap(unique_ptr<Expression> &expr) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY || expr->IsVolatile()) {
++			return false;
++		}
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr->Cast<BoundColumnRefExpression>();
++			if (colref.depth == 0) {
++				auto entry = binding_map.find(colref.binding);
++				if (entry == binding_map.end()) {
++					return false;
++				}
++				colref.binding = entry->second;
++				return true;
++			}
++			if (colref.depth == 1 && extra_tables.find(colref.binding.table_index) != extra_tables.end()) {
++				colref.depth = 0;
++				return true;
++			}
++			return false;
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			if (result && !Remap(child)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	static bool ConjunctEquals(const Expression &a, const Expression &b) {
++		if (a.Equals(b)) {
++			return true;
++		}
++		if (a.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON ||
++		    b.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++			return false;
++		}
++		auto &left = a.Cast<BoundComparisonExpression>();
++		auto &right = b.Cast<BoundComparisonExpression>();
++		return right.GetExpressionType() == FlipComparisonExpression(left.GetExpressionType()) &&
++		       left.left->Equals(*right.right) && left.right->Equals(*right.left);
++	}
++	static bool IsSupportedPartitionType(const LogicalType &type) {
++		// partitioning must never be coarser than value equality (e.g. -0.0 vs 0.0 for floating point)
++		if (type.IsIntegral()) {
++			return true;
++		}
++		switch (type.id()) {
++		case LogicalTypeId::BOOLEAN:
++		case LogicalTypeId::VARCHAR:
++		case LogicalTypeId::DATE:
++		case LogicalTypeId::TIMESTAMP:
++		case LogicalTypeId::DECIMAL:
++		case LogicalTypeId::UUID:
++			return true;
++		default:
++			return false;
++		}
++	}
++	static optional_ptr<unique_ptr<Expression>> FindSubquery(unique_ptr<Expression> &expr, idx_t &count) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			count++;
++			return &expr;
++		}
++		optional_ptr<unique_ptr<Expression>> result;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			auto child_result = FindSubquery(child, count);
++			if (child_result) {
++				result = child_result;
++			}
++		});
++		return result;
++	}
++
++private:
++	Binder &binder;
++	column_binding_map_t<ColumnBinding> binding_map;
++	unordered_set<idx_t> extra_tables;
++};
++
++bool SubqueryToWindowRewriter::TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root) {
++	if (!condition->HasSubquery()) {
++		return false;
++	}
++	// (1) find exactly one conjunct holding exactly one correlated scalar subquery
++	vector<unique_ptr<Expression> *> conjuncts;
++	CollectConjuncts(condition, conjuncts);
++	optional_idx subquery_conjunct;
++	optional_ptr<unique_ptr<Expression>> subquery_ptr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		auto &conjunct = *conjuncts[i];
++		if (conjunct->IsVolatile()) {
++			return false;
++		}
++		if (!conjunct->HasSubquery()) {
++			continue;
++		}
++		idx_t count = 0;
++		auto found = FindSubquery(conjunct, count);
++		if (subquery_conjunct.IsValid() || count != 1 || !found) {
++			return false;
++		}
++		subquery_conjunct = i;
++		subquery_ptr = found;
++	}
++	if (!subquery_conjunct.IsValid()) {
++		return false;
++	}
++	auto &subquery = (*subquery_ptr)->Cast<BoundSubqueryExpression>();
++	if (subquery.subquery_type != SubqueryType::SCALAR || !subquery.IsCorrelated() || !subquery.subquery.plan) {
++		return false;
++	}
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (col.depth != 1 || !IsSupportedPartitionType(col.type)) {
++			return false;
++		}
++	}
++	// (2) peel the subquery plan: projections of the single aggregate, then an ungrouped MIN/MAX aggregate
++	reference<LogicalOperator> sub_op = *subquery.subquery.plan;
++	optional_ptr<ColumnBinding> projected;
++	ColumnBinding target;
++	while (sub_op.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
++		auto &proj = sub_op.get().Cast<LogicalProjection>();
++		if (proj.expressions.size() != 1 || proj.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
++			return false;
++		}
++		if (projected && (projected->table_index != proj.table_index || projected->column_index != 0)) {
++			return false;
++		}
++		auto &colref = proj.expressions[0]->Cast<BoundColumnRefExpression>();
++		if (colref.depth != 0) {
++			return false;
++		}
++		target = colref.binding;
++		projected = &target;
++		sub_op = *proj.children[0];
++	}
++	if (sub_op.get().type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
++		return false;
++	}
++	auto &aggr_op = sub_op.get().Cast<LogicalAggregate>();
++	if (!aggr_op.groups.empty() || aggr_op.grouping_sets.size() > 1 || !aggr_op.grouping_functions.empty() ||
++	    aggr_op.expressions.size() != 1 || aggr_op.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
++		return false;
++	}
++	if (aggr_op.grouping_sets.size() == 1 && !aggr_op.grouping_sets[0].empty()) {
++		return false;
++	}
++	if (projected && (projected->table_index != aggr_op.aggregate_index || projected->column_index != 0)) {
++		return false;
++	}
++	auto &aggr = aggr_op.expressions[0]->Cast<BoundAggregateExpression>();
++	if ((aggr.function.name != "min" && aggr.function.name != "max") || aggr.children.size() != 1 ||
++	    aggr.IsDistinct() || aggr.filter || aggr.order_bys || aggr.return_type != subquery.return_type) {
++		return false;
++	}
++	vector<reference<LogicalGet>> sub_gets;
++	vector<reference<Expression>> sub_conjuncts;
++	if (!CollectJoinTree(*aggr_op.children[0], sub_gets, sub_conjuncts)) {
++		return false;
++	}
++	// (3) the outer FROM must be a plain join tree as well
++	vector<reference<LogicalGet>> outer_gets;
++	vector<reference<Expression>> outer_conjuncts;
++	if (!CollectJoinTree(*root, outer_gets, outer_conjuncts)) {
++		return false;
++	}
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i != subquery_conjunct.GetIndex()) {
++			outer_conjuncts.push_back(**conjuncts[i]);
++		}
++	}
++	// (4) match every subquery scan to a distinct outer scan of the same table
++	vector<bool> outer_matched(outer_gets.size(), false);
++	for (auto &sub_get_ref : sub_gets) {
++		auto &sub_get = sub_get_ref.get();
++		auto table = sub_get.GetTable();
++		if (!table || !sub_get.table_filters.filters.empty() || sub_get.dynamic_filters || sub_get.ordinality_idx.IsValid()) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t o = 0; o < outer_gets.size() && !found; o++) {
++			auto &outer_get = outer_gets[o].get();
++			if (outer_matched[o] || outer_get.GetTable().get() != table.get() ||
++			    outer_get.function.name != sub_get.function.name || !outer_get.table_filters.filters.empty() ||
++			    outer_get.dynamic_filters || outer_get.ordinality_idx.IsValid()) {
++				continue;
++			}
++			found = true;
++			outer_matched[o] = true;
++			auto &sub_ids = sub_get.GetColumnIds();
++			auto &outer_ids = outer_get.GetColumnIds();
++			for (idx_t s = 0; s < sub_ids.size(); s++) {
++				for (idx_t k = 0; k < outer_ids.size(); k++) {
++					if (sub_ids[s] == outer_ids[k]) {
++						binding_map[ColumnBinding(sub_get.table_index, s)] = ColumnBinding(outer_get.table_index, k);
++						break;
++					}
++				}
++			}
++		}
++		if (!found) {
++			return false;
++		}
++	}
++	for (idx_t o = 0; o < outer_gets.size(); o++) {
++		if (!outer_matched[o]) {
++			extra_tables.insert(outer_gets[o].get().table_index);
++		}
++	}
++	if (extra_tables.empty()) {
++		return false;
++	}
++	// (5) every subquery conjunct must be an outer conjunct after remapping
++	vector<bool> conjunct_matched(outer_conjuncts.size(), false);
++	column_binding_set_t equality_columns;
++	for (auto &sub_conjunct : sub_conjuncts) {
++		auto remapped = sub_conjunct.get().Copy();
++		if (!Remap(remapped)) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++			if (ConjunctEquals(*remapped, outer_conjuncts[k].get())) {
++				conjunct_matched[k] = true;
++				found = true;
++			}
++		}
++		if (!found) {
++			return false;
++		}
++		if (remapped->GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
++			auto &comp = remapped->Cast<BoundComparisonExpression>();
++			for (auto side : {comp.left.get(), comp.right.get()}) {
++				if (side->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++					equality_columns.insert(side->Cast<BoundColumnRefExpression>().binding);
++				}
++			}
++		}
++	}
++	// the remaining outer conjuncts may only restrict the extra tables
++	for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++		auto &conjunct = outer_conjuncts[k].get();
++		if (conjunct.IsVolatile() || conjunct.HasSubquery()) {
++			return false;
++		}
++		if (!conjunct_matched[k] && !OnlyReferencesTables(conjunct, extra_tables)) {
++			return false;
++		}
++	}
++	// every correlated column belongs to an extra table and is NULL-rejected by an equality
++	vector<unique_ptr<Expression>> partitions;
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (extra_tables.find(col.binding.table_index) == extra_tables.end() ||
++		    equality_columns.find(col.binding) == equality_columns.end()) {
++			return false;
++		}
++		partitions.push_back(make_uniq<BoundColumnRefExpression>(col.name, col.type, col.binding));
++	}
++	auto aggr_child = aggr.children[0]->Copy();
++	if (!Remap(aggr_child)) {
++		return false;
++	}
++
++	// (6) rewrite: filter(other conjuncts) -> window(min/max over partition) -> filter(subquery conjunct)
++	auto window_index = binder.GenerateTableIndex();
++	auto window_expr = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_AGGREGATE, aggr.return_type,
++	                                                    make_uniq<AggregateFunction>(aggr.function),
++	                                                    aggr.bind_info ? aggr.bind_info->Copy() : nullptr);
++	window_expr->children.push_back(std::move(aggr_child));
++	window_expr->partitions = std::move(partitions);
++	window_expr->ignore_nulls = false;
++	window_expr->distinct = false;
++	window_expr->start = WindowBoundary::UNBOUNDED_PRECEDING;
++	window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;
++	auto result_name = subquery.GetName();
++	auto result_type = subquery.return_type;
++
++	// replace the subquery by a reference to the window result (this destroys the subquery)
++	*subquery_ptr = make_uniq<BoundColumnRefExpression>(result_name, result_type, ColumnBinding(window_index, 0));
++	auto filter = make_uniq<LogicalFilter>();
++	unique_ptr<Expression> subquery_expr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i == subquery_conjunct.GetIndex()) {
++			subquery_expr = std::move(*conjuncts[i]);
++		} else {
++			filter->expressions.push_back(std::move(*conjuncts[i]));
++		}
++	}
++	if (!filter->expressions.empty()) {
++		filter->AddChild(std::move(root));
++		root = std::move(filter);
++	}
++	auto window = make_uniq<LogicalWindow>(window_index);
++	window->expressions.push_back(std::move(window_expr));
++	window->AddChild(std::move(root));
++	root = std::move(window);
++	condition = std::move(subquery_expr);
++	return true;
++}
++
++} // namespace
++
+ unique_ptr<LogicalOperator> Binder::PlanFilter(unique_ptr<Expression> condition, unique_ptr<LogicalOperator> root) {
++	SubqueryToWindowRewriter rewriter(*this);
++	rewriter.TryRewrite(condition, root);
+ 	PlanSubqueries(condition, root);
+ 	auto filter = make_uniq<LogicalFilter>(std::move(condition));
+ 	filter->AddChild(std::move(root));

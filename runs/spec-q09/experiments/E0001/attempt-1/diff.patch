@@ -1,0 +1,85 @@
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..e766a2c 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -79,6 +80,40 @@ idx_t RelationStatisticsHelper::GetDistinctCount(LogicalGet &get, ClientContext
+ 	return distinct_count;
+ }
+ 
++//! Selectivity assumed for substring / pattern matching filters on strings (LIKE '%abc%', contains, regex)
++static constexpr double STRING_PATTERN_SELECTIVITY = 0.05;
++
++//! Whether the table filter is (or is a conjunction containing) a string pattern match against a constant pattern
++static bool IsStringPatternFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conj = filter.Cast<ConjunctionAndFilter>();
++		for (auto &child : conj.child_filters) {
++			if (IsStringPatternFilter(*child)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr = *filter.Cast<ExpressionFilter>().expr;
++		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++			return false;
++		}
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (func.children.size() < 2 || func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &name = func.function.name;
++		return name == "contains" || name == "like" || name == "~~" || name == "ilike" || name == "~~*" ||
++		       name == "like_escape" || name == "ilike_escape" || name == "regexp_matches" || name == "suffix" ||
++		       name == "ends_with";
++	}
++	default:
++		return false;
++	}
++}
++
+ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
+ 	auto return_stats = RelationStats();
+ 
+@@ -119,6 +154,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 	if (!get.table_filters.filters.empty()) {
+ 		column_statistics = nullptr;
+ 		bool has_non_optional_filters = false;
++		bool has_string_pattern_filter = false;
+ 		for (auto &it : get.table_filters.filters) {
+ 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
+ 				if (get.function.statistics_extended) {
+@@ -139,15 +175,20 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 
+ 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
+ 				has_non_optional_filters = true;
++				if (IsStringPatternFilter(*it.second)) {
++					has_string_pattern_filter = true;
++				}
+ 			}
+ 		}
+ 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
+ 		// and there are other table filters (i.e cost > 50), use default selectivity.
++		// substring / pattern matching filters (i.e name LIKE '%abc%') are typically more selective.
+ 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+ 		if (!has_equality_filter && has_non_optional_filters) {
+-			cardinality_after_filters = MaxValue<idx_t>(
+-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+-			    1U);
++			double selectivity =
++			    has_string_pattern_filter ? STRING_PATTERN_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			cardinality_after_filters =
++			    MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * selectivity), 1U);
+ 		}
+ 		if (base_table_cardinality == 0) {
+ 			cardinality_after_filters = 0;

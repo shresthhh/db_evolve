@@ -1,0 +1,117 @@
+diff --git a/extension/core_functions/aggregate/algebraic/avg.cpp b/extension/core_functions/aggregate/algebraic/avg.cpp
+index dead267..af838ff 100644
+--- a/extension/core_functions/aggregate/algebraic/avg.cpp
++++ b/extension/core_functions/aggregate/algebraic/avg.cpp
+@@ -5,6 +5,8 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/function/function_set.hpp"
+ #include "duckdb/planner/expression.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -123,6 +125,20 @@ struct IntegerAverageOperationHugeint : public BaseSumOperation<AverageSetOperat
+ 	}
+ };
+ 
++// average over an int64 state - only used when statistics prove that the sum cannot overflow
++// the finalize goes through hugeint_t so the result is identical to IntegerAverageOperationHugeint
++struct IntegerAverageOperationInt64 : public BaseSumOperation<AverageSetOperation, RegularAdd> {
++	template <class T, class STATE>
++	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
++		if (state.count == 0) {
++			finalize_data.ReturnNull();
++		} else {
++			long double divident = GetAverageDivident<long double>(state.count, finalize_data.input.bind_data);
++			target = Hugeint::Cast<long double>(hugeint_t(state.value)) / divident;
++		}
++	}
++};
++
+ struct DiscreteAverageOperation : public BaseSumOperation<AverageSetOperation, AddToHugeint> {
+ 	template <class T, class STATE>
+ 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+@@ -239,6 +255,59 @@ struct TimeTZAverageOperation : public BaseSumOperation<AverageSetOperation, Add
+ 	}
+ };
+ 
++unique_ptr<BaseStatistics> AvgPropagateStats(ClientContext &context, BoundAggregateExpression &expr,
++                                             AggregateStatisticsInput &input) {
++	if (!input.node_stats || !input.node_stats->has_max_cardinality) {
++		return nullptr;
++	}
++	auto &numeric_stats = input.child_stats[0];
++	if (!NumericStats::HasMinMax(numeric_stats)) {
++		return nullptr;
++	}
++	auto internal_type = numeric_stats.GetType().InternalType();
++	hugeint_t max_negative;
++	hugeint_t max_positive;
++	switch (internal_type) {
++	case PhysicalType::INT32:
++		max_negative = NumericStats::Min(numeric_stats).GetValueUnsafe<int32_t>();
++		max_positive = NumericStats::Max(numeric_stats).GetValueUnsafe<int32_t>();
++		break;
++	case PhysicalType::INT64:
++		max_negative = NumericStats::Min(numeric_stats).GetValueUnsafe<int64_t>();
++		max_positive = NumericStats::Max(numeric_stats).GetValueUnsafe<int64_t>();
++		break;
++	default:
++		return nullptr;
++	}
++	auto max_sum_negative = max_negative * Hugeint::Convert(input.node_stats->max_cardinality);
++	auto max_sum_positive = max_positive * Hugeint::Convert(input.node_stats->max_cardinality);
++	if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ||
++	    max_sum_negative <= NumericLimits<int64_t>::Minimum()) {
++		// sum can potentially exceed int64_t bounds: keep the hugeint state
++		return nullptr;
++	}
++	// the total sum is guaranteed to fit in an int64: swap in the int64 state, keeping everything else
++	// (name, arguments, return type, bind callback, bind data) of the bound function
++	auto int64_function =
++	    internal_type == PhysicalType::INT32
++	        ? AggregateFunction::UnaryAggregate<AvgState<int64_t>, int32_t, double, IntegerAverageOperationInt64>(
++	              LogicalType::INTEGER, LogicalType::DOUBLE)
++	        : AggregateFunction::UnaryAggregate<AvgState<int64_t>, int64_t, double, IntegerAverageOperationInt64>(
++	              LogicalType::BIGINT, LogicalType::DOUBLE);
++	auto &function = expr.function;
++	function.SetStateSizeCallback(int64_function.GetStateSizeCallback());
++	function.SetStateInitCallback(int64_function.GetStateInitCallback());
++	function.SetStateUpdateCallback(int64_function.GetStateUpdateCallback());
++	function.SetStateSimpleUpdateCallback(int64_function.GetStateSimpleUpdateCallback());
++	function.SetStateCombineCallback(int64_function.GetStateCombineCallback());
++	function.SetStateFinalizeCallback(int64_function.GetStateFinalizeCallback());
++	function.SetStateDestructorCallback(int64_function.GetStateDestructorCallback());
++	function.SetWindowCallback(int64_function.GetWindowCallback());
++	function.SetWindowInitCallback(int64_function.GetWindowInitCallback());
++	function.SetStatisticsCallback(nullptr);
++	return nullptr;
++}
++
+ AggregateFunction GetAverageAggregateInternal(PhysicalType type) {
+ 	switch (type) {
+ 	case PhysicalType::INT16: {
+@@ -246,12 +315,18 @@ AggregateFunction GetAverageAggregateInternal(PhysicalType type) {
+ 		    LogicalType::SMALLINT, LogicalType::DOUBLE);
+ 	}
+ 	case PhysicalType::INT32: {
+-		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int32_t, double, IntegerAverageOperationHugeint>(
+-		    LogicalType::INTEGER, LogicalType::DOUBLE);
++		auto function =
++		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int32_t, double, IntegerAverageOperationHugeint>(
++		        LogicalType::INTEGER, LogicalType::DOUBLE);
++		function.SetStatisticsCallback(AvgPropagateStats);
++		return function;
+ 	}
+ 	case PhysicalType::INT64: {
+-		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, double, IntegerAverageOperationHugeint>(
+-		    LogicalType::BIGINT, LogicalType::DOUBLE);
++		auto function =
++		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, double, IntegerAverageOperationHugeint>(
++		        LogicalType::BIGINT, LogicalType::DOUBLE);
++		function.SetStatisticsCallback(AvgPropagateStats);
++		return function;
+ 	}
+ 	case PhysicalType::INT128: {
+ 		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, hugeint_t, double, HugeintAverageOperation>(

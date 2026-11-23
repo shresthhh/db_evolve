@@ -1,0 +1,119 @@
+{
+  "run_id": "merge-agent-k4-g2",
+  "created": "2026-11-22T19:51:36-05:00",
+  "base_sha": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "best_sha": "d8e71483cc509fdcce93ca801c112bcc7b6e6a43",
+  "generation": 2,
+  "round": 0,
+  "experiments": 1,
+  "train_ratio_vs_base": 0.6349843184199409,
+  "cost_usd": 0.4714552,
+  "releases": {
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "v1": "d8e71483cc509fdcce93ca801c112bcc7b6e6a43"
+  },
+  "config": {
+    "project": {
+      "work_dir": "work",
+      "runs_dir": "runs",
+      "results_dir": "results"
+    },
+    "engine": {
+      "name": "duckdb",
+      "repo": "https://github.com/duckdb/duckdb",
+      "base_ref": "v1.5.6",
+      "version_override": "v1.5.6",
+      "build_jobs": 8,
+      "extensions": [
+        "tpch"
+      ],
+      "editable_paths": [
+        "src/",
+        "extension/parquet/",
+        "extension/core_functions/"
+      ],
+      "forbidden_paths": [
+        "test/",
+        "benchmark/",
+        "tools/",
+        "scripts/",
+        "extension/tpch/",
+        "extension/tpcds/",
+        ".github/"
+      ],
+      "max_diff_lines": 4000,
+      "branch": "dbe/merge/agent-k4-g2",
+      "tag_prefix": "dbe/merge/agent-k4-g2"
+    },
+    "workload": {
+      "name": "tpch",
+      "seed": 20261116,
+      "train_templates": 14,
+      "val_templates": 3,
+      "test_templates": 5,
+      "instances_per_template": 4,
+      "heldout_bindings": 2,
+      "focus": [
+        "q02",
+        "q21"
+      ]
+    },
+    "datasets": {
+      "main": {
+        "scale_factor": 10.0
+      },
+      "shadow": {
+        "scale_factor": 1.0
+      }
+    },
+    "bench": {
+      "threads": 8,
+      "warmup_runs": 1,
+      "timed_runs": 3,
+      "statement_timeout_s": 300,
+      "ab_order": "ABBA",
+      "retime_order": "BAAB"
+    },
+    "bar": {
+      "rule": "templates",
+      "min_template_gain": 0.05,
+      "max_geomean_regression": 0.0,
+      "min_gain": 0.02,
+      "noise_multiplier": 1.5,
+      "max_template_regression": 0.05,
+      "abs_slack_ms": 5.0,
+      "val_tolerance": 0.02
+    },
+    "agents": {
+      "backend": "claude-cli",
+      "model": "claude-opus-5-5",
+      "planner_budget_usd": 4.0,
+      "implementer_budget_usd": 15.0,
+      "reviewer_budget_usd": 3.0,
+      "max_total_usd": 0,
+      "timeout_s": 5400,
+      "max_fix_attempts": 2
+    },
+    "loop": {
+      "generations": 3,
+      "rounds_per_generation": 6,
+      "experiments_per_round": 1
+    },
+    "report": {
+      "passes": 4
+    }
+  },
+  "merge": {
+    "sources": {
+      "q02": "cef9fd6aec98f7462c0cc3d125770f03d3623427",
+      "q21": "b0c83377573d23a5cb80c654f47d99b957e40d93"
+    },
+    "applied": [
+      "q02",
+      "q21"
+    ],
+    "conflicts": [],
+    "start": "d8e71483cc509fdcce93ca801c112bcc7b6e6a43"
+  },
+  "merged_sha": "d8e71483cc509fdcce93ca801c112bcc7b6e6a43"
+}

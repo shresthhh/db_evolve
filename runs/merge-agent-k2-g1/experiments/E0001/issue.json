@@ -1,0 +1,26 @@
+{
+  "title": "Merge 5 specialised systems: q01, q02, q09, q18, q19",
+  "hypothesis": "Each source change was accepted in a run specialised to its own templates. One engine that contains all of them should be fast on every template of this group.",
+  "plan": "Your working tree already contains the changes that applied cleanly. Bring in the rest from their patch files. Where two changes touch the same logic, combine them so that each applies in the situations it was written for, deciding from general properties of the query or plan, never from which query is running. Then build and run `bench` on all visible templates. If one change clearly hurts another template of the group, guard it or drop it, and say which and why. Sources:\n- `q01`: already applied in your working tree (`.dbe/merge/q01.patch`)\n- `q02`: already applied in your working tree (`.dbe/merge/q02.patch`)\n- `q09`: already applied in your working tree (`.dbe/merge/q09.patch`)\n- `q18`: NOT applied (it conflicted with the ones before it); apply it by hand (`.dbe/merge/q18.patch`)\n- `q19`: already applied in your working tree (`.dbe/merge/q19.patch`)",
+  "target_files": [
+    "extension/core_functions/aggregate/algebraic/avg.cpp",
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp",
+    "src/include/duckdb/storage/table/row_group_collection.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp",
+    "src/optimizer/join_order/cardinality_estimator.cpp",
+    "src/optimizer/join_order/relation_manager.cpp",
+    "src/optimizer/join_order/relation_statistics_helper.cpp",
+    "src/optimizer/optimizer.cpp",
+    "src/planner/binder/query_node/plan_select_node.cpp",
+    "src/storage/data_table.cpp",
+    "src/storage/table/column_segment.cpp",
+    "src/storage/table/row_group_collection.cpp"
+  ],
+  "expected_gain": "close to the best specialised system on each template of the group",
+  "generality": "same rules as the source changes",
+  "risk": "interactions between changes"
+}

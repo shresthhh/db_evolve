@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp CanUseBloomFilter: the check moves from conditions.size()==1 to equality_predicate_columns.size()==1 and still requires cmp==COMPARE_EQUAL. ReorderConditions puts equality and NOT DISTINCT FROM conditions first, and the hash table's bloom filter is built only from the equality key, so the single equality is conditions[0], the key PushBloomFilter uses. A non-equality condition (for example b < y) never gets the bloom filter because it fails the cmp check. A residual <> is never pushed down at all. Joins with two equalities, or an equality plus a NOT DISTINCT FROM, are still excluded. One edge not settled on budget: the pushdown code indexes the reordered physical op.conditions with positions recorded on the logical conditions. That indexing predates this change and already feeds the min/max filters; this change only lets it reach the bloom filter when the logical order differs.",
+      "join_filter_pushdown_optimizer.cpp: a DELIM_GET build side now counts as filtering. This is a cost heuristic based on plan shape, not on names or literals. It cannot affect correctness because the bloom filter is wrapped in SelectivityOptionalFilter, and the existing probe > build cardinality check still applies.",
+      "bloom_filter.cpp fast path: runs only for flat vectors with no NULLs among the approved rows and an integer physical type. Vectors with NULLs, constant or dictionary vectors and other types use the old path, so filters_null_values handling is unchanged. For non-NULL integers, duckdb::Hash<T> matches the hash VectorOperations::Hash stores on the build side. Reusing the previous result for an equal key is exact. The in-place write to sel is safe because found_count <= i, and the old path also writes sel in place. Empty input returns 0 and the scratch buffers are resized before use. There is no shared mutable state, so parallel scans are safe.",
+      "No references to tables, columns, literals or data sizes, and no changes to measurement, settings, tests or benchmarks. The author's measured gain is borderline (about -4% mean on q21) but real."
+    ],
+    "required_changes": []
+  }
+}

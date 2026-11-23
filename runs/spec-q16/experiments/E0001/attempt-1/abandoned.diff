@@ -1,0 +1,60 @@
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..44bfe0f 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -461,6 +461,37 @@ void DecideAdaptation(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lst
+ 	}
+ }
+ 
++//! Called when the HT is full before the adaptivity threshold is reached. If the HLL estimate indicates that a larger
++//! HT would deduplicate much better, abandon the HT and grow it (bounded by ADAPTIVITY_THRESHOLD). Returns true if grown.
++//! Unlike DecideAdaptation, this never skips lookups and does not mark the state as adapted.
++bool MaybeGrowEarly(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate) {
++	//! Only grow if groups repeat at least this many times on average (otherwise deduplication gains little)
++	static constexpr double EARLY_GROW_MAX_UNIQUE_PERCENTAGE = 0.8;
++	if (lstate.adapted || gstate.external || gstate.number_of_threads <= RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD ||
++	    lstate.local_sink_capacity >= RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD) {
++		return false;
++	}
++	auto &ht = *lstate.ht;
++	const auto sink_count = ht.GetSinkCount();
++	const auto hll_count = MinValue(ht.GetHLLUpperBound(), sink_count);
++	if (hll_count <= GroupedAggregateHashTable::ResizeThreshold(lstate.local_sink_capacity)) {
++		return false; // The (estimated) groups fit in the current HT, we're not thrashing
++	}
++	const auto hll_percentage = static_cast<double>(hll_count) / static_cast<double>(sink_count);
++	if (hll_percentage > EARLY_GROW_MAX_UNIQUE_PERCENTAGE) {
++		return false; // Too few duplicates, a larger HT would not deduplicate much better
++	}
++	const auto new_capacity = MinValue(GroupedAggregateHashTable::GetCapacityForCount(hll_count),
++	                                   RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD);
++	if (new_capacity <= lstate.local_sink_capacity) {
++		return false;
++	}
++	lstate.local_sink_capacity = new_capacity;
++	ht.Abandon();
++	ht.Resize(lstate.local_sink_capacity);
++	return true;
++}
++
+ // Grow abandoned_data (frozen at the radix bits of when we first went external) up to the current radix bits, so it
+ // never has fewer partitions than the data merged into it - Repartition/Combine only handle new >= old.
+ void GrowAbandonedDataToRadixBits(ClientContext &context, RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate,
+@@ -580,10 +611,13 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 	}
+ 
+ 	if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD || gstate.external) {
+-		// 'Reset' the HT without taking its data, we can just keep appending to the same collection
+-		// This only works because we never resize the HT
+-		// We don't do this when running with 1 or 2 threads, it only makes sense when there's many threads
+-		ht.Abandon();
++		// The HT is full: before the full adaptivity threshold is reached, check if we should grow early
++		if (!MaybeGrowEarly(gstate, lstate)) {
++			// 'Reset' the HT without taking its data, we can just keep appending to the same collection
++			// This only works because we never resize the HT
++			// We don't do this when running with 1 or 2 threads, it only makes sense when there's many threads
++			ht.Abandon();
++		}
+ 	}
+ 
+ 	// Check if we need to repartition

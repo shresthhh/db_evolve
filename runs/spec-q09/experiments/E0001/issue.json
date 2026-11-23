@@ -1,0 +1,14 @@
+{
+  "title": "Lower cardinality estimate for substring/LIKE table filters",
+  "hypothesis": "In q09 the scan on the filtered dimension table (contains(name,'word'), from LIKE '%word%') gets DEFAULT_SELECTIVITY 0.2 in RelationStatisticsHelper::ExtractGetStats. The real selectivity is about 5% (est 400K rows, actual 109K). That inflates every estimate above it: fact\u22c8dim is estimated at 12M (actual 3.27M) and the top 2-key join at 47.9M (actual 3.27M). As a result BuildProbeSideOptimizer builds hash tables on the big sides: 15M orders (HASH_JOIN 2.49s cumulative) and 8M partsupp\u22c8supplier\u22c8nation (2.29s), each probed with only 3.27M rows. I set disabled_optimizers='join_order,build_side_probe_side' and wrote the joins by hand so that the small intermediate is the build side of both joins: EXPLAIN ANALYZE total went from 1.40s to 0.725s on the same tool. Substring matching on free text is selective in general, and Postgres-style estimators give LIKE patterns much lower selectivity than plain range filters.",
+  "plan": "In src/optimizer/join_order/relation_statistics_helper.cpp, ExtractGetStats, lines 119-155: when a non-optional table filter is an ExpressionFilter (TableFilterType::EXPRESSION_FILTER, possibly inside a ConjunctionAndFilter) whose expression is a BoundFunctionExpression named contains / like / ~~ / ilike / ~~* / regexp_matches / suffix (with a constant pattern argument), apply a lower selectivity, e.g. a new constant STRING_PATTERN_SELECTIVITY = 0.05 in relation_statistics_helper.hpp, instead of DEFAULT_SELECTIVITY. Keep the existing rule that an equality filter estimate wins (MinValue). If the expression is anything else, behaviour stays exactly as it is now. Then check the q09 EXPLAIN: the part-side estimate should be about 100K and the orders/partsupp joins should flip or be reordered. If the partsupp join still builds on the 8M side because the 2-key join estimate counts only one key, record that in the ledger as a follow-up; don't widen this diff.",
+  "target_files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp",
+    "src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp"
+  ],
+  "expected_gain": "q09: 20-45% if both big builds flip (the hand-written plan measured 1.40s down to 0.73s); about 15-20% if only the orders join flips.",
+  "generality": "Any star or snowflake join where a dimension is filtered by LIKE '%x%', contains, or a suffix/regex filter: the join order and build side improve. Could get slower: queries whose substring filter is not selective (e.g. LIKE '%a%'), where a big table might now be chosen as the build side by mistake. Results stay correct because only plan choice changes.",
+  "risk": "Low for correctness, since this only changes estimates. Medium for performance on unseen queries that have unselective LIKE filters. Plan changes can also shift other templates in either direction.",
+  "status": "open",
+  "filed": "g1r1"
+}

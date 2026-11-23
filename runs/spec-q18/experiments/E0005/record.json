@@ -1,0 +1,27 @@
+{
+  "id": "E0005",
+  "title": "Zonemap-prunable join key-set filter through compressed-materialization projections",
+  "started": "2026-11-20T22:58:50-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "774cbe3fcc2b0a76c499ec5bd0908a2cbcb0039e",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.2818886,
+  "summary": "I made two changes so a hash join with a small key set can skip row groups on its probe-side scans through zonemaps. On q18 the time went from 640.6 ms (current best) to 553.2 ms, which is -13.6%. That is from `dbe-tool bench q18` (quick check: 2 bindings, 4 hot runs each), and the results match.\n\n(A) Join filters now pass through the integral compression projections. `JoinFilterPushdownColumn` has a new `Value storage_offset` field (null by default). `PushdownJoinFilterExpression` now accepts a `__internal_compress_integral_*(x, const)` call when x is integral and at most 64-bit, the constant is not null, and no offset has been set yet. It stores the constant and keeps going into x. The UNION rewrite copies the offset to each child. In `physical_hash_join.cpp`, a new helper `CastJoinFilterValueToStorage` turns each join key value v into the stored value: it adds v and the offset as HUGEINT (with an overflow check), then try-casts to the storage type. If any step fails, no filter is pushed. Both the min/max filters and the IN filter use it. The bloom filter is always skipped when an offset is set.\n\n(B) Range-set filter. The IN-filter path now runs when the hash table holds at most 64 \u00d7 `dynamic_or_filter_threshold` rows; the check is written so it cannot overflow. If the distinct keys still fit under the threshold, the IN filter is pushed exactly as before. If there are more and the storage type is integral (not UHUGEINT), the sorted keys are split at the (threshold\u22121) largest gaps. The result is pushed as an OptionalFilter of an OR of at most `threshold` inclusive ranges, so it is only used to skip row groups and never filters rows. A range holding one key becomes an equality. The existing NULL and dense-range bail-outs still apply, and the setting's default is unchanged.\n\nFrom the profile: the lineitem probe scan now emits 17.5M of its 60M rows, and the orders scan emits 9.0M of 15M.",
+  "notes": "- **Optimizer order:** compressed materialization runs inside STATISTICS_PROPAGATION, which is after ROW_GROUP_PRUNER and TOP_N. Those two also call `GetPushdownFilterTargets`, but they never see compress expressions, so the new `storage_offset` cannot reach them.\n- **Room for more:** with only 50 ranges over about 111 keys spread across the whole key range, about 70% of rows are skipped. Allowing more ranges than the threshold (checking a row group against them is cheap) would likely skip more, and lineitem scan time would fall further. That would need its own constant rather than reusing `dynamic_or_filter_threshold`.\n- **Minor waste:** for non-integral keys above the threshold, the code still scans the keys before bailing out.\n- **Not done:** the step-A-only check (`SET dynamic_or_filter_threshold=1000`) was skipped because A and B were built and measured together.",
+  "train_ratio": 0.8997842048147123,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q18": 0.8997842048147123
+  },
+  "improved": [
+    "q18"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T23:33:34-05:00"
+}

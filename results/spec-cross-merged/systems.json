@@ -1,0 +1,40 @@
+{
+  "systems": {
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "q01": "212b144ff9a3fb8a0eb07b06f31ef518e7804c48",
+    "q02": "cef9fd6aec98f7462c0cc3d125770f03d3623427",
+    "q09": "f0d9e1f9517988ef435167cd958db3ecb9b74267",
+    "q13": "6d8309dd1704585b563824468a1591c78480b328",
+    "q16": "084cba35c5dc243f7353ec8dcacb699f227beeda",
+    "q18": "d6c752b412f9acc366532f9729c2ddbffe9bd8f1",
+    "q19": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+    "q21": "b0c83377573d23a5cb80c654f47d99b957e40d93",
+    "sf10": "b6929da26e9e9170936084797dd3d9e34cd54b2d",
+    "agent-k1-g1": "a0c0f31d55818681351debfc8f06e06ce878af1b",
+    "agent-k2-g1": "d677873d43cd567be770783f31560482e145d556",
+    "agent-k2-g2": "53de1c433b75d20d84d1f442e6d76139628d5f7c",
+    "agent-k4-g1": "3ec60ccc9e756b5b9b79f1d0a9d563f244df23ee",
+    "agent-k4-g2": "d8e71483cc509fdcce93ca801c112bcc7b6e6a43",
+    "agent-k4-g3": "bc7105069b2d57c71acc668fec72aa9af9f2eb05",
+    "agent-k4-g4": "f74cae9fdd946a9280fc502a6df33c5db97b4205"
+  },
+  "unchanged_from_v0": [],
+  "runs": [
+    "spec-q01",
+    "spec-q02",
+    "spec-q09",
+    "spec-q13",
+    "spec-q16",
+    "spec-q18",
+    "spec-q19",
+    "spec-q21",
+    "sf10",
+    "merge-agent-k1-g1",
+    "merge-agent-k2-g1",
+    "merge-agent-k2-g2",
+    "merge-agent-k4-g1",
+    "merge-agent-k4-g2",
+    "merge-agent-k4-g3",
+    "merge-agent-k4-g4"
+  ]
+}

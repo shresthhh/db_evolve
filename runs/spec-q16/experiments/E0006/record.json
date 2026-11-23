@@ -1,0 +1,28 @@
+{
+  "id": "E0006",
+  "title": "Evaluate small integral constant IN lists inline instead of a MARK join",
+  "started": "2026-11-20T21:15:39-05:00",
+  "base": "084cba35c5dc243f7353ec8dcacb699f227beeda",
+  "candidate": "71361e410783e8a2e4e88cdaba82f4a18bd6f898",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q16 +0.3%; needs at least -5%)",
+    "visible geomean got slower (+0.3%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.6383169999999999,
+  "summary": "I changed `int_col [NOT] IN (...)` so it is evaluated inline when the list holds 6 to 64 non-NULL integer constants, instead of being turned into a MARK join. In q16 the MARK join and its 8-row COLUMN_DATA_SCAN are gone from the part build side. A plain FILTER `p_size IN (...)` (0.02s CPU) replaces the mark-join probe plus filter (0.02s + 0.01s). One profile run of q16.m0 went from 0.232s to 0.212s total. The gain is not clearly above noise: four `bench q16` runs gave +1.2%, -3.2%, -7.9% and -9.9%, about -5% on average.\n\nTwo files changed:\n- `src/optimizer/in_clause_rewriter.cpp`: after the `< 6` / non-scalar check, the IN expression is left unchanged when the left type is integral (not HUGEINT/UHUGEINT/DECIMAL), the list has at most 64 entries, and every entry is a non-NULL BoundConstantExpression of exactly the left type.\n- `src/execution/expression_executor/execute_operator.cpp`: new fast path `TryExecuteIntegralConstantIn`, used by the COMPARE_IN/NOT_IN branch when the left side has an integral physical type of at most 64 bits and the list is the same kind of constants. It sorts the constants and tests membership with a bitmap when max-min < 4096, otherwise with binary search. It handles CONSTANT and flat/unified left vectors. A NULL on the left gives NULL; NOT IN flips the answer. Anything else still goes through the old generic compare-and-OR loop.\n\nI checked results by hand with one statement: NULL and negative values, BIGINT with a wide range (binary-search path), HUGEINT (stays on the old path), NOT IN, and IN inside an aggregate FILTER all matched expected values.",
+  "notes": "- The saving is small in CPU terms (about 0.01-0.02s CPU on the part build side), and the wall-clock effect is borderline at the 5% bar: two of four bench runs were under it.\n- A follow-up with a bigger effect would be to push the integer IN as a real, non-optional table filter in the scan instead of an OptionalFilter (`filter_combiner.cpp:580`). Then the scan would drop the 84% of rows that fail it before the string predicates run. That needs a row-level IN_FILTER evaluation in column segment filter selection, which does not exist today: IN_FILTER only appears for zonemap and multi-file mapping.\n- In q16 the time is dominated by the HASH_GROUP_BY count(DISTINCT) (0.5-0.6s CPU) and the partsupp scan and join (0.2s); the part build side is minor.",
+  "train_ratio": 1.0034666753131527,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 1.0034666753131527
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T21:21:24-05:00"
+}

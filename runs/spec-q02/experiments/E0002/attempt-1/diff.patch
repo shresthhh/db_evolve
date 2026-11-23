@@ -1,0 +1,139 @@
+diff --git a/src/storage/compression/bitpacking.cpp b/src/storage/compression/bitpacking.cpp
+index b9bada0..70f69b5 100644
+--- a/src/storage/compression/bitpacking.cpp
++++ b/src/storage/compression/bitpacking.cpp
+@@ -867,6 +867,126 @@ void BitpackingScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_c
+ 	BitpackingScanPartial<T>(segment, state, scan_count, result, 0);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Select
++//===--------------------------------------------------------------------===//
++//! Advances the scan state by skip_count rows, leaving it in the same state a scan of skip_count rows would
++//! (i.e. a position at the end of a metadata group does not load the next - possibly non-existent - group)
++template <class T>
++static void BitpackingSelectAdvance(ColumnSegment &segment, BitpackingScanState<T> &scan_state, idx_t skip_count) {
++	if (skip_count == 0) {
++		return;
++	}
++	idx_t target = scan_state.current_group_offset + skip_count;
++	if (target <= BITPACKING_METADATA_GROUP_SIZE && scan_state.current_group.mode != BitpackingMode::DELTA_FOR) {
++		scan_state.current_group_offset = target;
++		return;
++	}
++	if (target % BITPACKING_METADATA_GROUP_SIZE == 0) {
++		// land on the last row of the group and step over it without loading the next group
++		scan_state.Skip(segment, skip_count - 1);
++		scan_state.current_group_offset++;
++		return;
++	}
++	scan_state.Skip(segment, skip_count);
++}
++
++template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
++void BitpackingSelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++                      const SelectionVector &sel, idx_t sel_count) {
++	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
++
++	bool ascending = true;
++	for (idx_t i = 1; i < sel_count; i++) {
++		if (sel.get_index(i) <= sel.get_index(i - 1)) {
++			ascending = false;
++			break;
++		}
++	}
++	bool dense = sel_count * 4 > vector_count;
++	bool in_delta_group = scan_state.current_group_offset < BITPACKING_METADATA_GROUP_SIZE &&
++	                      scan_state.current_group.mode == BitpackingMode::DELTA_FOR;
++	if (dense || in_delta_group || !ascending) {
++		// decode the entire vector and gather the selected rows
++		if (ascending) {
++			// sel[i] >= i: gathering in place front-to-back is safe
++			BitpackingScanPartial<T>(segment, state, vector_count, result, 0);
++			auto result_data = FlatVector::GetData<T>(result);
++			for (idx_t i = 0; i < sel_count; i++) {
++				result_data[i] = result_data[sel.get_index(i)];
++			}
++		} else {
++			Vector scratch(result.GetType(), vector_count);
++			BitpackingScanPartial<T>(segment, state, vector_count, scratch, 0);
++			auto scratch_data = FlatVector::GetData<T>(scratch);
++			auto result_data = FlatVector::GetData<T>(result);
++			for (idx_t i = 0; i < sel_count; i++) {
++				result_data[i] = scratch_data[sel.get_index(i)];
++			}
++			result.SetVectorType(VectorType::FLAT_VECTOR);
++		}
++		return;
++	}
++
++	// sparse selection: skip to every selected row and decode only the algorithm group that contains it
++	result.SetVectorType(VectorType::FLAT_VECTOR);
++	auto result_data = FlatVector::GetData<T>(result);
++	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
++	bool skip_sign_extend = true;
++	data_ptr_t cached_group_ptr = nullptr;
++	bitpacking_width_t cached_width = 0;
++	idx_t pos = 0;
++	for (idx_t i = 0; i < sel_count; i++) {
++		auto idx = sel.get_index(i);
++		BitpackingSelectAdvance<T>(segment, scan_state, idx - pos);
++		pos = idx;
++		if (scan_state.current_group_offset == BITPACKING_METADATA_GROUP_SIZE) {
++			scan_state.LoadNextGroup();
++		}
++		D_ASSERT(scan_state.current_group_offset < BITPACKING_METADATA_GROUP_SIZE);
++		switch (scan_state.current_group.mode) {
++		case BitpackingMode::CONSTANT:
++			result_data[i] = scan_state.current_constant;
++			break;
++		case BitpackingMode::CONSTANT_DELTA: {
++			idx_t multiplier = scan_state.current_group_offset;
++			// intended static casts to unsigned and back for defined wrapping of integers
++			result_data[i] = static_cast<T>((static_cast<T_U>(scan_state.current_constant) * multiplier) +
++			                                static_cast<T_U>(scan_state.current_frame_of_reference));
++			break;
++		}
++		case BitpackingMode::FOR:
++		case BitpackingMode::DELTA_FOR: {
++			idx_t offset_in_compression_group =
++			    scan_state.current_group_offset % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE;
++			data_ptr_t decompression_group_start_pointer =
++			    scan_state.current_group_ptr +
++			    (scan_state.current_group_offset - offset_in_compression_group) * scan_state.current_width / 8;
++			bool is_delta = scan_state.current_group.mode == BitpackingMode::DELTA_FOR;
++			// skipping within a DELTA_FOR group overwrites the decompression buffer: never reuse it there
++			if (is_delta || decompression_group_start_pointer != cached_group_ptr ||
++			    scan_state.current_width != cached_width) {
++				BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
++				                                     decompression_group_start_pointer, scan_state.current_width,
++				                                     skip_sign_extend);
++				cached_group_ptr = is_delta ? nullptr : decompression_group_start_pointer;
++				cached_width = scan_state.current_width;
++			}
++			T value = scan_state.decompression_buffer[offset_in_compression_group];
++			value += scan_state.current_frame_of_reference;
++			if (is_delta) {
++				value += scan_state.current_delta_offset;
++			}
++			result_data[i] = value;
++			break;
++		}
++		default:
++			throw InternalException("Invalid bitpacking mode");
++		}
++	}
++	BitpackingSelectAdvance<T>(segment, scan_state, vector_count - pos);
++}
++
+ //===--------------------------------------------------------------------===//
+ // Fetch
+ //===--------------------------------------------------------------------===//
+@@ -968,6 +1088,7 @@ CompressionFunction GetBitpackingFunction(PhysicalType data_type) {
+ 	    BitpackingCompress<T, WRITE_STATISTICS>, BitpackingFinalizeCompress<T, WRITE_STATISTICS>, BitpackingInitScan<T>,
+ 	    BitpackingScan<T>, BitpackingScanPartial<T>, BitpackingFetchRow<T>, BitpackingSkip<T>);
+ 	bitpacking.get_segment_info = BitpackingGetSegmentInfo<T>;
++	bitpacking.select = BitpackingSelect<T>;
+ 	return bitpacking;
+ }
+ 

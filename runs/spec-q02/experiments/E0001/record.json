@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "Sub-row-group scan morsels for tables with few row groups",
+  "started": "2026-11-19T11:58:35-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "fa5fe35db0c12f28f99bbc74bbeb251e46e774c5",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.6689402000000001,
+  "summary": "Parallel table scans can now hand out pieces of a row group (morsels) instead of always handing out a whole row group (~122k rows) per task. I added a static helper, RowGroupCollection::GetParallelScanMorselVectors(total_rows, row_group_size, threads). It aims for about 4 morsels per thread, uses at least 4 vectors (8k rows) per morsel, and never more than one row group. RowGroupCollection::NextParallelScan now uses the existing sub-row-group branch whenever the morsel is smaller than the current row group, or when it is part-way through a row group. That branch was previously only used under verify_parallelism, which still gets 1 vector. It advances vector_index by the morsel size and adds the morsel's own rows to processed_rows. DataTable::MaxThreads uses the same helper, so the scan source starts enough threads. I put the helper in row_group_collection.hpp rather than scan_state.hpp, so ParallelCollectionScanState is unchanged. The morsel size is recomputed under the lock on every call, which is a few arithmetic operations. Results: the build is OK and bench reported no result mismatches. q02 went from 88.7 to 72.3 ms (-18.5%) on the first run and from 91.2 to 79.0 ms (-13.4%) on the second. Before the change, the profile showed the 100k-row supplier scan taking 0.02s on a single thread.",
+  "notes": "- MaxThreads uses GetTotalRows(), while NextParallelScan uses max_row minus the base row id fixed at scan start. The two can differ slightly if rows are appended during a scan, but that only affects the thread-count estimate, not correctness.\n- Under verify_parallelism, processed_rows is now updated as well; before, it was never updated in that mode.\n- Not measured in isolation: whether scanning from a vector offset inside compressed or FSST string segments costs extra. The end-to-end time improved anyway.\n- Possible follow-ups: tune MORSELS_PER_THREAD and MIN_MORSEL_VECTORS, and check that the 17-row-group part scan (now about 31-vector morsels) is balanced.",
+  "train_ratio": 0.814650285750186,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.814650285750186
+  },
+  "improved": [
+    "q02"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-19T12:11:02-05:00"
+}

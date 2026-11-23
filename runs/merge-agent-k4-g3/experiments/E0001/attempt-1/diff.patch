@@ -1,0 +1,617 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..0d1cea6 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -184,7 +184,28 @@ static void AddPointerToCompare(JoinHashTable::ProbeState &state, const ht_entry
+ 	keys_to_compare_count += 1;
+ }
+ 
+-template <bool USE_SALTS, bool HAS_SEL>
++static inline void PrefetchRead(const void *p) {
++#if defined(__GNUC__) || defined(__clang__)
++	__builtin_prefetch(p, 0, 3);
++#endif
++}
++
++static inline void PrefetchWrite(const void *p) {
++#if defined(__GNUC__) || defined(__clang__)
++	__builtin_prefetch(p, 1, 3);
++#endif
++}
++
++//! How many iterations ahead to prefetch hash table entries
++static constexpr idx_t HT_PREFETCH_DISTANCE = 16;
++//! Only prefetch if the pointer table is larger than this (smaller tables are likely cache-resident)
++static constexpr idx_t HT_PREFETCH_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL;
++
++static inline bool ShouldPrefetch(const JoinHashTable &ht) {
++	return ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES;
++}
++
++template <bool USE_SALTS, bool HAS_SEL, bool PREFETCH>
+ static idx_t ProbeForPointersInternal(JoinHashTable::ProbeState &state, JoinHashTable &ht, ht_entry_t *entries,
+                                       Vector &pointers_result_v, const SelectionVector *row_sel, idx_t &count) {
+ 	auto hashes_dense = FlatVector::GetData<hash_t>(state.hashes_dense_v);
+@@ -192,6 +213,9 @@ static idx_t ProbeForPointersInternal(JoinHashTable::ProbeState &state, JoinHash
+ 	idx_t keys_to_compare_count = 0;
+ 
+ 	for (idx_t i = 0; i < count; i++) {
++		if (PREFETCH && i + HT_PREFETCH_DISTANCE < count) {
++			PrefetchRead(entries + (hashes_dense[i + HT_PREFETCH_DISTANCE] & ht.bitmask));
++		}
+ 		auto row_hash = hashes_dense[i]; // hashes have been flattened before -> always access dense
+ 		auto row_ht_offset = row_hash & ht.bitmask;
+ 
+@@ -242,10 +266,19 @@ template <bool USE_SALTS>
+ static idx_t ProbeForPointers(JoinHashTable::ProbeState &state, JoinHashTable &ht, ht_entry_t *entries,
+                               Vector &pointers_result_v, const SelectionVector *row_sel, idx_t count,
+                               const bool has_row_sel) {
++	if (ShouldPrefetch(ht)) {
++		if (has_row_sel) {
++			return ProbeForPointersInternal<USE_SALTS, true, true>(state, ht, entries, pointers_result_v, row_sel,
++			                                                       count);
++		} else {
++			return ProbeForPointersInternal<USE_SALTS, false, true>(state, ht, entries, pointers_result_v, row_sel,
++			                                                        count);
++		}
++	}
+ 	if (has_row_sel) {
+-		return ProbeForPointersInternal<USE_SALTS, true>(state, ht, entries, pointers_result_v, row_sel, count);
++		return ProbeForPointersInternal<USE_SALTS, true, false>(state, ht, entries, pointers_result_v, row_sel, count);
+ 	} else {
+-		return ProbeForPointersInternal<USE_SALTS, false>(state, ht, entries, pointers_result_v, row_sel, count);
++		return ProbeForPointersInternal<USE_SALTS, false, false>(state, ht, entries, pointers_result_v, row_sel, count);
+ 	}
+ }
+ 
+@@ -278,6 +311,7 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 
+ 	idx_t keys_no_match_count;
+ 	idx_t elements_to_probe_count = count;
++	const bool prefetch = ShouldPrefetch(ht);
+ 
+ 	do {
+ 		const idx_t keys_to_compare_count = ProbeForPointers<USE_SALTS>(state, ht, entries, pointers_result_v, row_sel,
+@@ -288,6 +322,14 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 			break;
+ 		}
+ 
++		if (prefetch) {
++			// the build-side rows are likely not cache-resident: prefetch them before comparing the keys
++			const auto pointers = FlatVector::GetData<data_ptr_t>(pointers_result_v);
++			for (idx_t i = 0; i < keys_to_compare_count; i++) {
++				PrefetchRead(pointers[state.keys_to_compare_sel.get_index(i)]);
++			}
++		}
++
+ 		// Perform row comparisons, after Match function call salt_match_sel will point to the keys that match
+ 		keys_no_match_count = 0;
+ 		const idx_t keys_match_count =
+@@ -643,11 +685,16 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 
+ 	// use the ht bitmask to make the modulo operation faster but keep the salt bits intact
+ 	idx_t capacity_mask = ht.bitmask | ht_entry_t::SALT_MASK;
++	const bool prefetch = ShouldPrefetch(ht);
+ 	while (remaining_count > 0) {
+ 		idx_t salt_match_count = 0;
+ 
+ 		// iterate over each entry to find out whether it belongs to an existing list or will start a new list
+ 		for (idx_t i = 0; i < remaining_count; i++) {
++			if (prefetch && i + HT_PREFETCH_DISTANCE < remaining_count) {
++				const auto ahead_offset = ht_offsets[remaining_sel->get_index(i + HT_PREFETCH_DISTANCE)] & ht.bitmask;
++				PrefetchWrite(entries + ahead_offset);
++			}
+ 			const idx_t row_index = remaining_sel->get_index(i);
+ 			auto &ht_offset = ht_offsets[row_index];
+ 			auto &salt = hash_salts[row_index];
+@@ -716,8 +763,8 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 
+ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataChunkState &chunk_state,
+                                  InsertState &insert_state, bool parallel) {
+-	// Insert Hashes into the BF
+-	if (bloom_filter.IsInitialized()) {
++	// Insert Hashes into the BF (multi-key HTs insert the hash of the first key in Finalize instead)
++	if (bloom_filter.IsInitialized() && conditions.size() == 1) {
+ 		bloom_filter.InsertHashes(hashes_v, count);
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+@@ -783,6 +830,11 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 	                                chunk_idx_to, false);
+ 	const auto row_locations = iterator.GetRowLocations();
+ 
++	// for multi-key joins, the stored row hash combines all keys, but the pushed-down bloom filter is probed with
++	// the hash of the first key only, so we gather and hash the first key column separately
++	const bool bf_on_first_key = bloom_filter.IsInitialized() && conditions.size() > 1;
++	Vector first_key_hashes_v(LogicalType::HASH);
++
+ 	InsertState insert_state(*this);
+ 	do {
+ 		const auto count = iterator.GetCurrentChunkCount();
+@@ -791,6 +843,14 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+ 
++		if (bf_on_first_key) {
++			const auto &incr_sel = *FlatVector::IncrementalSelectionVector();
++			Vector first_key_v(condition_types[0]);
++			data_collection->Gather(chunk_state.row_locations, incr_sel, count, 0, first_key_v, incr_sel, nullptr);
++			VectorOperations::Hash(first_key_v, first_key_hashes_v, count);
++			bloom_filter.InsertHashes(first_key_hashes_v, count);
++		}
++
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+ 	} while (iterator.Next());
+ }
+@@ -953,6 +1013,8 @@ void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_
+ 		auto idx = sel.get_index(i);
+ 		ptrs[idx] = LoadPointer(ptrs[idx] + ht.pointer_offset);
+ 		if (ptrs[idx]) {
++			// the next row in the chain will be compared soon: start fetching it
++			PrefetchRead(ptrs[idx]);
+ 			this->sel_vector.set_index(new_count++, idx);
+ 		}
+ 	}
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..980a497 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+ 
++#include "duckdb/common/operator/add.hpp"
+ #include "duckdb/common/radix_partitioning.hpp"
+ #include "duckdb/common/types/value_map.hpp"
+ #include "duckdb/execution/expression_executor.hpp"
+@@ -17,6 +18,7 @@
+ #include "duckdb/parallel/thread_context.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
+ #include "duckdb/planner/filter/in_filter.hpp"
+ #include "duckdb/planner/filter/optional_filter.hpp"
+@@ -711,14 +713,44 @@ public:
+ 	}
+ };
+ 
++//! Map a join key value to the value domain of the probe-side storage column (undoing integral compression if needed)
++static bool CastJoinFilterValueToStorage(Value &value, const JoinFilterPushdownColumn &column) {
++	if (!column.storage_offset.IsNull() && !value.IsNull()) {
++		// the probe expression is (storage_value - offset), so the storage value is (value + offset)
++		Value offset = column.storage_offset;
++		if (!value.DefaultTryCastAs(LogicalType::HUGEINT) || !offset.DefaultTryCastAs(LogicalType::HUGEINT)) {
++			return false;
++		}
++		hugeint_t result;
++		if (!TryAddOperator::Operation(value.GetValue<hugeint_t>(), offset.GetValue<hugeint_t>(), result)) {
++			return false;
++		}
++		value = Value::HUGEINT(result);
++	}
++	if (column.storage_type.IsValid() && !value.DefaultTryCastAs(column.storage_type)) {
++		return false;
++	}
++	return true;
++}
++
++//! With more distinct keys than the IN-list threshold, we still push a zonemap-only disjunction of key ranges as long
++//! as the hash table is at most this many times larger than the threshold (so that scanning the keys stays cheap)
++static constexpr idx_t JOIN_FILTER_RANGE_SET_FACTOR = 64;
++
+ bool JoinFilterPushdownInfo::CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+                                             const ExpressionType &cmp) const {
+ 	auto dynamic_or_filter_threshold = Settings::Get<DynamicOrFilterThresholdSetting>(context);
+-	return ht && ht->Count() > 1 && ht->Count() <= dynamic_or_filter_threshold && cmp == ExpressionType::COMPARE_EQUAL;
++	if (!ht || ht->Count() <= 1 || cmp != ExpressionType::COMPARE_EQUAL) {
++		return false;
++	}
++	// ht->Count() <= threshold * factor (written to avoid overflow)
++	return (ht->Count() + JOIN_FILTER_RANGE_SET_FACTOR - 1) / JOIN_FILTER_RANGE_SET_FACTOR <=
++	       dynamic_or_filter_threshold;
+ }
+ 
+-void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht,
+-                                          const PhysicalOperator &op, idx_t filter_idx, idx_t filter_col_idx) const {
++void JoinFilterPushdownInfo::PushInFilter(const ClientContext &context, const JoinFilterPushdownFilter &info,
++                                          JoinHashTable &ht, const PhysicalOperator &op, idx_t filter_idx,
++                                          idx_t filter_col_idx) const {
+ 	// generate a "OR" filter (i.e. x=1 OR x=535 OR x=997)
+ 	// first scan the entire vector at the probe side
+ 	auto build_idx = join_condition[filter_idx];
+@@ -734,8 +766,7 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 	for (idx_t k = 0; k < key_count; k++) {
+ 		// Cast to storage type, only insert if it succeeds
+ 		auto value = build_vector.GetValue(k);
+-		if (info.columns[filter_idx].storage_type.IsValid() &&
+-		    !value.DefaultTryCastAs(info.columns[filter_idx].storage_type)) {
++		if (!CastJoinFilterValueToStorage(value, info.columns[filter_idx])) {
+ 			return; // it's all or nothing sadly
+ 		}
+ 		unique_ht_values.insert(value);
+@@ -749,12 +780,69 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 		return;
+ 	}
+ 
+-	// generate the OR filter
+-	auto in_filter = make_uniq<InFilter>(std::move(in_list));
++	unique_ptr<TableFilter> child_filter;
++	const idx_t max_filter_count = Settings::Get<DynamicOrFilterThresholdSetting>(context);
++	if (in_list.size() <= max_filter_count) {
++		// generate the OR filter
++		child_filter = make_uniq<InFilter>(std::move(in_list));
++	} else {
++		// too many values for an IN-list: generate a disjunction of at most max_filter_count ranges [lo, hi]
++		// splitting the sorted keys at the largest gaps
++		const auto &storage_type = info.columns[filter_idx].storage_type;
++		if (max_filter_count < 2 || !storage_type.IsIntegral() || storage_type.id() == LogicalTypeId::UHUGEINT ||
++		    in_list[0].type() != storage_type) {
++			return;
++		}
++		// IsDenseRange sorted in_list for integral types
++		vector<hugeint_t> keys;
++		keys.reserve(in_list.size());
++		for (auto &val : in_list) {
++			keys.push_back(val.GetValue<hugeint_t>());
++		}
++		vector<pair<hugeint_t, idx_t>> gaps;
++		gaps.reserve(keys.size() - 1);
++		for (idx_t i = 1; i < keys.size(); i++) {
++			gaps.emplace_back(keys[i] - keys[i - 1], i);
++		}
++		const idx_t split_count = max_filter_count - 1;
++		std::nth_element(gaps.begin(), gaps.begin() + NumericCast<int64_t>(split_count), gaps.end(),
++		                 [](const pair<hugeint_t, idx_t> &a, const pair<hugeint_t, idx_t> &b) {
++			                 return a.first > b.first || (a.first == b.first && a.second < b.second);
++		                 });
++		vector<idx_t> splits;
++		splits.reserve(split_count + 1);
++		for (idx_t i = 0; i < split_count; i++) {
++			splits.push_back(gaps[i].second);
++		}
++		std::sort(splits.begin(), splits.end());
++		splits.push_back(keys.size());
++
++		auto or_filter = make_uniq<ConjunctionOrFilter>();
++		idx_t range_start = 0;
++		for (auto range_end : splits) {
++			Value lo = Value::HUGEINT(keys[range_start]);
++			Value hi = Value::HUGEINT(keys[range_end - 1]);
++			if (!lo.DefaultTryCastAs(storage_type) || !hi.DefaultTryCastAs(storage_type)) {
++				return;
++			}
++			if (range_end - range_start == 1) {
++				or_filter->child_filters.push_back(make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, lo));
++			} else {
++				auto and_filter = make_uniq<ConjunctionAndFilter>();
++				and_filter->child_filters.push_back(
++				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo));
++				and_filter->child_filters.push_back(
++				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi));
++				or_filter->child_filters.push_back(std::move(and_filter));
++			}
++			range_start = range_end;
++		}
++		child_filter = std::move(or_filter);
++	}
+ 
+ 	// we push the OR filter as an OptionalFilter so that we can use it for zonemap pruning only
+ 	// the IN-list is expensive to execute otherwise
+-	auto filter = make_uniq<OptionalFilter>(std::move(in_filter));
++	auto filter = make_uniq<OptionalFilter>(std::move(child_filter));
+ 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
+ }
+ 
+@@ -770,9 +858,11 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// bf is only supported on the first key with an equality condition, as the Filter API only allows
++	// single-column filters so far. For multi-key joins, the bf is built from the hash of the first key only
++	// (see JoinHashTable::Finalize); the caller ensures that the filter is for the first condition
++	const bool can_use_bf =
++	    cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -832,13 +922,9 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			auto max_val = final_min_max->data[max_idx].GetValue(0);
+ 
+ 			// Cast to storage type, skip if fails
+-			if (pushdown_column.storage_type.IsValid()) {
+-				if (!min_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
+-				if (!max_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
++			if (!CastJoinFilterValueToStorage(min_val, pushdown_column) ||
++			    !CastJoinFilterValueToStorage(max_val, pushdown_column)) {
++				continue;
+ 			}
+ 
+ 			if (min_val.IsNull() || max_val.IsNull()) {
+@@ -850,7 +936,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			// if the HT is small we can generate a complete "OR" filter
+ 			// but only if the join condition is equality.
+ 			if (ht && CanUseInFilter(context, ht, cmp)) {
+-				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
++				PushInFilter(context, info, *ht, op, filter_idx, filter_col_idx);
+ 			}
+ 			if (Value::NotDistinctFrom(min_val, max_val)) {
+ 				// min = max - single value
+@@ -895,8 +981,12 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 				}
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+-				bool has_cast = condition_type != pushdown_column.storage_type;
+-				if (!has_cast && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				// the bloom filter hashes join key values, which differ from storage values when casting or shifting
++				bool has_cast =
++				    condition_type != pushdown_column.storage_type || !pushdown_column.storage_offset.IsNull();
++				// the bloom filter is built on the first join condition, so only push it for that condition
++				const bool is_first_condition = join_condition[filter_idx] == 0;
++				if (!has_cast && is_first_condition && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..8e5a977 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -27,6 +27,9 @@ struct JoinFilterPushdownColumn {
+ 	ColumnBinding probe_column_index;
+ 	//! The type of the value in storage (LogicalGet)
+ 	LogicalType storage_type;
++	//! If set, the probe expression is "storage_value - storage_offset" (integral compression), so a join key value v
++	//! corresponds to storage value v + storage_offset
++	Value storage_offset;
+ };
+ 
+ struct JoinFilterGlobalState {
+@@ -89,8 +92,8 @@ public:
+ 	                     idx_t filter_col_idx) const;
+ 
+ private:
+-	void PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
+-	                  idx_t filter_idx, idx_t filter_col_idx) const;
++	void PushInFilter(const ClientContext &context, const JoinFilterPushdownFilter &info, JoinHashTable &ht,
++	                  const PhysicalOperator &op, idx_t filter_idx, idx_t filter_col_idx) const;
+ 
+ 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
+ 	bool CanUseBloomFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..034ea75 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -8,6 +8,8 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -50,6 +52,28 @@ bool PushdownJoinFilterExpression(Expression &expr, JoinFilterPushdownColumn &fi
+ 		}
+ 		return PushdownJoinFilterExpression(*bound_cast.child, filter);
+ 	}
++	case ExpressionClass::BOUND_FUNCTION: {
++		// We allow pushing through integral compression (input - offset), the filter values are shifted back later
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (!StringUtil::StartsWith(func.function.name, "__internal_compress_integral_") ||
++		    func.children.size() != 2 || !filter.storage_offset.IsNull()) {
++			return false;
++		}
++		if (func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		const auto &src = func.children[0]->return_type;
++		if (!src.IsIntegral() || !expr.return_type.IsIntegral() ||
++		    GetTypeIdSize(src.InternalType()) > GetTypeIdSize(PhysicalType::INT64)) {
++			return false;
++		}
++		auto &offset = func.children[1]->Cast<BoundConstantExpression>().value;
++		if (offset.IsNull()) {
++			return false;
++		}
++		filter.storage_offset = offset;
++		return PushdownJoinFilterExpression(*func.children[0], filter);
++	}
+ 	default:
+ 		return false;
+ 	}
+@@ -103,6 +127,7 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
+ 			for (auto &child_column : columns) {
+ 				JoinFilterPushdownColumn new_col;
+ 				new_col.probe_column_index = child_bindings[child_column.probe_column_index.column_index];
++				new_col.storage_offset = child_column.storage_offset;
+ 				child_columns.push_back(new_col);
+ 			}
+ 			// then recurse into the child
+diff --git a/src/optimizer/join_order/cardinality_estimator.cpp b/src/optimizer/join_order/cardinality_estimator.cpp
+index f09070c..e9d2a9c 100644
+--- a/src/optimizer/join_order/cardinality_estimator.cpp
++++ b/src/optimizer/join_order/cardinality_estimator.cpp
+@@ -263,12 +263,22 @@ double CardinalityEstimator::CalculateUpdatedDenom(Subgraph2Denominator left, Su
+ 	}
+ 	case JoinType::SEMI:
+ 	case JoinType::ANTI: {
++		double selectivity = CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		if (filter.filter_info->join_type == JoinType::SEMI && filter.filter_info->right_set) {
++			// a semi join keeps at most the fraction of the key domain present in its (small) RHS
++			auto tdom = filter.has_distinct_count_hll ? static_cast<double>(filter.distinct_count_hll)
++			                                          : static_cast<double>(filter.distinct_count_no_hll);
++			auto rhs_cardinality = GetNumerator(*filter.filter_info->right_set);
++			if (tdom > 0 && rhs_cardinality >= 1 && rhs_cardinality < tdom) {
++				selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);
++			}
++		}
+ 		if (JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&
+ 		    JoinRelationSet::IsSubset(*right.relations, *filter.filter_info->right_set)) {
+-			new_denom = left.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++			new_denom = left.denom * selectivity;
+ 			return new_denom;
+ 		}
+-		new_denom = right.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		new_denom = right.denom * selectivity;
+ 		return new_denom;
+ 	}
+ 	default:
+diff --git a/src/optimizer/join_order/relation_manager.cpp b/src/optimizer/join_order/relation_manager.cpp
+index 18498c9..6b054a9 100644
+--- a/src/optimizer/join_order/relation_manager.cpp
++++ b/src/optimizer/join_order/relation_manager.cpp
+@@ -202,6 +202,50 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
+ 	AddRelation(input_op, parent, child_stats);
+ }
+ 
++static bool IsAggregateRangeComparison(const Expression &expr, idx_t aggregate_index) {
++	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
++	    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		for (auto &child : conj.children) {
++			if (IsAggregateRangeComparison(*child, aggregate_index)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++		return false;
++	}
++	switch (expr.GetExpressionType()) {
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		break;
++	default:
++		return false;
++	}
++	auto &comp = expr.Cast<BoundComparisonExpression>();
++	auto is_aggr_ref = [&](const Expression &side) {
++		return side.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
++		       side.Cast<BoundColumnRefExpression>().binding.table_index == aggregate_index;
++	};
++	return (is_aggr_ref(*comp.left) && comp.right->IsFoldable()) ||
++	       (is_aggr_ref(*comp.right) && comp.left->IsFoldable());
++}
++
++static bool FilterHasAggregateRangePredicate(const vector<reference<LogicalOperator>> &filters,
++                                             idx_t aggregate_index) {
++	for (auto &filter : filters) {
++		for (auto &expr : filter.get().expressions) {
++			if (IsAggregateRangeComparison(*expr, aggregate_index)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
+ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, LogicalOperator &input_op,
+                                            vector<reference<LogicalOperator>> &filter_operators,
+                                            optional_ptr<LogicalOperator> parent) {
+@@ -274,6 +318,13 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
+ 		if (!datasource_filters.empty()) {
+ 			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
+ 			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
++			if (FilterHasAggregateRangePredicate(datasource_filters, aggr.aggregate_index)) {
++				// range predicates on aggregate results (HAVING sum(x) > c) usually keep few groups
++				operator_stats.cardinality =
++				    MaxValue<idx_t>(LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
++				                                            RelationStatisticsHelper::DEFAULT_SELECTIVITY),
++				                    1);
++			}
+ 		}
+ 		ModifyStatsIfLimit(limit_op.get(), child_stats);
+ 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..e766a2c 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -79,6 +80,40 @@ idx_t RelationStatisticsHelper::GetDistinctCount(LogicalGet &get, ClientContext
+ 	return distinct_count;
+ }
+ 
++//! Selectivity assumed for substring / pattern matching filters on strings (LIKE '%abc%', contains, regex)
++static constexpr double STRING_PATTERN_SELECTIVITY = 0.05;
++
++//! Whether the table filter is (or is a conjunction containing) a string pattern match against a constant pattern
++static bool IsStringPatternFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conj = filter.Cast<ConjunctionAndFilter>();
++		for (auto &child : conj.child_filters) {
++			if (IsStringPatternFilter(*child)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr = *filter.Cast<ExpressionFilter>().expr;
++		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++			return false;
++		}
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (func.children.size() < 2 || func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &name = func.function.name;
++		return name == "contains" || name == "like" || name == "~~" || name == "ilike" || name == "~~*" ||
++		       name == "like_escape" || name == "ilike_escape" || name == "regexp_matches" || name == "suffix" ||
++		       name == "ends_with";
++	}
++	default:
++		return false;
++	}
++}
++
+ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
+ 	auto return_stats = RelationStats();
+ 
+@@ -119,6 +154,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 	if (!get.table_filters.filters.empty()) {
+ 		column_statistics = nullptr;
+ 		bool has_non_optional_filters = false;
++		bool has_string_pattern_filter = false;
+ 		for (auto &it : get.table_filters.filters) {
+ 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
+ 				if (get.function.statistics_extended) {
+@@ -139,15 +175,20 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 
+ 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
+ 				has_non_optional_filters = true;
++				if (IsStringPatternFilter(*it.second)) {
++					has_string_pattern_filter = true;
++				}
+ 			}
+ 		}
+ 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
+ 		// and there are other table filters (i.e cost > 50), use default selectivity.
++		// substring / pattern matching filters (i.e name LIKE '%abc%') are typically more selective.
+ 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+ 		if (!has_equality_filter && has_non_optional_filters) {
+-			cardinality_after_filters = MaxValue<idx_t>(
+-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+-			    1U);
++			double selectivity =
++			    has_string_pattern_filter ? STRING_PATTERN_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			cardinality_after_filters =
++			    MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * selectivity), 1U);
+ 		}
+ 		if (base_table_cardinality == 0) {
+ 			cardinality_after_filters = 0;

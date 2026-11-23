@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "join_filter_pushdown_optimizer.cpp: allowing join filters for RIGHT_SEMI/RIGHT_ANTI is sound. Output comes only from build rows, and a build row is marked only when some probe row matches it, so removing probe rows whose key is in no build row cannot change the result. The physical filter code (FinalizeFilters, CanUseBloomFilter, PushBloomFilter in physical_hash_join.cpp:762-923) has no join-type assumptions. It skips the filter when min/max is NULL, builds the bloom filter only for COMPARE_EQUAL, and sets bloom null handling from NullValuesAreEqual.",
+      "deliminator.cpp: the NOT DISTINCT FROM to = rewrite is properly guarded. It needs all of these: the delim join was fully removed; every removed correlation condition was a plain = on column refs, which is the case where RemoveJoinWithDelimGet adds IS NOT NULL (deliminator.cpp:371-378); the RHS key traces back to one of those bindings through column-ref projections and group keys only; the RHS subtree has no operator that can add NULLs (outer, mark or single joins, set operations and multiple grouping sets all bail); and the join type is INNER, SEMI or ANTI. With the RHS key never NULL, a NULL LHS key matches nothing under either operator, so SEMI, ANTI and INNER results are unchanged. Correlations using IS NOT DISTINCT FROM / DISTINCT FROM are excluded, so they keep the old behaviour.",
+      "compress_comparison_join.cpp: the join-key columns of RIGHT_SEMI/RIGHT_ANTI joins are no longer compressed, so the probe key stays a plain column ref and the pushdown can reach the scan. This trades some build-side hash table compression for filter pushdown. It is a general heuristic keyed on join type, not on the workload, and payload columns are still compressed. It is outside the original plan, but the author states it is needed for the stated idea to take effect.",
+      "There is nothing specific to the workload (no table, column, literal or size checks), and nothing touches timing, settings or tests. The new helpers are small, file-local statics."
+    ],
+    "required_changes": []
+  }
+}

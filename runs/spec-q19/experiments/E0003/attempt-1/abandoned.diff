@@ -1,0 +1,182 @@
+diff --git a/src/storage/compression/dictionary_compression.cpp b/src/storage/compression/dictionary_compression.cpp
+index 6f10acb..6f4d974 100644
+--- a/src/storage/compression/dictionary_compression.cpp
++++ b/src/storage/compression/dictionary_compression.cpp
+@@ -7,6 +7,12 @@
+ #include "duckdb/common/types/vector_buffer.hpp"
+ #include "duckdb/function/compression/compression.hpp"
+ #include "duckdb/function/compression_function.hpp"
++#include "duckdb/planner/expression.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/filter/optional_filter.hpp"
++#include "duckdb/storage/table/column_segment.hpp"
++#include "duckdb/storage/table/scan_state.hpp"
+ #include "duckdb/storage/segment/uncompressed.hpp"
+ #include "duckdb/storage/string_uncompressed.hpp"
+ #include "duckdb/storage/table/column_data_checkpointer.hpp"
+@@ -123,10 +129,22 @@ void DictionaryCompressionStorage::FinalizeCompress(CompressionState &state_p) {
+ //===--------------------------------------------------------------------===//
+ // Scan
+ //===--------------------------------------------------------------------===//
++namespace {
++//! Scan state that additionally caches the result of a pushed-down filter evaluated on the dictionary entries
++struct DictionaryFilterScanState : public CompressedStringScanState {
++	explicit DictionaryFilterScanState(BufferHandle &&handle_p) : CompressedStringScanState(std::move(handle_p)) {
++	}
++	//! Per dictionary entry: does it pass the filter (only valid if filter_result_initialized)
++	unsafe_unique_array<bool> filter_result;
++	bool filter_result_initialized = false;
++	bool null_filter_result_initialized = false;
++};
++} // namespace
++
+ unique_ptr<SegmentScanState> DictionaryCompressionStorage::StringInitScan(const QueryContext &context,
+                                                                           ColumnSegment &segment) {
+ 	auto &buffer_manager = BufferManager::GetBufferManager(segment.db);
+-	auto state = make_uniq<CompressedStringScanState>(buffer_manager.Pin(segment.block));
++	auto state = make_uniq<DictionaryFilterScanState>(buffer_manager.Pin(segment.block));
+ 	state->Initialize(segment, true);
+ 	return std::move(state);
+ }
+@@ -153,6 +171,107 @@ void DictionaryCompressionStorage::StringScan(ColumnSegment &segment, ColumnScan
+ 	StringScanPartial<true>(segment, state, scan_count, result, 0);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Filter
++//===--------------------------------------------------------------------===//
++//! Whether the result of the filter for a given value is fixed for the duration of the scan
++static bool FilterResultIsStable(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONSTANT_COMPARISON:
++	case TableFilterType::IS_NULL:
++	case TableFilterType::IS_NOT_NULL:
++	case TableFilterType::IN_FILTER:
++		return true;
++	case TableFilterType::EXPRESSION_FILTER:
++		return !filter.Cast<ExpressionFilter>().expr->IsVolatile();
++	case TableFilterType::OPTIONAL_FILTER: {
++		auto &child = filter.Cast<OptionalFilter>().child_filter;
++		return child && FilterResultIsStable(*child);
++	}
++	case TableFilterType::CONJUNCTION_AND:
++	case TableFilterType::CONJUNCTION_OR: {
++		for (auto &child : static_cast<const ConjunctionFilter &>(filter).child_filters) {
++			if (!FilterResultIsStable(*child)) {
++				return false;
++			}
++		}
++		return true;
++	}
++	default:
++		return false;
++	}
++}
++
++static void StringFilter(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++                         SelectionVector &sel, idx_t &sel_count, const TableFilter &filter,
++                         TableFilterState &filter_state) {
++	auto &scan_state = state.scan_state->Cast<DictionaryFilterScanState>();
++	auto start = state.GetPositionInSegment();
++	// evaluate the filter once per dictionary entry, then map the rows through the dictionary selection
++	// only for full vectors with a small dictionary (bounded per-entry work) and a filter whose result is stable
++	if (vector_count != STANDARD_VECTOR_SIZE || !scan_state.dictionary || scan_state.dictionary_size == 0 ||
++	    scan_state.dictionary_size > STANDARD_VECTOR_SIZE || !FilterResultIsStable(filter)) {
++		DictionaryCompressionStorage::StringScan(segment, state, vector_count, result);
++		UnifiedVectorFormat vdata;
++		result.ToUnifiedFormat(vector_count, vdata);
++		ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, vector_count, sel_count);
++		return;
++	}
++	auto dict_count = scan_state.dictionary_size;
++	if (!scan_state.filter_result_initialized) {
++		scan_state.filter_result = make_unsafe_uniq_array<bool>(dict_count);
++		for (idx_t i = 0; i < dict_count; i++) {
++			scan_state.filter_result[i] = false;
++		}
++		// slot zero represents NULL and is not necessarily referenced by any row
++		idx_t non_null_count = dict_count - 1;
++		if (non_null_count > 0) {
++			Vector dict_data(scan_state.dictionary->data, /*offset=*/1, dict_count);
++			UnifiedVectorFormat vdata;
++			dict_data.ToUnifiedFormat(non_null_count, vdata);
++			SelectionVector dict_sel;
++			idx_t filter_count = non_null_count;
++			ColumnSegment::FilterSelection(dict_sel, dict_data, vdata, filter, filter_state, non_null_count,
++			                               filter_count);
++			for (idx_t i = 0; i < filter_count; i++) {
++				scan_state.filter_result[dict_sel.get_index(i) + 1] = true;
++			}
++		}
++		scan_state.filter_result_initialized = true;
++	}
++
++	// decode the dictionary selection for this vector - this also emits the dictionary vector into result
++	scan_state.ScanToDictionaryVector(segment, result, 0, start, vector_count);
++	auto &dict_sel = *scan_state.sel_vec;
++
++	SelectionVector new_sel(sel_count);
++	idx_t approved_tuple_count = 0;
++	for (idx_t i = 0; i < sel_count; i++) {
++		auto row_idx = sel.get_index(i);
++		auto dict_offset = dict_sel.get_index(row_idx);
++		if (dict_offset == 0 && !scan_state.null_filter_result_initialized) {
++			// evaluate the filter on NULL only when a row actually references it
++			Vector null_data(scan_state.dictionary->data, /*offset=*/0, /*end=*/1);
++			UnifiedVectorFormat null_vdata;
++			null_data.ToUnifiedFormat(1, null_vdata);
++			SelectionVector null_sel;
++			idx_t null_filter_count = 1;
++			ColumnSegment::FilterSelection(null_sel, null_data, null_vdata, filter, filter_state, 1,
++			                               null_filter_count);
++			scan_state.filter_result[0] = null_filter_count == 1;
++			scan_state.null_filter_result_initialized = true;
++		}
++		if (!scan_state.filter_result[dict_offset]) {
++			continue;
++		}
++		new_sel.set_index(approved_tuple_count++, row_idx);
++	}
++	if (approved_tuple_count < sel_count) {
++		sel.Initialize(new_sel);
++	}
++	sel_count = approved_tuple_count;
++}
++
+ //===--------------------------------------------------------------------===//
+ // Fetch
+ //===--------------------------------------------------------------------===//
+@@ -168,7 +287,7 @@ void DictionaryCompressionStorage::StringFetchRow(ColumnSegment &segment, Column
+ // Get Function
+ //===--------------------------------------------------------------------===//
+ CompressionFunction DictionaryCompressionFun::GetFunction(PhysicalType data_type) {
+-	return CompressionFunction(
++	auto res = CompressionFunction(
+ 	    CompressionType::COMPRESSION_DICTIONARY, data_type, DictionaryCompressionStorage ::StringInitAnalyze,
+ 	    DictionaryCompressionStorage::StringAnalyze, DictionaryCompressionStorage::StringFinalAnalyze,
+ 	    DictionaryCompressionStorage::InitCompression, DictionaryCompressionStorage::Compress,
+@@ -176,6 +295,8 @@ CompressionFunction DictionaryCompressionFun::GetFunction(PhysicalType data_type
+ 	    DictionaryCompressionStorage::StringScan, DictionaryCompressionStorage::StringScanPartial<false>,
+ 	    DictionaryCompressionStorage::StringFetchRow, UncompressedFunctions::EmptySkip,
+ 	    UncompressedStringStorage::StringInitSegment);
++	res.filter = StringFilter;
++	return res;
+ }
+ 
+ bool DictionaryCompressionFun::TypeIsSupported(const PhysicalType physical_type) {
+diff --git a/src/storage/compression/numeric_constant.cpp b/src/storage/compression/numeric_constant.cpp
+index e13a074..2bfbb45 100644
+--- a/src/storage/compression/numeric_constant.cpp
++++ b/src/storage/compression/numeric_constant.cpp
+@@ -170,6 +170,10 @@ void ConstantFun::FiltersNullValues(const LogicalType &type, const TableFilter &
+ 		filters_nulls = bf.FiltersNullValues();
+ 		break;
+ 	}
++	case TableFilterType::IN_FILTER:
++	case TableFilterType::DYNAMIC_FILTER:
++		// conservative: keep all rows - the filter on the data itself has already been applied
++		break;
+ 	default:
+ 		throw InternalException("FIXME: unsupported type for filter selection in validity select");
+ 	}

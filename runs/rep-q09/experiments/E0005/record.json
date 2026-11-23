@@ -1,0 +1,27 @@
+{
+  "id": "E0005",
+  "title": "Exact-bitmap join filter through CM integral compress projections (offset-shifted, no hashed BF)",
+  "started": "2026-11-23T13:32:53-05:00",
+  "base": "a496c6c900cceface52a41cb5babf2ae9f4baade",
+  "candidate": "ab40c57bf06864d11d49490dac3c43de6dc5705d",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -7.9%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 2.2434754,
+  "summary": "The orders scan in q09 now gets an exact-bitmap join filter through the compressed-materialization projection. The release build succeeds. `bench q09`: 525.1 ms \u2192 449.9 ms (-14.3%), with results checked by the harness. In the profile the orders scan shows `o_orderkey IN BF(l_orderkey)` plus shifted min/max filters, and its output falls from 15M to 2.94M rows.\n\nChanges:\n1. **Optimizer** (`PushdownJoinFilterExpression`): it now accepts `__internal_compress_integral_*(x, const)` when x is an integral type of 64 bits or less and not UBIGINT, and the constant is non-NULL and castable to BIGINT. Only one offset is allowed per column. The offset is recorded as a new `Value offset` field on `JoinFilterPushdownColumn` and copied when UNION children are rewritten. TopN and RowGroupPruner bail out on targets that have an offset.\n2. **FinalizeFilters**: for offset columns, min/max are cast to HUGEINT, shifted by the offset, then cast to the storage type; the column is skipped if a cast fails. The IN filter is skipped. The bloom filter is pushed only if `TrySetExactBloomFilterRange` (called with the compressed build min/max) makes the hash table's filter exact and the storage type is one the exact lookup supports. A hashed bloom filter is never pushed for an offset column.\n3. **BFTableFilter**: new `has_key_offset`/`key_offset`, serialized as optional fields 203 and 204. `Filter`, `FilterValue` and `CheckStatistics` test bit `(v - offset - key_min)` in wrapping uint64 arithmetic. The stats range check uses hugeint. If the filter is somehow not exact, an offset filter lets every row through in release builds (`D_ASSERT` in debug).\n4. **PushBloomFilter**: passes the first key's offset and storage type.\n\nCorrectness checks (orders\u22c8lineitem with lineitem-side filters, grouped by year, compared with `o_orderkey+0=l_orderkey+0` versions): count, sum(o_totalprice) and sum(o_orderkey) match exactly in two cases.\n- Sparse build: 171k rows over a 60M key range. No bitmap is built; only the shifted min/max filter is used.\n- Dense build: 1.54M rows. The exact bitmap is used and orders drops from 15M to 1.47M rows.\n\nThe only offset tested was 1, because every integer key in this dataset has min 1 or 0. A wrong sign would shift by 2 and break the match above.",
+  "notes": "- **Remaining cost is the build:** the orders HASH_JOIN still shows about 1.35s CPU in the profile even though probe rows fell from 15M to 2.94M. The wall-clock gain comes mainly from the cheaper probe pipeline (scan plus projection), not from the join operator itself. A next step would target the 3.27M-row build: inserts or pointer-table size, or a perfect hash join on the compressed uint32 key, whose range is about 60M.\n- **Earlier attempt (E0003):** the same pushdown with a hashed bloom filter was +4.7% on bench; the exact bitmap is what makes it pay off.\n- **Fewer changes than the plan expected:** the exact-range check needed no relaxing, because passing the condition's (compressed) type as the probe type already matches the build layout type. The actual probe vector physical type is handled in `LookupKeys`.\n- **Possible follow-ups:** joins with larger key offsets were not exercised here and could be worth a test with synthetic data. Pushing offsets through decompress\u2192compress chains is another possible extension.",
+  "train_ratio": 0.9212442941772758,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9212442941772758
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-23T13:44:42-05:00"
+}

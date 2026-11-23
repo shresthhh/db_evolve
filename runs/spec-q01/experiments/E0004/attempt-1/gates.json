@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "extension/core_functions/aggregate/algebraic/avg.cpp: AvgPropagateStats uses the same overflow bound as the existing SumPropagateStats in sum.cpp (|min|,|max| \u00d7 max_cardinality strictly inside int64), so the int64 sum is exact whenever the swap happens. With missing stats, all-NULL input (no min/max) or wide ranges, it keeps the hugeint path.",
+      "The finalize casts the int64 sum to hugeint_t and then to long double, then divides by the same GetAverageDivident using the unchanged bind_data. This keeps the decimal scale, and the result is bit-identical to IntegerAverageOperationHugeint. When count is 0 it returns NULL, which covers empty input.",
+      "The patch swaps only the state and execution callbacks and leaves the name, arguments, return type and bind/bind_info alone. A deserialised plan rebinds 'avg' to the hugeint version, which gives the same results, so avg does not need separate serialisation handling the way sum_no_overflow does.",
+      "Child stats come from the child expression after any implicit cast, so the INT32/INT64 internal type matches the function's input type. Decimal avg with int32/int64 storage goes through GetAverageAggregate and is covered correctly.",
+      "The change is general: avg over INTEGER, BIGINT or DECIMAL(<=18) when stats prove the sum cannot overflow. It refers to no tables, columns, literals or data sizes, it is small, and it does what the issue describes."
+    ],
+    "required_changes": []
+  }
+}

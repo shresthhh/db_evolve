@@ -1,0 +1,27 @@
+{
+  "id": "E0001",
+  "title": "Lower cardinality estimate for substring/LIKE table filters",
+  "started": "2026-11-20T00:13:02-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "c6b5dde53f661ee3709ac8121136aef2f9ec784f",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.3829946000000001,
+  "summary": "I changed `RelationStatisticsHelper::ExtractGetStats` in `src/optimizer/join_order/relation_statistics_helper.cpp` (only that `.cpp` file, no header change). If a non-optional table filter is a string pattern match against a constant, the default selectivity drops from 0.2 to 0.05. This covers an ExpressionFilter, or one inside a ConjunctionAndFilter, whose BoundFunctionExpression is `contains`, `like`, `~~`, `ilike`, `~~*`, `like_escape`, `ilike_escape`, `regexp_matches`, `suffix` or `ends_with`, with a constant second argument. The new constant `STRING_PATTERN_SELECTIVITY` is a file-local constexpr. Equality-filter estimates still take precedence, and every other filter behaves exactly as before. The release build passes. q09.m0 EXPLAIN ANALYZE went from 1.39s to 1.03s. The plan now joins partsupp to the filtered part table first (436K rows), then joins lineitem on both keys while building on that small side. The orders join builds on the 3.27M intermediate, not on the 15M orders scan. Bench result: q09 went from 980.7 ms to 723.0 ms (-26.3%), and the geomean also fell 26.3%. Result checks passed.",
+  "notes": "Follow-up: in the new plan the lineitem scan no longer gets the dynamic bloom filter on its part key (`IN BF(p_partkey)`). It now reads all 60M rows (2.16s of scan time) instead of 3.45M, and the 2-key join takes 2.38s of operator time. The old plan had the part table as a direct build child of the lineitem join, so its bloom filter was pushed into the scan. Now the build side is partsupp\u22c8part, and the dynamic filter only carries min/max bounds, not a bloom filter. Two ways to get a further large gain: let bloom-filter pushdown work when the build side is a join whose output still covers the key, or have the join order prefer joining lineitem to part directly. I did not try either, to keep this diff small. Also, the 2-key join estimate counting only one key, which the issue raised, did not block the flip here.",
+  "train_ratio": 0.7973396752661089,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.7973396752661089
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T00:17:57-05:00"
+}

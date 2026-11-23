@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "plan_aggregate.cpp: the larger perfect-HA eligibility (up to max(threshold, 22) bits) depends only on the bits taken from key statistics, the estimated cardinality (density of at least 1/4) and a memory bound from thread count and max_memory. It names no tables, columns, literals or scale factors. The 22-bit cap is a fixed engine constant, not a dataset value.",
+      "perfect_aggregate_hashtable.cpp: CombineRange keeps the original loop logic, restricted to [begin, end). group_is_set is a bool (byte) array, so threads writing to disjoint stripes do not race. Each combining thread uses its own ArenaAllocator, and those arenas, along with the local tables' arenas, are stored in stored_allocators under the global lock, so the states' memory lives as long as the global HT. Destroy still visits every slot of the global table exactly once.",
+      "physical_perfecthash_aggregate.cpp: the stripes are multiples of STANDARD_VECTOR_SIZE and stripe_count is a ceiling division, so they cover every slot. Tiny tables give a single stripe. Tables under 2^16 slots keep the exact old single-lock Combine.",
+      "Parallel source: blocks are handed out through an atomic counter, and each thread has its own address vector and finalize arena. Small tables use one block, so MaxThreads=1 and the scan stays serial as before. SourceOrder was already NO_ORDER, so a parallel source does not change any ordering guarantee. The local arena outlives the chunks it backs because they are consumed within the same pipeline.",
+      "Nothing touches timing, settings defaults, tests or the shell. The threshold setting's default is unchanged, and the larger-table path is limited by the user's memory and thread configuration."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"plan_aggregate.cpp: the larger perfect-HA eligibility (up to max(threshold, 22) bits) depends only on the bits taken from key statistics, the estimated cardinality (density of at least 1/4) and a memory bound from thread count and max_memory. It names no tables, columns, literals or scale factors. The 22-bit cap is a fixed engine constant, not a dataset value.\",\"perfect_aggregate_hashtable.cpp: CombineRange keeps the original loop logic, restricted to [begin, end). group_is_set is a bool (byte) array, so threads writing to disjoint stripes do not race. Each combining thread uses its own ArenaAllocator, and those arenas, along with the local tables' arenas, are stored in stored_allocators under the global lock, so the states' memory lives as long as the global HT. Destroy still visits every slot of the global table exactly once.\",\"physical_perfecthash_aggregate.cpp: the stripes are multiples of STANDARD_VECTOR_SIZE and stripe_count is a ceiling division, so they cover every slot. Tiny tables give a single stripe. Tables under 2^16 slots keep the exact old single-lock Combine.\",\"Parallel source: blocks are handed out through an atomic counter, and each thread has its own address vector and finalize arena. Small tables use one block, so MaxThreads=1 and the scan stays serial as before. SourceOrder was already NO_ORDER, so a parallel source does not change any ordering guarantee. The local arena outlives the chunks it backs because they are consumed within the same pipeline.\",\"Nothing touches timing, settings defaults, tests or the shell. The threshold setting's default is unchanged, and the larger-table path is limited by the user's memory and thread configuration.\"],\"required_changes\":[]}",
+  "cost_usd": 0.18428200000000003,
+  "seconds": 35.58893013000488,
+  "error": ""
+}

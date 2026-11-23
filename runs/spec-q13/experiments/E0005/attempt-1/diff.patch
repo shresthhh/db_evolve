@@ -1,0 +1,134 @@
+diff --git a/src/function/scalar/string/contains.cpp b/src/function/scalar/string/contains.cpp
+index 95c53ff..146a121 100644
+--- a/src/function/scalar/string/contains.cpp
++++ b/src/function/scalar/string/contains.cpp
+@@ -7,6 +7,10 @@
+ #include "duckdb/function/scalar/struct_functions.hpp"
+ #include "duckdb/planner/expression/bound_function_expression.hpp"
+ 
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
+ namespace duckdb {
+ 
+ namespace {
+@@ -73,8 +77,118 @@ struct ContainsOperator {
+ 
+ } // namespace
+ 
++// the SWAR candidate masks assume little-endian byte order
++#if (defined(__GNUC__) || defined(__clang__)) && defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) &&      \
++    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++#define DUCKDB_BLOCK_STRING_SEARCH
++#endif
++
++#ifdef DUCKDB_BLOCK_STRING_SEARCH
++//! Haystacks up to this size use the block-wise first+last byte candidate filter; longer haystacks use memchr,
++//! which is faster when the first needle byte is rare
++static constexpr idx_t BLOCK_SEARCH_MAX_HAYSTACK = 256;
++
++//! Verify a candidate whose first and last byte are known to match the needle
++static inline bool MatchCandidateMiddle(const unsigned char *haystack, const unsigned char *needle, idx_t needle_size) {
++	return needle_size <= 2 || memcmp(haystack + 1, needle + 1, needle_size - 2) == 0;
++}
++
++//! Leftmost-match substring search for needle_size >= 2: compares many candidate positions at once against the
++//! first and last needle byte, and only verifies the surviving candidates
++static idx_t BlockFindStrInStr(const unsigned char *haystack, idx_t haystack_size, const unsigned char *needle,
++                               idx_t needle_size) {
++	D_ASSERT(needle_size >= 2 && haystack_size >= needle_size);
++	const idx_t last_offset = needle_size - 1;
++	const unsigned char first_char = needle[0];
++	const unsigned char last_char = needle[last_offset];
++	// number of candidate start positions
++	const idx_t position_count = haystack_size - last_offset;
++	idx_t i = 0;
++#if defined(__SSE2__)
++	if (position_count >= 16) {
++		const __m128i first_vec = _mm_set1_epi8(static_cast<char>(first_char));
++		const __m128i last_vec = _mm_set1_epi8(static_cast<char>(last_char));
++		// bit k is set iff position (start + k) matches the first and last needle byte
++		auto block_mask = [&](idx_t start) {
++			auto block_first = _mm_loadu_si128(reinterpret_cast<const __m128i *>(haystack + start));
++			auto block_last = _mm_loadu_si128(reinterpret_cast<const __m128i *>(haystack + start + last_offset));
++			auto eq = _mm_and_si128(_mm_cmpeq_epi8(block_first, first_vec), _mm_cmpeq_epi8(block_last, last_vec));
++			return static_cast<uint32_t>(_mm_movemask_epi8(eq));
++		};
++		while (true) {
++			uint32_t mask;
++			if (i + 16 <= position_count) {
++				mask = block_mask(i);
++			} else if (i < position_count) {
++				// final block: overlap with the previous block, dropping the positions already checked
++				mask = block_mask(position_count - 16) >> (i + 16 - position_count);
++			} else {
++				return DConstants::INVALID_INDEX;
++			}
++			while (mask) {
++				idx_t pos = i + static_cast<idx_t>(__builtin_ctz(mask));
++				if (MatchCandidateMiddle(haystack + pos, needle, needle_size)) {
++					return pos;
++				}
++				mask &= mask - 1;
++			}
++			i += 16;
++		}
++	}
++#endif
++	if (position_count >= 8) {
++		const uint64_t ones = 0x0101010101010101ULL;
++		const uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL;
++		const uint64_t first_word = ones * first_char;
++		const uint64_t last_word = ones * last_char;
++		// byte k has its high bit set iff position (start + k) matches the first and last needle byte
++		auto block_mask = [&](idx_t start) {
++			uint64_t x = (Load<uint64_t>(haystack + start) ^ first_word) |
++			             (Load<uint64_t>(haystack + start + last_offset) ^ last_word);
++			// exact zero-byte mask (no false positives)
++			return ~(((x & low7) + low7) | x | low7);
++		};
++		while (true) {
++			uint64_t mask;
++			if (i + 8 <= position_count) {
++				mask = block_mask(i);
++			} else if (i < position_count) {
++				// final block: overlap with the previous block, dropping the positions already checked
++				mask = block_mask(position_count - 8) >> ((i + 8 - position_count) * 8);
++			} else {
++				return DConstants::INVALID_INDEX;
++			}
++			while (mask) {
++				idx_t pos = i + static_cast<idx_t>(__builtin_ctzll(mask)) / 8;
++				if (MatchCandidateMiddle(haystack + pos, needle, needle_size)) {
++					return pos;
++				}
++				mask &= mask - 1;
++			}
++			i += 8;
++		}
++	}
++	// short haystack: scalar loop over the candidate positions
++	for (; i < position_count; i++) {
++		if (haystack[i] == first_char && haystack[i + last_offset] == last_char &&
++		    MatchCandidateMiddle(haystack + i, needle, needle_size)) {
++			return i;
++		}
++	}
++	return DConstants::INVALID_INDEX;
++}
++#endif
++
+ idx_t FindStrInStr(const unsigned char *haystack, idx_t haystack_size, const unsigned char *needle, idx_t needle_size) {
+ 	D_ASSERT(needle_size > 0);
++#ifdef DUCKDB_BLOCK_STRING_SEARCH
++	if (needle_size >= 2 && haystack_size <= BLOCK_SEARCH_MAX_HAYSTACK) {
++		if (needle_size > haystack_size) {
++			return DConstants::INVALID_INDEX;
++		}
++		return BlockFindStrInStr(haystack, haystack_size, needle, needle_size);
++	}
++#endif
+ 	// start off by performing a memchr to find the first character of the
+ 	auto location = memchr(haystack, needle[0], haystack_size);
+ 	if (location == nullptr) {

@@ -1,0 +1,120 @@
+{
+  "templates": [
+    "q01",
+    "q02",
+    "q09",
+    "q13",
+    "q16",
+    "q18",
+    "q19",
+    "q21"
+  ],
+  "k": {
+    "1": {
+      "random": [
+        [
+          "q01",
+          "q02",
+          "q09",
+          "q13",
+          "q16",
+          "q18",
+          "q19",
+          "q21"
+        ]
+      ],
+      "agent": {
+        "groups": [
+          [
+            "q01",
+            "q02",
+            "q09",
+            "q13",
+            "q16",
+            "q18",
+            "q19",
+            "q21"
+          ]
+        ],
+        "rationale": "Only one group is allowed, so all 8 templates go into a single merged engine and there are no separation choices to make. This is what the merging agent should know. Several diffs are cleanly separate: q19 changes optimizer.cpp and column_segment.cpp, q02 changes row-group/data_table storage and plan_select_node, and q16 changes the radix/aggregate hashtable. These are also the largest gains (q19 2.14x, q02 1.97x) or touch code no other diff touches, so they should merge without trouble. The overlaps that need care: (1) src/execution/perfect_aggregate_hashtable.cpp/.hpp is changed by both q01 (4 replica states per group plus a fused int64 sum/avg/count fast path) and q13 (perfect-hash aggregate and plan_aggregate changes). Their address computations and update paths have to be reconciled. (2) physical_hash_join.cpp is changed by q09, q13, q18 and q21, join_hashtable.cpp by q09 and q21, and join_filter_pushdown_optimizer.cpp by q13, q18 and q21 (q21 also adds bloom filters). These join and filter-pushdown heuristics are where conflicts are most likely. When a compromise is needed, the merger should favour q09's (2.07x) and q13's (1.45x) behaviour over q21's (1.21x) and q18's (1.12x). (3) Cardinality and statistics changes in q09 (relation_statistics_helper) and q18 (cardinality_estimator, relation_manager) both feed join ordering and should be checked against each other. I read the summaries and the files each diff touches, not the full patches; with a single group the patch-level conflicts don't change the grouping, only how hard the merge is.",
+        "cost_usd": 0.11353919999999999
+      }
+    },
+    "2": {
+      "random": [
+        [
+          "q01",
+          "q09",
+          "q13",
+          "q19"
+        ],
+        [
+          "q02",
+          "q16",
+          "q18",
+          "q21"
+        ]
+      ],
+      "agent": {
+        "groups": [
+          [
+            "q01",
+            "q02",
+            "q09",
+            "q18",
+            "q19"
+          ],
+          [
+            "q13",
+            "q16",
+            "q21"
+          ]
+        ],
+        "rationale": "Two pairs of diffs really conflict, and the grouping keeps each pair apart.\n\n(1) q09 and q21 both rewrite the same `can_use_bf` line in JoinFilterPushdownInfo::CanUseBloomFilter, and both change how JoinHashTable::Finalize fills the bloom filter. q09 allows multi-key joins and builds the filter from gathered first-key hashes. q21 requires exactly one equality column, allows extra non-equality conditions, and swaps the filter for an exact key bitmap that skips the hashed insert. q09 also adds prefetching throughout join_hashtable.cpp.\n\n(2) q01 and q13 both restructure PerfectAggregateHashTable's AddChunk, Combine and Scan. q01 adds K=4 replicated states, folds them in Scan and adds a fused int64 update path. q13 adds CombineRange, range-based concurrent Scan with caller-owned arenas, and tables up to 2^22 slots. Each rewrites the other's code paths.\n\nGroup 1 (q09, q18, q01, q02, q19): this group protects q09 (2.07x), q19 (2.14x) and q02 (1.97x).\n- q19 changes only optimizer rule order and column_segment filter evaluation. q02 changes only scan morsel sizing and a binder rewrite. Neither overlaps anything else.\n- q01 touches only avg.cpp and the perfect aggregate table. Nobody else in this group touches those.\n- q18 sits with q09 because their hash-join edits go the same way. q18 widens has_cast when there is a storage offset and adds IN/range-set filters. q09 gates the bloom filter to the first condition. These are adjacent but separate lines in FinalizeFilters.\n- Their join-order changes are also separate: q09 lowers LIKE selectivity in relation stats, q18 changes HAVING selectivity and the SEMI denominator. q09 has no semi joins, so q18's SEMI change is harmless to it. q18's query has no LIKE, so q09's change is harmless to it.\n- Keeping q18 away from q21 also matters: q21 is EXISTS/NOT EXISTS-heavy, and q18's new SEMI-join estimate could change its join order.\n\nGroup 2 (q13, q21, q16):\n- q13 and q21 both edit join_filter_pushdown_optimizer.cpp and physical_hash_join.cpp, but in different functions. q13 adds RIGHT joins to compute_aggregates_anyway and adds PrepareScanHT match propagation. q21 sets DELIM_GET build_side_has_filter, adds the bloom bitmap and SetKeyRange. They don't conflict, since perfect hash joins never use the bloom filter.\n- q16 changes only grouped radix-hashtable partitioning, so it fits anywhere.",
+        "cost_usd": 0.35211139999999996
+      }
+    },
+    "4": {
+      "random": [
+        [
+          "q01",
+          "q21"
+        ],
+        [
+          "q02",
+          "q09"
+        ],
+        [
+          "q13",
+          "q16"
+        ],
+        [
+          "q18",
+          "q19"
+        ]
+      ],
+      "agent": {
+        "groups": [
+          [
+            "q01",
+            "q19"
+          ],
+          [
+            "q02",
+            "q21"
+          ],
+          [
+            "q09",
+            "q18"
+          ],
+          [
+            "q13",
+            "q16"
+          ]
+        ],
+        "rationale": "I split the groups along two conflicts I found in the patches. The first is the hash-join bloom-filter rule (CanUseBloomFilter / FinalizeFilters in physical_hash_join.cpp, and JoinHashTable::Finalize). q09 drops the `conditions.size()==1` rule so multi-key joins get a filter built from the hash of key 0 only, and it adds that insertion in Finalize. q21 replaces the same line with `equality_predicate_columns.size()==1`, adds an exact key-bitmap mode that skips the hashed insert, and reads layout column 0 in Finalize. These are two different, overlapping changes to the same condition and the same insertion path, so q09 (2.07x) and q21 (1.21x) go in separate groups. The second conflict is the perfect aggregate hash table. q01 rewrites AddChunk, Combine and Scan to keep 4 copies of each group's state plus a fused int64 fast path. q13 rewrites the same Combine and Scan into CombineRange and striped parallel scans for large tables. So q01 and q13 are also separated.\n\nGroup {q09, q18}: Both change join filter pushdown and join-order estimates in the same direction. q09 lowers the estimate for LIKE filters and extends bloom filters to multi-key joins. q18 adds a HAVING selectivity and a SEMI-join estimate, and lets min/max and IN filters pass through compression projections. Where they touch the same lines in FinalizeFilters, the edits combine cleanly: q18 adds a storage-offset condition to `has_cast` and q09 adds an `is_first_condition` guard. This keeps q09's large gain safe.\n\nGroup {q21, q02}: q21's bloom-filter, bitmap and DELIM_GET pushdown work sits by itself. q02 changes only scan morsel sizes and a binder rewrite in plan_select_node, so nothing overlaps. Keeping q21 away from q13 also matters. q13 widens the perfect hash join (RIGHT joins, key ranges up to 2^22), and CanUseBloomFilter rejects perfect hash tables, so q13 could turn q21's dense-key joins into perfect joins and take away its bloom-filter gain.\n\nGroup {q13, q16}: q13 changes the perfect hash aggregate (larger threshold, parallel combine and source) and the perfect hash join. q16 changes only how the radix-partitioned GroupedAggregateHashTable partitions count(DISTINCT). They are different operators, and plan_aggregate's perfect-HT check already rejects DISTINCT, so q16's path is unaffected.\n\nGroup {q01, q19}: q01 changes avg.cpp and the perfect aggregate hash table, which is kept apart from q13. q19 changes optimizer rule order and dense-mask filter evaluation in column_segment.cpp. The files don't overlap at all, so q19 keeps its 2.14x gain.",
+        "cost_usd": 0.32321300000000003
+      }
+    }
+  }
+}

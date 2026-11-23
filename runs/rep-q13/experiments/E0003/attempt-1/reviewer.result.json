@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "plan_aggregate.cpp: the planner now allows the perfect hash aggregate for keys needing up to 22 bits. It is guarded by min/max stats (as before), a density check (estimated input \u2265 half the slots) and a memory check (slots \u00d7 tuple size \u00d7 (threads+1) \u2264 max_memory/8). These conditions describe a general class of queries, GROUP BY on dense integer keys. No names, literals or dataset facts appear.",
+      "perfect_aggregate_hashtable.cpp: AddChunk still throws if a group falls outside total_groups, so stale or corrupt stats cannot write out of bounds. NULL keys keep their dedicated slot 0. Values up to 22 bits fit in the uint32 used to rebuild the group values.",
+      "physical_perfecthash_aggregate.cpp Combine: each stripe locks a disjoint range of slots. Each thread uses its own arena for combine allocations, and the global table takes that arena over only under the global lock. Serial and striped paths never mix, because the choice depends on table size, which is fixed per operator. No data race found.",
+      "Parallel source: blocks of slots are claimed with an atomic counter and never overlap. Each thread has its own address vector and arena for finalize. The small-table path reports MaxThreads=1, so its unsynchronised global scan_position is only touched by one thread. The output order was already NO_ORDER.",
+      "Minor: the memory check estimates tuple size as 1+8+sum(payload_size), which may differ slightly from the real layout row width (alignment). The per-thread tables are allocated outside the buffer manager, as in the existing perfect hash aggregate. The /8 margin makes this acceptable.",
+      "Costs are not hidden: each thread's table allocation, initialisation and full-range combine all run inside the measured query. Nothing touches timing, settings defaults or tests."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"plan_aggregate.cpp: the planner now allows the perfect hash aggregate for keys needing up to 22 bits. It is guarded by min/max stats (as before), a density check (estimated input \u2265 half the slots) and a memory check (slots \u00d7 tuple size \u00d7 (threads+1) \u2264 max_memory/8). These conditions describe a general class of queries, GROUP BY on dense integer keys. No names, literals or dataset facts appear.\",\"perfect_aggregate_hashtable.cpp: AddChunk still throws if a group falls outside total_groups, so stale or corrupt stats cannot write out of bounds. NULL keys keep their dedicated slot 0. Values up to 22 bits fit in the uint32 used to rebuild the group values.\",\"physical_perfecthash_aggregate.cpp Combine: each stripe locks a disjoint range of slots. Each thread uses its own arena for combine allocations, and the global table takes that arena over only under the global lock. Serial and striped paths never mix, because the choice depends on table size, which is fixed per operator. No data race found.\",\"Parallel source: blocks of slots are claimed with an atomic counter and never overlap. Each thread has its own address vector and arena for finalize. The small-table path reports MaxThreads=1, so its unsynchronised global scan_position is only touched by one thread. The output order was already NO_ORDER.\",\"Minor: the memory check estimates tuple size as 1+8+sum(payload_size), which may differ slightly from the real layout row width (alignment). The per-thread tables are allocated outside the buffer manager, as in the existing perfect hash aggregate. The /8 margin makes this acceptable.\",\"Costs are not hidden: each thread's table allocation, initialisation and full-range combine all run inside the measured query. Nothing touches timing, settings defaults or tests.\"],\"required_changes\":[]}",
+  "cost_usd": 0.260228,
+  "seconds": 42.915570974349976,
+  "error": ""
+}

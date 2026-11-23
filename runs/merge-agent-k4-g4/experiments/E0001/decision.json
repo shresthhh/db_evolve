@@ -1,0 +1,19 @@
+{
+  "accept": true,
+  "reasons": [],
+  "rule": "templates",
+  "train_ratio": 0.7478573023608721,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "improved": [
+    "q13",
+    "q16"
+  ],
+  "regressed": [],
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.6191236056332312,
+    "q16": 0.9033584563819791
+  },
+  "passes": 4
+}

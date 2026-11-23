@@ -1,0 +1,104 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..893f03c 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -516,6 +516,63 @@ optional_idx GroupedAggregateHashTable::TryAddCompressedGroups(DataChunk &groups
+ 	return optional_idx();
+ }
+ 
++//! Detects runs of adjacent rows with identical (fixed-width) group keys
++//! Two rows are considered identical only if, for every column, both are NULL or both are valid with identical bytes
++//! Returns the number of runs (with the first row of every run in "heads" and the run of every row in "run_ids"),
++//! or an invalid index if the keys are not fixed-width or the input is not clustered enough to benefit
++static optional_idx FindGroupRuns(DataChunk &groups, SelectionVector &heads, sel_t run_ids[]) {
++	static constexpr idx_t MAX_GROUP_COLUMNS = 8;
++	const auto count = groups.size();
++	const auto column_count = groups.ColumnCount();
++	if (count < 2 || column_count == 0 || column_count > MAX_GROUP_COLUMNS) {
++		return optional_idx();
++	}
++	UnifiedVectorFormat formats[MAX_GROUP_COLUMNS];
++	idx_t widths[MAX_GROUP_COLUMNS];
++	for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
++		auto &col = groups.data[col_idx];
++		const auto physical_type = col.GetType().InternalType();
++		if (!TypeIsConstantSize(physical_type)) {
++			return optional_idx();
++		}
++		widths[col_idx] = GetTypeIdSize(physical_type);
++		col.ToUnifiedFormat(count, formats[col_idx]);
++	}
++
++	const idx_t max_heads = count / 2;
++	idx_t head_count = 0;
++	heads.set_index(head_count++, 0);
++	run_ids[0] = 0;
++	for (idx_t i = 1; i < count; i++) {
++		bool equal = true;
++		for (idx_t col_idx = 0; col_idx < column_count && equal; col_idx++) {
++			auto &format = formats[col_idx];
++			const auto prev_idx = format.sel->get_index(i - 1);
++			const auto cur_idx = format.sel->get_index(i);
++			if (prev_idx == cur_idx) {
++				continue;
++			}
++			const auto prev_valid = format.validity.RowIsValid(prev_idx);
++			const auto cur_valid = format.validity.RowIsValid(cur_idx);
++			if (prev_valid != cur_valid) {
++				equal = false;
++			} else if (cur_valid) {
++				const auto width = widths[col_idx];
++				equal = memcmp(format.data + prev_idx * width, format.data + cur_idx * width, width) == 0;
++			}
++		}
++		if (!equal) {
++			if (head_count >= max_heads) {
++				// not clustered enough - use the regular path
++				return optional_idx();
++			}
++			heads.set_index(head_count++, i);
++		}
++		run_ids[i] = UnsafeNumericCast<sel_t>(head_count - 1);
++	}
++	return head_count;
++}
++
+ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter) {
+ 	sink_count += groups.size();
+ 
+@@ -524,6 +581,36 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
+ 	if (result.IsValid()) {
+ 		return result.GetIndex();
+ 	}
++
++	// if the input is clustered on the group keys (runs of adjacent identical keys), only look up the first row
++	// of every run in the hash table, and let the remaining rows of the run share its address
++	auto &dict_state = state.dict_state;
++	auto &run_heads = dict_state.unique_entries;
++	sel_t run_ids[STANDARD_VECTOR_SIZE];
++	const auto head_count = FindGroupRuns(groups, run_heads, run_ids);
++	if (head_count.IsValid()) {
++		auto &unique_values = dict_state.unique_values;
++		if (unique_values.ColumnCount() == 0) {
++			unique_values.InitializeEmpty(groups.GetTypes());
++		}
++		unique_values.Slice(groups, run_heads, head_count.GetIndex());
++		auto &hashes = dict_state.hashes;
++		unique_values.Hash(hashes);
++		auto &head_pointers = dict_state.new_dictionary_pointers;
++		const auto new_group_count = FindOrCreateGroups(unique_values, hashes, head_pointers, state.new_groups);
++		if (layout_ptr->GetAggregates().empty()) {
++			return new_group_count;
++		}
++		const auto head_addresses = FlatVector::GetData<uintptr_t>(head_pointers);
++		const auto result_addresses = FlatVector::GetData<uintptr_t>(state.addresses);
++		const auto aggr_offset = layout_ptr->GetAggrOffset();
++		for (idx_t i = 0; i < groups.size(); i++) {
++			result_addresses[i] = head_addresses[run_ids[i]] + aggr_offset;
++		}
++		UpdateAggregates(payload, filter);
++		return new_group_count;
++	}
++
+ 	// otherwise append the raw values
+ 	groups.Hash(state.hashes);

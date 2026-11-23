@@ -1,0 +1,42 @@
+{
+  "id": "E0011",
+  "title": "Deliminator: drop the delim join for SEMI/ANTI subqueries without blocking operators even when the LHS has a selection",
+  "started": "2026-11-17T20:00:24-05:00",
+  "base": "7ba03a07c16a4ebc44e626aa3b31913a7f61a9d6",
+  "candidate": "91c2adb1348c7dfa520cb698e983253075aa86c3",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.35148799999999997,
+  "summary": "I changed one file, src/optimizer/deliminator.cpp. Deliminator::Optimize keeps the deepest join with the DelimGet when the left side has a selection. It now skips that when two things are true: the delim join is SEMI or ANTI, and its right subtree has no blocking or deduplicating operator. The operators checked are aggregate/group-by, window, limit, order-by, top-n, distinct, and a nested delim join. A new file-local static recursive helper, HasBlockingOperator, does that check; no header changed. In those cases the plan falls back to the existing removal path, the one already used when the left side has no selection. EXISTS and NOT EXISTS then become a single hash SEMI/ANTI join.\n\nBench (your build vs current best, two runs):\n- q04: 325.9 \u2192 224.1ms (-31.2%), then 292.7 \u2192 203.7ms (-30.4%).\n- q22: 172.2 \u2192 141.6ms (-17.8%), then 169.9 \u2192 131.9ms (-22.4%).\n- Geomean: -4.6% over all visible templates.\n- The first full run showed q16 at +11.6% and q19 at +9.5%. Neither has a correlated subquery, so this change can't touch their plans. On rerun they came in at -1.7% and +3.2%, so it was noise.\n\nThe q04 profile now shows a single HASH_JOIN RIGHT_SEMI between the filtered orders scan and lineitem, with no RIGHT_DELIM_JOIN, DELIM_SCAN or dedup HASH_GROUP_BY. I checked small hand-built inputs against hand-worked answers, and all were correct:\n- NOT EXISTS with NULL keys on both sides\n- EXISTS and NOT EXISTS with an extra correlated inequality\n- NOT EXISTS with an IS NOT DISTINCT FROM correlation",
+  "notes": "The q04 semi join's condition is still `o_orderkey IS NOT DISTINCT FROM o_orderkey`, inherited from the delim join. The lineitem scan shows no dynamic or bloom filter pushed down from the semi join's build side. A follow-up could turn NOT DISTINCT FROM into plain equality for SEMI joins, which is safe for SEMI because a NULL outer key never matches under EXISTS semantics. It is not safe for ANTI with no IS NOT NULL handling, so be careful there. That could let a join filter or min-max filter prune the large probe-side scan, which still costs about 1.9s of cumulative scan time in q04. I didn't try MARK joins, since the issue scoped them out.",
+  "train_ratio": 0.9581067501416464,
+  "val_ratio": 0.8771004346644363,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9148142374687025,
+    "q03": 1.022159272235592,
+    "q04": 0.7376205630840061,
+    "q05": 1.003806402243952,
+    "q07": 1.0063009788948658,
+    "q08": 1.0061307068593173,
+    "q09": 1.0213052704603343,
+    "q13": 0.979236776316686,
+    "q14": 0.9814702966356597,
+    "q16": 0.988518044914015,
+    "q17": 1.0068387283494644,
+    "q18": 0.9920862514853808,
+    "q19": 1.015419691525289,
+    "q22": 0.7961920926243995
+  },
+  "improved": [
+    "q02",
+    "q04",
+    "q22"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-17T20:18:02-05:00"
+}

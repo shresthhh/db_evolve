@@ -1,0 +1,16 @@
+{
+  "title": "Exact key bitmap mode for join BF on dense integer build keys",
+  "hypothesis": "The lineitem scan carries the l_partkey BF and is the largest operator in q09 (5.28s CPU in the profile, 60M rows in, 3.27M out). The BF is sized for 436K build rows: 12 bits/key, next power of two = 8Mbit = 1MB. Each probe does a Murmur hash plus a random load into 1MB, which mostly misses L2. The build key range from min/max is 12..1999993, about 2M bits = 250KB. An exact bitmap indexed by (key - min) needs no hashing, fits L2 and has no false positives. A sibling run measured -15% on q21 with this mechanism (128 bits/key cap).",
+  "plan": "In BloomFilter (src/planner/filter/bloom_filter.cpp) add an exact mode, SetKeyRange(min, range), used when the build key is integral, range <= 128 * ht count and range <= 2^31. Insert/lookup become bit set/test on (key - min). Out-of-range probes are rejected. The probe side reads the raw key values instead of hashes. In FinalizeFilters (physical_hash_join.cpp ~line 901) the min/max is known, so decide the mode there before the deferred build. JoinHashTable::InsertHashes/Finalize (join_hashtable.cpp) fills the bitmap from layout column 0 instead of hashes. CheckStatistics must handle the mode.",
+  "target_files": [
+    "src/planner/filter/bloom_filter.cpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "expected_gain": "q09: -5..-10%, if the BF probe is a real part of the hot lineitem scan cost (unverified; cold profile).",
+  "generality": "Any join BF whose build keys are dense integers, which is typical for surrogate keys and FKs.",
+  "risk": "Medium. Two code paths in the BF, and must keep hash mode for non-integral keys. The hot gain is uncertain because an earlier decode-side tweak on this scan gave 0% hot.",
+  "status": "open",
+  "filed": "g1r3"
+}

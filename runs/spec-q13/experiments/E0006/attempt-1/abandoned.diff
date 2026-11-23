@@ -1,0 +1,81 @@
+diff --git a/src/include/duckdb/common/types/vector_buffer.hpp b/src/include/duckdb/common/types/vector_buffer.hpp
+index 1b3b92a..9af2823 100644
+--- a/src/include/duckdb/common/types/vector_buffer.hpp
++++ b/src/include/duckdb/common/types/vector_buffer.hpp
+@@ -229,6 +229,13 @@ public:
+ 		references.push_back(std::move(heap));
+ 	}
+ 
++	//! Clear all strings and references so the buffer can be reused (keeps the largest heap block)
++	//! Only safe if no-one else holds a reference to this buffer
++	void ResetForReuse() {
++		heap.GetAllocator().Reset();
++		references.clear();
++	}
++
+ private:
+ 	//! The string heap of this buffer
+ 	StringHeap heap;
+diff --git a/src/include/duckdb/storage/table/scan_state.hpp b/src/include/duckdb/storage/table/scan_state.hpp
+index 32aac49..c7da0d0 100644
+--- a/src/include/duckdb/storage/table/scan_state.hpp
++++ b/src/include/duckdb/storage/table/scan_state.hpp
+@@ -131,6 +131,8 @@ struct ColumnScanState {
+ 	unique_ptr<PushedDownExpressionState> expression_state;
+ 	//! Whether or not updates should be allowed
+ 	UpdateScanType update_scan_type = UpdateScanType::STANDARD;
++	//! String buffer that segment scans can reuse across vectors once no-one else references it
++	buffer_ptr<VectorBuffer> cached_string_buffer;
+ 
+ public:
+ 	void PushDownCast(const LogicalType &original_type, const LogicalType &cast_type);
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index df16e5f..52bfe05 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -641,6 +641,28 @@ void FSSTStorage::EndScan(FSSTScanState &scan_state, bp_delta_offsets_t &offsets
+ 	                          UnsafeNumericCast<int64_t>(start + scan_count - 1));
+ }
+ 
++//! Get the string buffer to decompress into. When the result vector starts out without a string heap, reuse the
++//! heap cached in the column scan state if nothing else references it anymore: this avoids re-growing a fresh
++//! arena (several mallocs of cold memory) for every vector.
++static VectorStringBuffer &GetDecompressStringBuffer(ColumnScanState &state, Vector &result, idx_t result_offset) {
++	if (result_offset == 0 && !result.GetAuxiliary() && result.GetVectorType() == VectorType::FLAT_VECTOR) {
++		auto &cached = state.cached_string_buffer;
++		if (cached && cached.use_count() == 1) {
++			cached->Cast<VectorStringBuffer>().ResetForReuse();
++		} else {
++			auto vector_buffer = result.GetBuffer();
++			auto stored_allocator = vector_buffer ? vector_buffer->GetAllocator() : nullptr;
++			if (stored_allocator) {
++				cached = make_buffer<VectorStringBuffer>(*stored_allocator);
++			} else {
++				cached = make_buffer<VectorStringBuffer>();
++			}
++		}
++		result.SetAuxiliary(cached);
++	}
++	return StringVector::GetStringBuffer(result);
++}
++
+ template <bool ALLOW_FSST_VECTORS>
+ void FSSTStorage::StringScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
+                                     idx_t result_offset) {
+@@ -695,7 +717,7 @@ void FSSTStorage::StringScanPartial(ColumnSegment &segment, ColumnScanState &sta
+ 		}
+ 	} else {
+ 		// Just decompress
+-		auto &str_buffer = StringVector::GetStringBuffer(result);
++		auto &str_buffer = GetDecompressStringBuffer(state, result, result_offset);
+ 		for (idx_t i = 0; i < scan_count; i++) {
+ 			result_data[i + result_offset] = scan_state.DecompressString(dict, baseptr, offsets, i, str_buffer);
+ 		}
+@@ -721,7 +743,7 @@ void FSSTStorage::Select(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 
+ 	D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
+ 
+-	auto &str_buffer = StringVector::GetStringBuffer(result);
++	auto &str_buffer = GetDecompressStringBuffer(state, result, 0);
+ 	auto offsets = StartScan(scan_state, base_data, start, vector_count);
+ 	auto result_data = FlatVector::GetData<string_t>(result);

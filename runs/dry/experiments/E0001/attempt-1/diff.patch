@@ -1,0 +1,9 @@
+diff --git a/src/common/assert.cpp b/src/common/assert.cpp
+index 02f6221..9775012 100644
+--- a/src/common/assert.cpp
++++ b/src/common/assert.cpp
+@@ -14,3 +14,4 @@ void DuckDBAssertInternal(bool condition, const char *condition_name, const char
+ }
+ 
+ } // namespace duckdb
++// db_evolve mock change

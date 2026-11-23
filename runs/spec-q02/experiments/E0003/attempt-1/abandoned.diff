@@ -1,0 +1,158 @@
+diff --git a/src/function/table/table_scan.cpp b/src/function/table/table_scan.cpp
+index 821434a..e322fbc 100644
+--- a/src/function/table/table_scan.cpp
++++ b/src/function/table/table_scan.cpp
+@@ -43,6 +43,17 @@ struct TableScanLocalState : public LocalTableFunctionState {
+ 
+ 	idx_t rows_in_current_row_group = 0;
+ 	idx_t row_groups_scanned = 0;
++
++	//! Buffer used to compact sparse scan results (e.g., of selective filters) within a single morsel.
++	DataChunk compact_buffer;
++	//! A chunk that did not fit into the compact buffer; it is emitted by the next scan call.
++	DataChunk compact_pending;
++	bool emit_pending = false;
++	//! Set if the current morsel was exhausted while compacting, i.e., we can move on to the next morsel.
++	bool morsel_exhausted = false;
++	//! The partition index of the chunk emitted from the compact buffer (the morsel may be exhausted already).
++	bool has_partition_override = false;
++	idx_t partition_override = 0;
+ };
+ 
+ struct IndexScanLocalState : public LocalTableFunctionState {
+@@ -316,20 +327,25 @@ public:
+ 	void TableScanFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) override {
+ 		auto &l_state = data_p.local_state->Cast<TableScanLocalState>();
+ 		l_state.scan_state.options.force_fetch_row = ClientConfig::GetConfig(context).force_fetch_row;
++		l_state.has_partition_override = false;
++
++		if (l_state.emit_pending) {
++			// emit the chunk that did not fit into the compact buffer during the previous call
++			l_state.emit_pending = false;
++			output.Reference(l_state.compact_pending);
++			return;
++		}
+ 
+ 		do {
+ 			if (bind_data.is_create_index) {
+ 				storage.CreateIndexScan(l_state.scan_state, output);
+-			} else if (CanRemoveFilterColumns()) {
+-				l_state.all_columns.Reset();
+-				storage.Scan(tx, l_state.all_columns, l_state.scan_state);
+-				output.ReferenceColumns(l_state.all_columns, projection_ids);
+-			} else {
+-				storage.Scan(tx, output, l_state.scan_state);
+-			}
+-			if (output.size() > 0) {
++				if (output.size() > 0) {
++					return;
++				}
++			} else if (!l_state.morsel_exhausted && ScanCompacted(context, l_state, output)) {
+ 				return;
+ 			}
++			l_state.morsel_exhausted = false;
+ 
+ 			l_state.rows_in_current_row_group = storage.NextParallelScan(context, state, l_state.scan_state);
+ 			if (l_state.rows_in_current_row_group > 0) {
+@@ -356,6 +372,83 @@ public:
+ 		} while (true);
+ 	}
+ 
++	void ScanChunk(TableScanLocalState &l_state, DataChunk &output) {
++		if (CanRemoveFilterColumns()) {
++			l_state.all_columns.Reset();
++			storage.Scan(tx, l_state.all_columns, l_state.scan_state);
++			output.ReferenceColumns(l_state.all_columns, projection_ids);
++		} else {
++			storage.Scan(tx, output, l_state.scan_state);
++		}
++	}
++
++	//! Scans the next chunk of the current morsel into output. Sparse chunks (e.g., produced by selective filters)
++	//! are compacted into fuller chunks, without ever crossing the morsel boundary (to preserve batch indexes).
++	//! Returns false if the morsel is exhausted and no rows were produced.
++	bool ScanCompacted(ClientContext &context, TableScanLocalState &l_state, DataChunk &output) {
++		static constexpr idx_t SPARSE_CHUNK_THRESHOLD = STANDARD_VECTOR_SIZE / 8;
++		static constexpr idx_t COMPACT_TARGET = STANDARD_VECTOR_SIZE / 2;
++		auto &buffer = l_state.compact_buffer;
++		idx_t buffered = 0;
++		while (true) {
++			ScanChunk(l_state, output);
++			const idx_t count = output.size();
++			if (count == 0) {
++				if (buffered == 0) {
++					return false;
++				}
++				// the morsel is exhausted: emit what we have buffered
++				l_state.morsel_exhausted = true;
++				break;
++			}
++			if (buffered == 0) {
++				if (count >= SPARSE_CHUNK_THRESHOLD) {
++					// fast path: the chunk is full enough
++					return true;
++				}
++				// start compacting
++				if (buffer.ColumnCount() == 0) {
++					buffer.Initialize(context, output.GetTypes());
++				} else {
++					buffer.Reset();
++				}
++				l_state.partition_override = GetPartitionIndex(l_state);
++			}
++			if (buffered + count > STANDARD_VECTOR_SIZE) {
++				// does not fit: stash the chunk and emit it during the next call
++				auto &pending = l_state.compact_pending;
++				if (pending.ColumnCount() == 0) {
++					pending.Initialize(context, output.GetTypes());
++				} else {
++					pending.Reset();
++				}
++				pending.Append(output);
++				l_state.emit_pending = true;
++				break;
++			}
++			buffer.Append(output);
++			buffered = buffer.size();
++			output.Reset();
++			if (buffered >= COMPACT_TARGET) {
++				break;
++			}
++		}
++		D_ASSERT(buffered > 0);
++		output.Reference(buffer);
++		l_state.has_partition_override = true;
++		return true;
++	}
++
++	idx_t GetPartitionIndex(TableScanLocalState &l_state) {
++		if (l_state.scan_state.table_state.row_group) {
++			return l_state.scan_state.table_state.batch_index;
++		}
++		if (l_state.scan_state.local_state.row_group) {
++			return l_state.scan_state.table_state.batch_index + l_state.scan_state.local_state.batch_index;
++		}
++		return 0;
++	}
++
+ 	double TableScanProgress(ClientContext &context, const FunctionData *bind_data_p) const override {
+ 		// The table is empty or smaller than the standard vector size.
+ 		if (total_rows == 0) {
+@@ -376,14 +469,10 @@ public:
+ 	OperatorPartitionData TableScanGetPartitionData(ClientContext &context,
+ 	                                                TableFunctionGetPartitionInput &input) override {
+ 		auto &l_state = input.local_state->Cast<TableScanLocalState>();
+-		if (l_state.scan_state.table_state.row_group) {
+-			return OperatorPartitionData(l_state.scan_state.table_state.batch_index);
+-		}
+-		if (l_state.scan_state.local_state.row_group) {
+-			return OperatorPartitionData(l_state.scan_state.table_state.batch_index +
+-			                             l_state.scan_state.local_state.batch_index);
++		if (l_state.has_partition_override) {
++			return OperatorPartitionData(l_state.partition_override);
+ 		}
+-		return OperatorPartitionData(0);
++		return OperatorPartitionData(GetPartitionIndex(l_state));
+ 	}
+ 
+ 	idx_t TableScanRowsScanned(LocalTableFunctionState &state) override {

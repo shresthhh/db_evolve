@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/join_hashtable.cpp InsertHashes: for joins with more than one condition, the bloom filter now gets VectorOperations::Hash of layout column 0, gathered from the chunk's row locations. Layout column 0 is condition_types[0], which is conditions[0] (see the JoinHashTable constructor), so the build side hashes the same column and type that PushBloomFilter uses on the probe side (ht.conditions[0]). The has_cast guard keeps the probe storage type equal to the condition type, so the hashes line up.",
+      "If the join has one equality plus non-equality conditions, the row hash already equals the key-0 hash. The new branch then gathers and hashes that column a second time. This is redundant work but still correct.",
+      "The bloom filter on key 0 accepts every row the full multi-key match would accept, so it never drops a valid row. NULL keys on the build side only add false positives. Condition 0 is required to be COMPARE_EQUAL, so probe rows with NULL in key 0 could never match anyway. The existing guards for join type, perfect HT, external join and cast all stay in place.",
+      "physical_hash_join.cpp: only the filter for join condition 0 is offered the bloom filter, and condition 0 must be a plain equality. Every condition here is about the shape of the query, not names, literals or data. Any composite-key equi-join with a filtered build side benefits, and SelectivityOptionalFilter turns the filter off when it doesn't help.",
+      "Thread safety: the key and hash vectors are local to each Finalize call, so parallel finalize is fine. Rows are kept pinned, so the gathered strings point to valid memory."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "title": "Run JoinDependentFilterRule before DistributivityRule",
+  "hypothesis": "q19 shape: WHERE (j AND a1 AND b1) OR (j AND a2 AND b2) OR (j AND a3 AND b3) with a* on table A, b* on table B, j the join equality. JoinDependentFilterRule (src/optimizer/rule/join_dependent_filter.cpp) is meant to derive (a1 OR a2 OR a3) AND (b1 OR b2 OR b3) and let filter pushdown push them to each scan, but it only fires when the ROOT expression is a CONJUNCTION_OR (Apply line 56-65, is_root only true on the top-level call in ExpressionRewriter::VisitExpression). DistributivityRule is registered earlier (optimizer.cpp:52 vs :69) and fires first, rewriting the root into AND(j, OR(...)); after that the OR is never root, so no derived filters. Evidence: EXPLAIN shows no filter on part scan; join builds 2M part rows and emits 2.14M rows (HASH_JOIN 0.87s, FILTER 0.39s, decompress PROJECTION 0.09s). Manually adding the derived filters to the SQL: join output drops to 2,672 rows, join 0.01s, filter 0.00s, total 0.783s -> 0.644s (~18%), same result 41150783.5184.",
+  "plan": "In src/optimizer/optimizer.cpp Optimizer::Optimizer rule registration, move `rewriter.rules.push_back(make_uniq<JoinDependentFilterRule>(rewriter));` (line 69) to before DistributivityRule (line 52). Then the root OR is seen first: rule returns AND(original OR, derived), ApplyRules reruns (non-root) so Distributivity still factors j out of the inner OR; on the next fixpoint iteration root is AND so JoinDependent returns nullptr (no loop). Verify with EXPLAIN that the part scan gets an OR filter and lineitem gets an l_quantity OR filter (and the common shipmode/shipinstruct still pushed). If reordering causes trouble (e.g. other rules interfering, plan regressions), fallback: extend JoinDependentFilterRule::Apply to accept a root CONJUNCTION_AND, run the derivation on each CONJUNCTION_OR child, and append only derived conjuncts not already Equals() to an existing AND child (to guarantee fixpoint termination). Run the optimizer sql tests (test/optimizer/*join_dependent* if present) for results.",
+  "target_files": [
+    "src/optimizer/optimizer.cpp",
+    "src/optimizer/rule/join_dependent_filter.cpp"
+  ],
+  "expected_gain": "q19 ~15-20% (join/filter/decompress phases nearly vanish; scan remains)",
+  "generality": "Any join query whose WHERE is a disjunction of per-branch conjunctions that each repeat the join key equality plus single-table predicates (common hand-written/ORM 'OR of cases' filters, TPC-H Q19, TPC-DS q13/q48-like shapes). Derived filters are implied by the original (sound), original predicate kept. Possible slowdown: extra redundant filter evaluation when derived filters are unselective (small cost).",
+  "risk": "Low. Pure optimizer rule order; derived predicates are logically implied. Watch for volatile expressions (rule already skips) and for changed plan shapes in other tests.",
+  "status": "open",
+  "filed": "g1r1"
+}

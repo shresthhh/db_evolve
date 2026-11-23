@@ -1,0 +1,3118 @@
+diff --git a/extension/core_functions/aggregate/algebraic/avg.cpp b/extension/core_functions/aggregate/algebraic/avg.cpp
+index 6e55010..af838ff 100644
+--- a/extension/core_functions/aggregate/algebraic/avg.cpp
++++ b/extension/core_functions/aggregate/algebraic/avg.cpp
+@@ -5,6 +5,8 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/function/function_set.hpp"
+ #include "duckdb/planner/expression.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -123,6 +125,20 @@ struct IntegerAverageOperationHugeint : public BaseSumOperation<AverageSetOperat
+ 	}
+ };
+ 
++// average over an int64 state - only used when statistics prove that the sum cannot overflow
++// the finalize goes through hugeint_t so the result is identical to IntegerAverageOperationHugeint
++struct IntegerAverageOperationInt64 : public BaseSumOperation<AverageSetOperation, RegularAdd> {
++	template <class T, class STATE>
++	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
++		if (state.count == 0) {
++			finalize_data.ReturnNull();
++		} else {
++			long double divident = GetAverageDivident<long double>(state.count, finalize_data.input.bind_data);
++			target = Hugeint::Cast<long double>(hugeint_t(state.value)) / divident;
++		}
++	}
++};
++
+ struct DiscreteAverageOperation : public BaseSumOperation<AverageSetOperation, AddToHugeint> {
+ 	template <class T, class STATE>
+ 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+@@ -239,19 +255,78 @@ struct TimeTZAverageOperation : public BaseSumOperation<AverageSetOperation, Add
+ 	}
+ };
+ 
+-AggregateFunction GetAverageAggregate(PhysicalType type) {
++unique_ptr<BaseStatistics> AvgPropagateStats(ClientContext &context, BoundAggregateExpression &expr,
++                                             AggregateStatisticsInput &input) {
++	if (!input.node_stats || !input.node_stats->has_max_cardinality) {
++		return nullptr;
++	}
++	auto &numeric_stats = input.child_stats[0];
++	if (!NumericStats::HasMinMax(numeric_stats)) {
++		return nullptr;
++	}
++	auto internal_type = numeric_stats.GetType().InternalType();
++	hugeint_t max_negative;
++	hugeint_t max_positive;
++	switch (internal_type) {
++	case PhysicalType::INT32:
++		max_negative = NumericStats::Min(numeric_stats).GetValueUnsafe<int32_t>();
++		max_positive = NumericStats::Max(numeric_stats).GetValueUnsafe<int32_t>();
++		break;
++	case PhysicalType::INT64:
++		max_negative = NumericStats::Min(numeric_stats).GetValueUnsafe<int64_t>();
++		max_positive = NumericStats::Max(numeric_stats).GetValueUnsafe<int64_t>();
++		break;
++	default:
++		return nullptr;
++	}
++	auto max_sum_negative = max_negative * Hugeint::Convert(input.node_stats->max_cardinality);
++	auto max_sum_positive = max_positive * Hugeint::Convert(input.node_stats->max_cardinality);
++	if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ||
++	    max_sum_negative <= NumericLimits<int64_t>::Minimum()) {
++		// sum can potentially exceed int64_t bounds: keep the hugeint state
++		return nullptr;
++	}
++	// the total sum is guaranteed to fit in an int64: swap in the int64 state, keeping everything else
++	// (name, arguments, return type, bind callback, bind data) of the bound function
++	auto int64_function =
++	    internal_type == PhysicalType::INT32
++	        ? AggregateFunction::UnaryAggregate<AvgState<int64_t>, int32_t, double, IntegerAverageOperationInt64>(
++	              LogicalType::INTEGER, LogicalType::DOUBLE)
++	        : AggregateFunction::UnaryAggregate<AvgState<int64_t>, int64_t, double, IntegerAverageOperationInt64>(
++	              LogicalType::BIGINT, LogicalType::DOUBLE);
++	auto &function = expr.function;
++	function.SetStateSizeCallback(int64_function.GetStateSizeCallback());
++	function.SetStateInitCallback(int64_function.GetStateInitCallback());
++	function.SetStateUpdateCallback(int64_function.GetStateUpdateCallback());
++	function.SetStateSimpleUpdateCallback(int64_function.GetStateSimpleUpdateCallback());
++	function.SetStateCombineCallback(int64_function.GetStateCombineCallback());
++	function.SetStateFinalizeCallback(int64_function.GetStateFinalizeCallback());
++	function.SetStateDestructorCallback(int64_function.GetStateDestructorCallback());
++	function.SetWindowCallback(int64_function.GetWindowCallback());
++	function.SetWindowInitCallback(int64_function.GetWindowInitCallback());
++	function.SetStatisticsCallback(nullptr);
++	return nullptr;
++}
++
++AggregateFunction GetAverageAggregateInternal(PhysicalType type) {
+ 	switch (type) {
+ 	case PhysicalType::INT16: {
+ 		return AggregateFunction::UnaryAggregate<AvgState<int64_t>, int16_t, double, IntegerAverageOperation>(
+ 		    LogicalType::SMALLINT, LogicalType::DOUBLE);
+ 	}
+ 	case PhysicalType::INT32: {
+-		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int32_t, double, IntegerAverageOperationHugeint>(
+-		    LogicalType::INTEGER, LogicalType::DOUBLE);
++		auto function =
++		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int32_t, double, IntegerAverageOperationHugeint>(
++		        LogicalType::INTEGER, LogicalType::DOUBLE);
++		function.SetStatisticsCallback(AvgPropagateStats);
++		return function;
+ 	}
+ 	case PhysicalType::INT64: {
+-		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, double, IntegerAverageOperationHugeint>(
+-		    LogicalType::BIGINT, LogicalType::DOUBLE);
++		auto function =
++		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, double, IntegerAverageOperationHugeint>(
++		        LogicalType::BIGINT, LogicalType::DOUBLE);
++		function.SetStatisticsCallback(AvgPropagateStats);
++		return function;
+ 	}
+ 	case PhysicalType::INT128: {
+ 		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, hugeint_t, double, HugeintAverageOperation>(
+@@ -266,6 +341,13 @@ AggregateFunction GetAverageAggregate(PhysicalType type) {
+ 	}
+ }
+ 
++AggregateFunction GetAverageAggregate(PhysicalType type) {
++	auto function = GetAverageAggregateInternal(type);
++	// these averages accumulate exact integer states, so the result does not depend on the input order
++	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
++	return function;
++}
++
+ unique_ptr<FunctionData> BindDecimalAvg(ClientContext &context, AggregateFunction &function,
+                                         vector<unique_ptr<Expression>> &arguments) {
+ 	auto decimal_type = arguments[0]->return_type;
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..ad9500b 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -278,6 +278,40 @@ idx_t GroupedAggregateHashTable::GetHLLUpperBound() const {
+ 	return LossyNumericCast<idx_t>((1 + HyperLogLog::GetErrorRate()) * static_cast<double>(hll.Count()));
+ }
+ 
++void GroupedAggregateHashTable::SetPartitionKeyCount(idx_t count_p) {
++	D_ASSERT(Count() == 0);
++	// Only useful if the partition key is a strict prefix of the group columns
++	partition_key_count = count_p < layout_ptr->ColumnCount() - 1 ? count_p : 0;
++}
++
++void GroupedAggregateHashTable::HashGroups(DataChunk &groups, Vector &hashes) {
++	groups.Hash(hashes);
++	if (partition_key_count == 0) {
++		return;
++	}
++	D_ASSERT(partition_key_count < groups.ColumnCount());
++	if (!partition_key_hashes) {
++		partition_key_hashes = make_uniq<Vector>(LogicalType::HASH);
++	}
++	auto &key_hashes = *partition_key_hashes;
++	const auto count = groups.size();
++	// Same hash function (and column order) as DataChunk::Hash on the key columns
++	VectorOperations::Hash(groups.data[0], key_hashes, count);
++	for (idx_t col_idx = 1; col_idx < partition_key_count; col_idx++) {
++		VectorOperations::CombineHash(key_hashes, groups.data[col_idx], count);
++	}
++	hashes.Flatten(count);
++	key_hashes.Flatten(count);
++	// Splice the radix bits of the key hash into the full hash, so that all rows of a key end up in the same
++	// partition. Salt and pointer table bits keep coming from the full hash.
++	static constexpr hash_t RADIX_MASK = RadixPartitioning::Mask(RadixPartitioning::MAX_RADIX_BITS);
++	auto hash_data = FlatVector::GetData<hash_t>(hashes);
++	const auto key_hash_data = FlatVector::GetData<hash_t>(key_hashes);
++	for (idx_t i = 0; i < count; i++) {
++		hash_data[i] = (hash_data[i] & ~RADIX_MASK) | (key_hash_data[i] & RADIX_MASK);
++	}
++}
++
+ void GroupedAggregateHashTable::Resize(idx_t size) {
+ 	D_ASSERT(size >= STANDARD_VECTOR_SIZE);
+ 	D_ASSERT(IsPowerOfTwo(size));
+@@ -520,12 +554,14 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
+ 	sink_count += groups.size();
+ 
+ 	// check if we can use an optimized path that utilizes compressed vectors
+-	auto result = TryAddCompressedGroups(groups, payload, filter);
+-	if (result.IsValid()) {
+-		return result.GetIndex();
++	if (partition_key_count == 0) {
++		auto result = TryAddCompressedGroups(groups, payload, filter);
++		if (result.IsValid()) {
++			return result.GetIndex();
++		}
+ 	}
+ 	// otherwise append the raw values
+-	groups.Hash(state.hashes);
++	HashGroups(groups, state.hashes);
+ 
+ 	return AddChunk(groups, state.hashes, payload, filter);
+ }
+@@ -827,7 +863,7 @@ void GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &ad
+ 
+ idx_t GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &addresses_out,
+                                                     SelectionVector &new_groups_out) {
+-	groups.Hash(state.hashes);
++	HashGroups(groups, state.hashes);
+ 	return FindOrCreateGroups(groups, state.hashes, addresses_out, new_groups_out);
+ }
+ 
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..71222b6 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -184,7 +184,28 @@ static void AddPointerToCompare(JoinHashTable::ProbeState &state, const ht_entry
+ 	keys_to_compare_count += 1;
+ }
+ 
+-template <bool USE_SALTS, bool HAS_SEL>
++static inline void PrefetchRead(const void *p) {
++#if defined(__GNUC__) || defined(__clang__)
++	__builtin_prefetch(p, 0, 3);
++#endif
++}
++
++static inline void PrefetchWrite(const void *p) {
++#if defined(__GNUC__) || defined(__clang__)
++	__builtin_prefetch(p, 1, 3);
++#endif
++}
++
++//! How many iterations ahead to prefetch hash table entries
++static constexpr idx_t HT_PREFETCH_DISTANCE = 16;
++//! Only prefetch if the pointer table is larger than this (smaller tables are likely cache-resident)
++static constexpr idx_t HT_PREFETCH_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL;
++
++static inline bool ShouldPrefetch(const JoinHashTable &ht) {
++	return ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES;
++}
++
++template <bool USE_SALTS, bool HAS_SEL, bool PREFETCH>
+ static idx_t ProbeForPointersInternal(JoinHashTable::ProbeState &state, JoinHashTable &ht, ht_entry_t *entries,
+                                       Vector &pointers_result_v, const SelectionVector *row_sel, idx_t &count) {
+ 	auto hashes_dense = FlatVector::GetData<hash_t>(state.hashes_dense_v);
+@@ -192,6 +213,9 @@ static idx_t ProbeForPointersInternal(JoinHashTable::ProbeState &state, JoinHash
+ 	idx_t keys_to_compare_count = 0;
+ 
+ 	for (idx_t i = 0; i < count; i++) {
++		if (PREFETCH && i + HT_PREFETCH_DISTANCE < count) {
++			PrefetchRead(entries + (hashes_dense[i + HT_PREFETCH_DISTANCE] & ht.bitmask));
++		}
+ 		auto row_hash = hashes_dense[i]; // hashes have been flattened before -> always access dense
+ 		auto row_ht_offset = row_hash & ht.bitmask;
+ 
+@@ -242,10 +266,19 @@ template <bool USE_SALTS>
+ static idx_t ProbeForPointers(JoinHashTable::ProbeState &state, JoinHashTable &ht, ht_entry_t *entries,
+                               Vector &pointers_result_v, const SelectionVector *row_sel, idx_t count,
+                               const bool has_row_sel) {
++	if (ShouldPrefetch(ht)) {
++		if (has_row_sel) {
++			return ProbeForPointersInternal<USE_SALTS, true, true>(state, ht, entries, pointers_result_v, row_sel,
++			                                                       count);
++		} else {
++			return ProbeForPointersInternal<USE_SALTS, false, true>(state, ht, entries, pointers_result_v, row_sel,
++			                                                        count);
++		}
++	}
+ 	if (has_row_sel) {
+-		return ProbeForPointersInternal<USE_SALTS, true>(state, ht, entries, pointers_result_v, row_sel, count);
++		return ProbeForPointersInternal<USE_SALTS, true, false>(state, ht, entries, pointers_result_v, row_sel, count);
+ 	} else {
+-		return ProbeForPointersInternal<USE_SALTS, false>(state, ht, entries, pointers_result_v, row_sel, count);
++		return ProbeForPointersInternal<USE_SALTS, false, false>(state, ht, entries, pointers_result_v, row_sel, count);
+ 	}
+ }
+ 
+@@ -278,6 +311,7 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 
+ 	idx_t keys_no_match_count;
+ 	idx_t elements_to_probe_count = count;
++	const bool prefetch = ShouldPrefetch(ht);
+ 
+ 	do {
+ 		const idx_t keys_to_compare_count = ProbeForPointers<USE_SALTS>(state, ht, entries, pointers_result_v, row_sel,
+@@ -288,6 +322,14 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 			break;
+ 		}
+ 
++		if (prefetch) {
++			// the build-side rows are likely not cache-resident: prefetch them before comparing the keys
++			const auto pointers = FlatVector::GetData<data_ptr_t>(pointers_result_v);
++			for (idx_t i = 0; i < keys_to_compare_count; i++) {
++				PrefetchRead(pointers[state.keys_to_compare_sel.get_index(i)]);
++			}
++		}
++
+ 		// Perform row comparisons, after Match function call salt_match_sel will point to the keys that match
+ 		keys_no_match_count = 0;
+ 		const idx_t keys_match_count =
+@@ -643,11 +685,16 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 
+ 	// use the ht bitmask to make the modulo operation faster but keep the salt bits intact
+ 	idx_t capacity_mask = ht.bitmask | ht_entry_t::SALT_MASK;
++	const bool prefetch = ShouldPrefetch(ht);
+ 	while (remaining_count > 0) {
+ 		idx_t salt_match_count = 0;
+ 
+ 		// iterate over each entry to find out whether it belongs to an existing list or will start a new list
+ 		for (idx_t i = 0; i < remaining_count; i++) {
++			if (prefetch && i + HT_PREFETCH_DISTANCE < remaining_count) {
++				const auto ahead_offset = ht_offsets[remaining_sel->get_index(i + HT_PREFETCH_DISTANCE)] & ht.bitmask;
++				PrefetchWrite(entries + ahead_offset);
++			}
+ 			const idx_t row_index = remaining_sel->get_index(i);
+ 			auto &ht_offset = ht_offsets[row_index];
+ 			auto &salt = hash_salts[row_index];
+@@ -716,8 +763,9 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 
+ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataChunkState &chunk_state,
+                                  InsertState &insert_state, bool parallel) {
+-	// Insert Hashes into the BF
+-	if (bloom_filter.IsInitialized()) {
++	// Insert Hashes into the BF (the row hash covers the equality keys only, so it equals the hash of the key if
++	// there is a single equality key; otherwise, or for an exact BF, Finalize inserts the first key instead)
++	if (bloom_filter.IsInitialized() && !bloom_filter.IsExact() && equality_types.size() == 1) {
+ 		bloom_filter.InsertHashes(hashes_v, count);
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+@@ -772,6 +820,47 @@ void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx
+ 	std::fill_n(entries + entry_idx_from, entry_idx_to - entry_idx_from, ht_entry_t());
+ }
+ 
++template <class T>
++static void InsertExactBloomFilterKeys(const BloomFilter &bf, const data_ptr_t *row_locations, const idx_t count,
++                                       const idx_t key_offset, const idx_t column_count) {
++	// the bloom filter key is the first column of the layout
++	idx_t entry_idx;
++	idx_t idx_in_entry;
++	ValidityBytes::GetEntryIndex(0, entry_idx, idx_in_entry);
++	for (idx_t i = 0; i < count; i++) {
++		const auto row = row_locations[i];
++		if (!ValidityBytes::RowIsValid(ValidityBytes(row, column_count).GetValidityEntryUnsafe(entry_idx),
++		                               idx_in_entry)) {
++			continue;
++		}
++		bf.InsertKey(static_cast<int64_t>(Load<T>(row + key_offset)));
++	}
++}
++
++static void InsertExactBloomFilter(const BloomFilter &bloom_filter, const TupleDataLayout &layout,
++                                   const data_ptr_t *row_locations, const idx_t count) {
++	const auto key_offset = layout.GetOffsets()[0];
++	const auto column_count = layout.ColumnCount();
++	switch (bloom_filter.ExactKeyType()) {
++	case PhysicalType::INT8:
++		return InsertExactBloomFilterKeys<int8_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT16:
++		return InsertExactBloomFilterKeys<int16_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT32:
++		return InsertExactBloomFilterKeys<int32_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::INT64:
++		return InsertExactBloomFilterKeys<int64_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT8:
++		return InsertExactBloomFilterKeys<uint8_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT16:
++		return InsertExactBloomFilterKeys<uint16_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	case PhysicalType::UINT32:
++		return InsertExactBloomFilterKeys<uint32_t>(bloom_filter, row_locations, count, key_offset, column_count);
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
+ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel) {
+ 	// Pointer table should be allocated
+ 	D_ASSERT(hash_map.get());
+@@ -783,6 +872,13 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 	                                chunk_idx_to, false);
+ 	const auto row_locations = iterator.GetRowLocations();
+ 
++	// for multi-key joins, the stored row hash combines all keys, but the pushed-down bloom filter is probed with
++	// the hash of the first key only, so we gather and hash the first key column separately
++	// an exact bloom filter (key bitmap) is filled with the first key values instead of hashes
++	const bool exact_bloom_filter = bloom_filter.IsInitialized() && bloom_filter.IsExact();
++	const bool bf_on_first_key = bloom_filter.IsInitialized() && !exact_bloom_filter && equality_types.size() > 1;
++	Vector first_key_hashes_v(LogicalType::HASH);
++
+ 	InsertState insert_state(*this);
+ 	do {
+ 		const auto count = iterator.GetCurrentChunkCount();
+@@ -791,6 +887,16 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+ 
++		if (exact_bloom_filter) {
++			InsertExactBloomFilter(bloom_filter, *layout_ptr, row_locations, count);
++		} else if (bf_on_first_key) {
++			const auto &incr_sel = *FlatVector::IncrementalSelectionVector();
++			Vector first_key_v(condition_types[0]);
++			data_collection->Gather(chunk_state.row_locations, incr_sel, count, 0, first_key_v, incr_sel, nullptr);
++			VectorOperations::Hash(first_key_v, first_key_hashes_v, count);
++			bloom_filter.InsertHashes(first_key_hashes_v, count);
++		}
++
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+ 	} while (iterator.Next());
+ }
+@@ -953,6 +1059,8 @@ void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_
+ 		auto idx = sel.get_index(i);
+ 		ptrs[idx] = LoadPointer(ptrs[idx] + ht.pointer_offset);
+ 		if (ptrs[idx]) {
++			// the next row in the chain will be compared soon: start fetching it
++			PrefetchRead(ptrs[idx]);
+ 			this->sel_vector.set_index(new_count++, idx);
+ 		}
+ 	}
+diff --git a/src/execution/operator/aggregate/physical_hash_aggregate.cpp b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+index 4eda5cb..4620e9f 100644
+--- a/src/execution/operator/aggregate/physical_hash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+@@ -185,6 +185,24 @@ PhysicalHashAggregate::PhysicalHashAggregate(PhysicalPlan &physical_plan, Client
+ 		groupings.emplace_back(grouping_sets[i], grouped_aggregate_data, distinct_collection_info, group_validity,
+ 		                       distinct_validity);
+ 	}
++
++	// With many groups, partition the distinct HTs on the hash of the group columns only (which are the first
++	// columns of the distinct HTs). Every distinct partition then holds complete groups, so re-aggregating the
++	// distinct tuples into the main HT sees far fewer groups per task. With few groups, this would skew partitions.
++	static constexpr idx_t DISTINCT_PARTITION_ON_GROUPS_MIN_CARDINALITY = 4096;
++	if (estimated_cardinality >= DISTINCT_PARTITION_ON_GROUPS_MIN_CARDINALITY) {
++		for (idx_t i = 0; i < groupings.size(); i++) {
++			auto &distinct_data = groupings[i].distinct_data;
++			if (!distinct_data || grouping_sets[i].empty()) {
++				continue;
++			}
++			for (auto &radix_table : distinct_data->radix_tables) {
++				if (radix_table) {
++					radix_table->partition_key_count = grouping_sets[i].size();
++				}
++			}
++		}
++	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+index 7a08b43..04d4c39 100644
+--- a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+@@ -80,16 +80,42 @@ unique_ptr<PerfectAggregateHashTable> PhysicalPerfectHashAggregate::CreateHT(All
+ //===--------------------------------------------------------------------===//
+ // Sink
+ //===--------------------------------------------------------------------===//
++//! Tables with at least this many groups are combined and scanned in parallel
++static constexpr idx_t PERFECT_HT_PARALLEL_MIN_GROUPS = idx_t(1) << 16;
++//! The maximum number of stripes a large table is split into during the combine
++static constexpr idx_t PERFECT_HT_COMBINE_STRIPES = 64;
++//! The number of slots scanned by a source task of a large table
++static constexpr idx_t PERFECT_HT_SCAN_BLOCK_SIZE = STANDARD_VECTOR_SIZE * 8;
++
+ class PerfectHashAggregateGlobalState : public GlobalSinkState {
+ public:
+ 	PerfectHashAggregateGlobalState(const PhysicalPerfectHashAggregate &op, ClientContext &context)
+-	    : ht(op.CreateHT(Allocator::Get(context), context)) {
++	    : ht(op.CreateHT(Allocator::Get(context), context)), combine_start(0) {
++		total_groups = ht->TotalGroups();
++		parallel = total_groups >= PERFECT_HT_PARALLEL_MIN_GROUPS;
++		// stripes are a multiple of the vector size and together cover all slots
++		stripe_size = AlignValue<idx_t, STANDARD_VECTOR_SIZE>(
++		    (total_groups + PERFECT_HT_COMBINE_STRIPES - 1) / PERFECT_HT_COMBINE_STRIPES);
++		stripe_count = (total_groups + stripe_size - 1) / stripe_size;
++		D_ASSERT(stripe_count <= PERFECT_HT_COMBINE_STRIPES);
+ 	}
+ 
+ 	//! The lock for updating the global aggregate state
+ 	mutex lock;
+ 	//! The global aggregate hash table
+ 	unique_ptr<PerfectAggregateHashTable> ht;
++
++	//! Total number of slots in the hash table
++	idx_t total_groups;
++	//! Whether the table is large enough to be combined/scanned in parallel
++	bool parallel;
++	//! Stripe layout for the parallel combine
++	idx_t stripe_size;
++	idx_t stripe_count;
++	//! Per-stripe locks for the parallel combine
++	mutex stripe_locks[PERFECT_HT_COMBINE_STRIPES];
++	//! Used to spread the starting stripe of combining threads
++	atomic<idx_t> combine_start;
+ };
+ 
+ class PerfectHashAggregateLocalState : public LocalSinkState {
+@@ -166,9 +192,27 @@ SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &co
+ 	auto &lstate = input.local_state.Cast<PerfectHashAggregateLocalState>();
+ 	auto &gstate = input.global_state.Cast<PerfectHashAggregateGlobalState>();
+ 
+-	lock_guard<mutex> l(gstate.lock);
+-	gstate.ht->Combine(*lstate.ht);
++	if (!gstate.parallel) {
++		lock_guard<mutex> l(gstate.lock);
++		gstate.ht->Combine(*lstate.ht);
++		return SinkCombineResultType::FINISHED;
++	}
++
++	// large table: combine stripe-by-stripe, so that multiple threads can combine into different stripes concurrently
++	// every thread uses its own arena allocator for allocations made by the combine
++	auto combine_allocator = make_uniq<ArenaAllocator>(Allocator::Get(context.client));
++	const auto start = gstate.combine_start++ % gstate.stripe_count;
++	for (idx_t i = 0; i < gstate.stripe_count; i++) {
++		const auto stripe = (start + i) % gstate.stripe_count;
++		const auto begin = stripe * gstate.stripe_size;
++		const auto end = MinValue<idx_t>(begin + gstate.stripe_size, gstate.total_groups);
++		lock_guard<mutex> l(gstate.stripe_locks[stripe]);
++		gstate.ht->CombineRange(*lstate.ht, begin, end, *combine_allocator);
++	}
+ 
++	lock_guard<mutex> l(gstate.lock);
++	gstate.ht->StoreAllocator(std::move(combine_allocator));
++	gstate.ht->StoreAllocator(*lstate.ht);
+ 	return SinkCombineResultType::FINISHED;
+ }
+ 
+@@ -177,28 +221,71 @@ SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &co
+ //===--------------------------------------------------------------------===//
+ class PerfectHashAggregateState : public GlobalSourceState {
+ public:
+-	PerfectHashAggregateState() : ht_scan_position(0) {
++	explicit PerfectHashAggregateState(idx_t total_groups_p, bool parallel_p)
++	    : total_groups(total_groups_p), block_size(parallel_p ? PERFECT_HT_SCAN_BLOCK_SIZE : total_groups_p),
++	      next_block(0) {
++	}
++
++	idx_t MaxThreads() override {
++		return MaxValue<idx_t>((total_groups + block_size - 1) / block_size, 1);
+ 	}
+ 
+-	//! The current position to scan the HT for output tuples
+-	idx_t ht_scan_position;
++	//! Total number of slots in the hash table
++	idx_t total_groups;
++	//! The number of slots handed out at a time
++	idx_t block_size;
++	//! The next block of slots to scan
++	atomic<idx_t> next_block;
++};
++
++class PerfectHashAggregateLocalSourceState : public LocalSourceState {
++public:
++	explicit PerfectHashAggregateLocalSourceState(ClientContext &context)
++	    : scan_position(0), scan_end(0), addresses(LogicalType::POINTER), allocator(Allocator::Get(context)) {
++	}
++
++	//! The current scan position and the end of the current block
++	idx_t scan_position;
++	idx_t scan_end;
++	//! Scan-local address vector
++	Vector addresses;
++	//! Scan-local arena allocator used while finalizing states
++	ArenaAllocator allocator;
+ };
+ 
+ unique_ptr<GlobalSourceState> PhysicalPerfectHashAggregate::GetGlobalSourceState(ClientContext &context) const {
+-	return make_uniq<PerfectHashAggregateState>();
++	auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
++	// the source may scan the HT concurrently: fold replicated states up front
++	gstate.ht->FoldReplicas();
++	return make_uniq<PerfectHashAggregateState>(gstate.total_groups, gstate.parallel);
++}
++
++unique_ptr<LocalSourceState> PhysicalPerfectHashAggregate::GetLocalSourceState(ExecutionContext &context,
++                                                                               GlobalSourceState &gstate) const {
++	return make_uniq<PerfectHashAggregateLocalSourceState>(context.client);
+ }
+ 
+ SourceResultType PhysicalPerfectHashAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                                OperatorSourceInput &input) const {
+ 	auto &state = input.global_state.Cast<PerfectHashAggregateState>();
++	auto &lstate = input.local_state.Cast<PerfectHashAggregateLocalSourceState>();
+ 	auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
+ 
+-	gstate.ht->Scan(state.ht_scan_position, chunk);
+-
+-	if (chunk.size() > 0) {
+-		return SourceResultType::HAVE_MORE_OUTPUT;
+-	} else {
+-		return SourceResultType::FINISHED;
++	while (true) {
++		if (lstate.scan_position < lstate.scan_end) {
++			gstate.ht->Scan(lstate.scan_position, lstate.scan_end, chunk, lstate.addresses, lstate.allocator);
++			if (chunk.size() > 0) {
++				return SourceResultType::HAVE_MORE_OUTPUT;
++			}
++		}
++		// fetch the next block of slots
++		const auto block = state.next_block++;
++		const auto begin = block * state.block_size;
++		if (begin >= state.total_groups) {
++			return SourceResultType::FINISHED;
++		}
++		lstate.scan_position = begin;
++		lstate.scan_end = MinValue<idx_t>(begin + state.block_size, state.total_groups);
+ 	}
+ }
+ 
+diff --git a/src/execution/operator/join/perfect_hash_join_executor.cpp b/src/execution/operator/join/perfect_hash_join_executor.cpp
+index a92a2fe..4f011a4 100644
+--- a/src/execution/operator/join/perfect_hash_join_executor.cpp
++++ b/src/execution/operator/join/perfect_hash_join_executor.cpp
+@@ -68,9 +68,9 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 		return true; // Already true based on static statistics
+ 	}
+ 
+-	// We only do this optimization for inner joins with one integer equality condition
++	// We only do this optimization for inner and right outer joins with one integer equality condition
+ 	const auto key_type = op.conditions[0].left->return_type;
+-	if (op.join_type != JoinType::INNER || op.conditions.size() != 1 ||
++	if ((op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1 ||
+ 	    op.conditions[0].comparison != ExpressionType::COMPARE_EQUAL || !TypeIsInteger(key_type.InternalType())) {
+ 		return false;
+ 	}
+@@ -88,6 +88,9 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 	}
+ 
+ 	// And when the build range is smaller than the threshold
++	if (min.IsNull() || max.IsNull()) {
++		return false;
++	}
+ 	perfect_join_statistics.build_min = min;
+ 	perfect_join_statistics.build_max = max;
+ 	hugeint_t min_value, max_value;
+@@ -106,13 +109,30 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 
+ 	// The max size our build must have to run the perfect HJ
+ 	static constexpr idx_t MAX_BUILD_SIZE = 1048576;
+-	if (build_range > Hugeint::Convert(MAX_BUILD_SIZE)) {
++	// Larger ranges are allowed if the build keys are dense and the table fits comfortably in memory
++	static constexpr idx_t MAX_DENSE_BUILD_SIZE = 4194304;
++	if (build_range > Hugeint::Convert(MAX_DENSE_BUILD_SIZE)) {
+ 		return false;
+ 	}
++	if (build_range > Hugeint::Convert(MAX_BUILD_SIZE)) {
++		const auto build_size = NumericCast<idx_t>(build_range) + 1;
++		// Density: at least a quarter of the slots must be occupied
++		if (ht.Count() * 4 < build_size) {
++			return false;
++		}
++		// Memory: per slot we store the build columns, a validity bit, and (for outer joins) a pointer and a flag
++		idx_t slot_size = sizeof(data_ptr_t) + 1;
++		for (auto &type : op.rhs_output_columns.col_types) {
++			slot_size += GetTypeIdSize(type.InternalType());
++		}
++		if (build_size * slot_size > ht.buffer_manager.GetMaxMemory() / 8) {
++			return false;
++		}
++	}
+ 	perfect_join_statistics.build_range = NumericCast<idx_t>(build_range);
+ 
+-	// If count is larger than range (duplicates), we bail out
+-	if (ht.Count() > perfect_join_statistics.build_range) {
++	// If count is larger than the number of slots (duplicates), we bail out
++	if (ht.Count() > perfect_join_statistics.build_range + 1) {
+ 		return false;
+ 	}
+ 
+@@ -164,6 +184,17 @@ bool PerfectHashJoinExecutor::FullScanHashTable(LogicalType &key_type) {
+ 	}
+ 	key_count = unique_keys; // do not consider keys out of the range
+ 
++	if (PropagatesBuildSide(join.join_type)) {
++		// Remember the build tuple of each slot, so that matches can be propagated to it after the probe
++		slot_to_row = make_unsafe_uniq_array_uninitialized<data_ptr_t>(build_size);
++		slot_found = make_unsafe_uniq_array_uninitialized<uint8_t>(build_size);
++		memset(slot_found.get(), 0, build_size * sizeof(uint8_t));
++		const auto row_ptrs = FlatVector::GetData<data_ptr_t>(tuples_addresses);
++		for (idx_t i = 0; i < key_count; i++) {
++			slot_to_row[sel_build.get_index(i)] = row_ptrs[sel_tuples.get_index(i)];
++		}
++	}
++
+ 	// Full scan the remaining build columns and fill the perfect hash table
+ 
+ 	for (idx_t i = 0; i < join.rhs_output_columns.col_types.size(); i++) {
+@@ -222,6 +253,10 @@ bool PerfectHashJoinExecutor::TemplatedFillSelectionVectorBuild(Vector &source,
+ 	// generate the selection vector
+ 	for (idx_t i = 0, sel_idx = 0; i < count; ++i) {
+ 		auto data_idx = vector_data.sel->get_index(i);
++		if (!vector_data.validity.RowIsValid(data_idx)) {
++			// NULL keys never match (they are only kept in the HT for joins that propagate the build side)
++			continue;
++		}
+ 		auto input_value = data[data_idx];
+ 		// add index to selection vector if value in the range
+ 		if (min_value <= input_value && input_value <= max_value) {
+@@ -281,6 +316,12 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
+ 	auto keys_count = state.join_keys.size();
+ 	// todo: add check for fast pass when probe is part of build domain
+ 	FillSelectionVectorSwitchProbe(keys_vec, state.build_sel_vec, state.probe_sel_vec, keys_count, probe_sel_count);
++	if (slot_found) {
++		// Mark the matched build slots (concurrent stores of the same value are benign)
++		for (idx_t i = 0; i < probe_sel_count; i++) {
++			slot_found[state.build_sel_vec.get_index(i)] = 1;
++		}
++	}
+ 
+ 	// If build is dense and probe is in build's domain, just reference probe
+ 	if (perfect_join_statistics.is_build_dense && keys_count == probe_sel_count) {
+@@ -298,6 +339,19 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
+ 	return OperatorResultType::NEED_MORE_INPUT;
+ }
+ 
++void PerfectHashJoinExecutor::PropagateFoundMatches() {
++	if (!slot_found) {
++		return;
++	}
++	const auto build_size = perfect_join_statistics.build_range + 1;
++	for (idx_t idx = 0; idx < build_size; idx++) {
++		if (slot_found[idx]) {
++			Store<bool>(true, slot_to_row[idx] + ht.tuple_size);
++		}
++	}
++	slot_found.reset();
++}
++
+ void PerfectHashJoinExecutor::FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec,
+                                                              SelectionVector &probe_sel_vec, idx_t count,
+                                                              idx_t &probe_sel_count) {
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..a56a46d 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+ 
++#include "duckdb/common/operator/add.hpp"
+ #include "duckdb/common/radix_partitioning.hpp"
+ #include "duckdb/common/types/value_map.hpp"
+ #include "duckdb/execution/expression_executor.hpp"
+@@ -17,6 +18,7 @@
+ #include "duckdb/parallel/thread_context.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
+ #include "duckdb/planner/filter/in_filter.hpp"
+ #include "duckdb/planner/filter/optional_filter.hpp"
+@@ -711,14 +713,44 @@ public:
+ 	}
+ };
+ 
++//! Map a join key value to the value domain of the probe-side storage column (undoing integral compression if needed)
++static bool CastJoinFilterValueToStorage(Value &value, const JoinFilterPushdownColumn &column) {
++	if (!column.storage_offset.IsNull() && !value.IsNull()) {
++		// the probe expression is (storage_value - offset), so the storage value is (value + offset)
++		Value offset = column.storage_offset;
++		if (!value.DefaultTryCastAs(LogicalType::HUGEINT) || !offset.DefaultTryCastAs(LogicalType::HUGEINT)) {
++			return false;
++		}
++		hugeint_t result;
++		if (!TryAddOperator::Operation(value.GetValue<hugeint_t>(), offset.GetValue<hugeint_t>(), result)) {
++			return false;
++		}
++		value = Value::HUGEINT(result);
++	}
++	if (column.storage_type.IsValid() && !value.DefaultTryCastAs(column.storage_type)) {
++		return false;
++	}
++	return true;
++}
++
++//! With more distinct keys than the IN-list threshold, we still push a zonemap-only disjunction of key ranges as long
++//! as the hash table is at most this many times larger than the threshold (so that scanning the keys stays cheap)
++static constexpr idx_t JOIN_FILTER_RANGE_SET_FACTOR = 64;
++
+ bool JoinFilterPushdownInfo::CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+                                             const ExpressionType &cmp) const {
+ 	auto dynamic_or_filter_threshold = Settings::Get<DynamicOrFilterThresholdSetting>(context);
+-	return ht && ht->Count() > 1 && ht->Count() <= dynamic_or_filter_threshold && cmp == ExpressionType::COMPARE_EQUAL;
++	if (!ht || ht->Count() <= 1 || cmp != ExpressionType::COMPARE_EQUAL) {
++		return false;
++	}
++	// ht->Count() <= threshold * factor (written to avoid overflow)
++	return (ht->Count() + JOIN_FILTER_RANGE_SET_FACTOR - 1) / JOIN_FILTER_RANGE_SET_FACTOR <=
++	       dynamic_or_filter_threshold;
+ }
+ 
+-void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht,
+-                                          const PhysicalOperator &op, idx_t filter_idx, idx_t filter_col_idx) const {
++void JoinFilterPushdownInfo::PushInFilter(const ClientContext &context, const JoinFilterPushdownFilter &info,
++                                          JoinHashTable &ht, const PhysicalOperator &op, idx_t filter_idx,
++                                          idx_t filter_col_idx) const {
+ 	// generate a "OR" filter (i.e. x=1 OR x=535 OR x=997)
+ 	// first scan the entire vector at the probe side
+ 	auto build_idx = join_condition[filter_idx];
+@@ -734,8 +766,7 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 	for (idx_t k = 0; k < key_count; k++) {
+ 		// Cast to storage type, only insert if it succeeds
+ 		auto value = build_vector.GetValue(k);
+-		if (info.columns[filter_idx].storage_type.IsValid() &&
+-		    !value.DefaultTryCastAs(info.columns[filter_idx].storage_type)) {
++		if (!CastJoinFilterValueToStorage(value, info.columns[filter_idx])) {
+ 			return; // it's all or nothing sadly
+ 		}
+ 		unique_ht_values.insert(value);
+@@ -749,12 +780,69 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 		return;
+ 	}
+ 
+-	// generate the OR filter
+-	auto in_filter = make_uniq<InFilter>(std::move(in_list));
++	unique_ptr<TableFilter> child_filter;
++	const idx_t max_filter_count = Settings::Get<DynamicOrFilterThresholdSetting>(context);
++	if (in_list.size() <= max_filter_count) {
++		// generate the OR filter
++		child_filter = make_uniq<InFilter>(std::move(in_list));
++	} else {
++		// too many values for an IN-list: generate a disjunction of at most max_filter_count ranges [lo, hi]
++		// splitting the sorted keys at the largest gaps
++		const auto &storage_type = info.columns[filter_idx].storage_type;
++		if (max_filter_count < 2 || !storage_type.IsIntegral() || storage_type.id() == LogicalTypeId::UHUGEINT ||
++		    in_list[0].type() != storage_type) {
++			return;
++		}
++		// IsDenseRange sorted in_list for integral types
++		vector<hugeint_t> keys;
++		keys.reserve(in_list.size());
++		for (auto &val : in_list) {
++			keys.push_back(val.GetValue<hugeint_t>());
++		}
++		vector<pair<hugeint_t, idx_t>> gaps;
++		gaps.reserve(keys.size() - 1);
++		for (idx_t i = 1; i < keys.size(); i++) {
++			gaps.emplace_back(keys[i] - keys[i - 1], i);
++		}
++		const idx_t split_count = max_filter_count - 1;
++		std::nth_element(gaps.begin(), gaps.begin() + NumericCast<int64_t>(split_count), gaps.end(),
++		                 [](const pair<hugeint_t, idx_t> &a, const pair<hugeint_t, idx_t> &b) {
++			                 return a.first > b.first || (a.first == b.first && a.second < b.second);
++		                 });
++		vector<idx_t> splits;
++		splits.reserve(split_count + 1);
++		for (idx_t i = 0; i < split_count; i++) {
++			splits.push_back(gaps[i].second);
++		}
++		std::sort(splits.begin(), splits.end());
++		splits.push_back(keys.size());
++
++		auto or_filter = make_uniq<ConjunctionOrFilter>();
++		idx_t range_start = 0;
++		for (auto range_end : splits) {
++			Value lo = Value::HUGEINT(keys[range_start]);
++			Value hi = Value::HUGEINT(keys[range_end - 1]);
++			if (!lo.DefaultTryCastAs(storage_type) || !hi.DefaultTryCastAs(storage_type)) {
++				return;
++			}
++			if (range_end - range_start == 1) {
++				or_filter->child_filters.push_back(make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, lo));
++			} else {
++				auto and_filter = make_uniq<ConjunctionAndFilter>();
++				and_filter->child_filters.push_back(
++				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo));
++				and_filter->child_filters.push_back(
++				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi));
++				or_filter->child_filters.push_back(std::move(and_filter));
++			}
++			range_start = range_end;
++		}
++		child_filter = std::move(or_filter);
++	}
+ 
+ 	// we push the OR filter as an OptionalFilter so that we can use it for zonemap pruning only
+ 	// the IN-list is expensive to execute otherwise
+-	auto filter = make_uniq<OptionalFilter>(std::move(in_filter));
++	auto filter = make_uniq<OptionalFilter>(std::move(child_filter));
+ 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
+ }
+ 
+@@ -770,9 +858,11 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// bf is only supported on the first key with an equality condition, as the Filter API only allows
++	// single-column filters so far. For multi-key joins, the bf is built from the hash of the first key only
++	// (see JoinHashTable::Finalize); the caller ensures that the filter is for the first condition
++	const bool can_use_bf =
++	    cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -832,13 +922,9 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			auto max_val = final_min_max->data[max_idx].GetValue(0);
+ 
+ 			// Cast to storage type, skip if fails
+-			if (pushdown_column.storage_type.IsValid()) {
+-				if (!min_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
+-				if (!max_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
++			if (!CastJoinFilterValueToStorage(min_val, pushdown_column) ||
++			    !CastJoinFilterValueToStorage(max_val, pushdown_column)) {
++				continue;
+ 			}
+ 
+ 			if (min_val.IsNull() || max_val.IsNull()) {
+@@ -850,7 +936,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			// if the HT is small we can generate a complete "OR" filter
+ 			// but only if the join condition is equality.
+ 			if (ht && CanUseInFilter(context, ht, cmp)) {
+-				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
++				PushInFilter(context, info, *ht, op, filter_idx, filter_col_idx);
+ 			}
+ 			if (Value::NotDistinctFrom(min_val, max_val)) {
+ 				// min = max - single value
+@@ -895,12 +981,19 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 				}
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+-				bool has_cast = condition_type != pushdown_column.storage_type;
+-				if (!has_cast && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				// the bloom filter hashes join key values, which differ from storage values when casting or shifting
++				bool has_cast =
++				    condition_type != pushdown_column.storage_type || !pushdown_column.storage_offset.IsNull();
++				// the bloom filter is built on the first join condition, so only push it for that condition
++				const bool is_first_condition = join_condition[filter_idx] == 0;
++				if (!has_cast && is_first_condition && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+ 						ht->SetBuildBloomFilter(true);
++						// the build key range allows an exact key bitmap if it is dense enough
++						ht->GetBloomFilter().SetKeyRange(final_min_max->data[min_idx].GetValue(0),
++						                                 final_min_max->data[max_idx].GetValue(0));
+ 						deferred_bloom_filters->emplace_back(info, filter_col_idx);
+ 					}
+ 				}
+@@ -1369,6 +1462,10 @@ void HashJoinGlobalSourceState::PrepareProbe(HashJoinGlobalSinkState &sink) {
+ void HashJoinGlobalSourceState::PrepareScanHT(HashJoinGlobalSinkState &sink) {
+ 	D_ASSERT(global_stage != HashJoinSourceStage::SCAN_HT);
+ 	auto &ht = *sink.hash_table;
++	if (sink.perfect_join_executor) {
++		// The perfect hash join tracks matches per slot, transfer them to the HT before scanning it
++		sink.perfect_join_executor->PropagateFoundMatches();
++	}
+ 
+ 	auto &data_collection = ht.GetDataCollection();
+ 	full_outer_chunk_idx = 0;
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 30f66c0..7367bd8 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -6,6 +6,11 @@
+ 
+ namespace duckdb {
+ 
++//! Number of state replicas per group (must be a power of two)
++static constexpr idx_t MAX_REPLICA_COUNT = 4;
++//! Maximum size of the replicated state array
++static constexpr idx_t MAX_REPLICATED_HT_SIZE = 1ULL << 20ULL;
++
+ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, Allocator &allocator,
+                                                      const vector<LogicalType> &group_types_p,
+                                                      vector<LogicalType> payload_types_p,
+@@ -25,8 +30,23 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 	layout_ptr->Initialize(std::move(aggregate_objects_p));
+ 	tuple_size = layout_ptr->GetRowWidth();
+ 
++	// if all aggregates are order-independent, we keep several replicas of every group state and spread the rows
++	// over them: consecutive rows of the same group then update independent states instead of forming a serial
++	// read-modify-write chain. The replicas are combined before the result is produced.
++	replica_count = 1;
++	replicas_folded = false;
++	bool can_replicate = !layout_ptr->GetAggregates().empty();
++	for (auto &aggr : layout_ptr->GetAggregates()) {
++		if (aggr.function.GetOrderDependent() != AggregateOrderDependent::NOT_ORDER_DEPENDENT || aggr.IsDistinct()) {
++			can_replicate = false;
++		}
++	}
++	if (can_replicate && total_groups * tuple_size * MAX_REPLICA_COUNT <= MAX_REPLICATED_HT_SIZE) {
++		replica_count = MAX_REPLICA_COUNT;
++	}
++
+ 	// allocate and null initialize the data
+-	owned_data = make_unsafe_uniq_array_uninitialized<data_t>(tuple_size * total_groups);
++	owned_data = make_unsafe_uniq_array_uninitialized<data_t>(tuple_size * total_groups * replica_count);
+ 	data = owned_data.get();
+ 
+ 	// set up the empty payloads for every tuple, and initialize the "occupied" flag to false
+@@ -36,7 +56,7 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 	// initialize the hash table for each entry
+ 	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
+ 	idx_t init_count = 0;
+-	for (idx_t i = 0; i < total_groups; i++) {
++	for (idx_t i = 0; i < total_groups * replica_count; i++) {
+ 		address_data[init_count] = uintptr_t(data) + (tuple_size * i);
+ 		init_count++;
+ 		if (init_count == STANDARD_VECTOR_SIZE) {
+@@ -46,6 +66,165 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 		}
+ 	}
+ 	RowOperations::InitializeStates(*layout_ptr, addresses, *FlatVector::IncrementalSelectionVector(), init_count);
++
++	InitializeFusedUpdate();
++}
++
++// mirrors of the int64 sum and average states (SumState<int64_t> / AvgState<int64_t> in core_functions)
++struct FusedSumState {
++	bool isset;
++	int64_t value;
++};
++struct FusedAvgState {
++	uint64_t count;
++	int64_t value;
++};
++static_assert(sizeof(FusedSumState) == 16 && offsetof(FusedSumState, value) == 8, "unexpected sum state layout");
++static_assert(sizeof(FusedAvgState) == 16 && offsetof(FusedAvgState, value) == 8, "unexpected avg state layout");
++
++void PerfectAggregateHashTable::InitializeFusedUpdate() {
++	use_fused_update = false;
++	fused_aggregates.clear();
++	auto &aggregates = layout_ptr->GetAggregates();
++	if (aggregates.empty()) {
++		return;
++	}
++	idx_t payload_idx = 0;
++	idx_t state_offset = 0;
++	for (auto &aggr : aggregates) {
++		if (aggr.filter || aggr.IsDistinct() || aggr.function.HasStateDestructorCallback()) {
++			return;
++		}
++		const auto state_size = aggr.function.GetStateSizeCallback()(aggr.function);
++		FusedAggregate fused;
++		fused.state_offset = state_offset;
++		fused.payload_idx = payload_idx;
++		const auto &name = aggr.function.name;
++		if (aggr.child_count == 0) {
++			if (name != "count_star" || state_size != sizeof(int64_t)) {
++				return;
++			}
++			fused.kind = FusedAggregateKind::COUNT_STAR;
++		} else {
++			if (aggr.child_count != 1 || payload_idx >= payload_types.size()) {
++				return;
++			}
++			const auto input_type = payload_types[payload_idx].InternalType();
++			if (input_type != PhysicalType::INT32 && input_type != PhysicalType::INT64) {
++				return;
++			}
++			const bool is_int32 = input_type == PhysicalType::INT32;
++			if (name == "sum_no_overflow" && state_size == sizeof(FusedSumState)) {
++				fused.kind = is_int32 ? FusedAggregateKind::SUM_INT32 : FusedAggregateKind::SUM_INT64;
++			} else if (name == "avg" && state_size == sizeof(FusedAvgState)) {
++				fused.kind = is_int32 ? FusedAggregateKind::AVG_INT32 : FusedAggregateKind::AVG_INT64;
++			} else {
++				return;
++			}
++		}
++		fused_aggregates.push_back(fused);
++		payload_idx += aggr.child_count;
++		state_offset += aggr.payload_size;
++	}
++	use_fused_update = true;
++}
++
++namespace {
++
++struct FusedInput {
++	const data_t *data;
++	const SelectionVector *sel;
++	const ValidityMask *validity;
++};
++
++} // namespace
++
++template <class T, bool IS_SUM, bool HAS_NULLS>
++static void FusedColumnLoop(const uintptr_t *__restrict address_data, const FusedInput &input, idx_t offset,
++                            idx_t count) {
++	const auto data = reinterpret_cast<const T *>(input.data);
++	const auto &sel = *input.sel;
++	for (idx_t i = 0; i < count; i++) {
++		const auto idx = sel.get_index(i);
++		if (HAS_NULLS && !input.validity->RowIsValid(idx)) {
++			continue;
++		}
++		const auto state = reinterpret_cast<data_ptr_t>(address_data[i]) + offset;
++		if (IS_SUM) {
++			auto &sum_state = *reinterpret_cast<FusedSumState *>(state);
++			sum_state.isset = true;
++			sum_state.value += int64_t(data[idx]);
++		} else {
++			auto &avg_state = *reinterpret_cast<FusedAvgState *>(state);
++			avg_state.count++;
++			avg_state.value += int64_t(data[idx]);
++		}
++	}
++}
++
++template <bool HAS_NULLS>
++static void FusedUpdateLoop(const uintptr_t *address_data, const FusedInput *inputs, const idx_t *offsets,
++                            const uint8_t *kinds, idx_t aggr_count, idx_t count) {
++	using KIND = uint8_t;
++	for (idx_t k = 0; k < aggr_count; k++) {
++		const auto offset = offsets[k];
++		switch (kinds[k]) {
++		case KIND(0): // COUNT_STAR
++			for (idx_t i = 0; i < count; i++) {
++				(*reinterpret_cast<int64_t *>(address_data[i] + offset))++;
++			}
++			break;
++		case KIND(1): // SUM_INT32
++			FusedColumnLoop<int32_t, true, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(2): // SUM_INT64
++			FusedColumnLoop<int64_t, true, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(3): // AVG_INT32
++			FusedColumnLoop<int32_t, false, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		case KIND(4): // AVG_INT64
++			FusedColumnLoop<int64_t, false, HAS_NULLS>(address_data, inputs[k], offset, count);
++			break;
++		default:
++			break;
++		}
++	}
++}
++
++void PerfectAggregateHashTable::FusedUpdate(DataChunk &payload, idx_t count) {
++	// FusedUpdateLoop relies on these numeric values
++	static_assert(uint8_t(FusedAggregateKind::COUNT_STAR) == 0 && uint8_t(FusedAggregateKind::SUM_INT32) == 1 &&
++	                  uint8_t(FusedAggregateKind::SUM_INT64) == 2 && uint8_t(FusedAggregateKind::AVG_INT32) == 3 &&
++	                  uint8_t(FusedAggregateKind::AVG_INT64) == 4,
++	              "unexpected fused aggregate kind values");
++	const idx_t aggr_count = fused_aggregates.size();
++	unsafe_vector<UnifiedVectorFormat> formats(aggr_count);
++	unsafe_vector<FusedInput> inputs(aggr_count);
++	unsafe_vector<idx_t> offsets(aggr_count);
++	unsafe_vector<uint8_t> kinds(aggr_count);
++	bool has_nulls = false;
++	for (idx_t k = 0; k < aggr_count; k++) {
++		auto &fused = fused_aggregates[k];
++		offsets[k] = fused.state_offset;
++		kinds[k] = static_cast<uint8_t>(fused.kind);
++		if (fused.kind == FusedAggregateKind::COUNT_STAR) {
++			inputs[k] = {nullptr, nullptr, nullptr};
++			continue;
++		}
++		auto &format = formats[k];
++		payload.data[fused.payload_idx].ToUnifiedFormat(count, format);
++		inputs[k] = {format.data, format.sel, &format.validity};
++		if (!format.validity.AllValid()) {
++			has_nulls = true;
++		}
++	}
++	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
++	if (has_nulls) {
++		FusedUpdateLoop<true>(address_data, inputs.data(), offsets.data(), kinds.data(), aggr_count, count);
++	} else {
++		FusedUpdateLoop<false>(address_data, inputs.data(), offsets.data(), kinds.data(), aggr_count, count);
++	}
+ }
+ 
+ PerfectAggregateHashTable::~PerfectAggregateHashTable() {
+@@ -129,6 +308,8 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 	}
+ 	// now we have the HT entry number for every tuple
+ 	// compute the actual pointer to the data by adding it to the base HT pointer and multiplying by the tuple size
++	// row i is assigned to replica (i % replica_count) of its group
++	const idx_t replica_mask = replica_count - 1;
+ 	for (idx_t i = 0; i < groups.size(); i++) {
+ 		const auto group = address_data[i];
+ 		if (group >= total_groups) {
+@@ -138,10 +319,14 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 			                            group, total_groups);
+ 		}
+ 		group_is_set[group] = true;
+-		address_data[i] = uintptr_t(data) + group * tuple_size;
++		address_data[i] = uintptr_t(data) + (group + (i & replica_mask) * total_groups) * tuple_size;
+ 	}
+ 
+ 	// after finding the group location we update the aggregates
++	if (use_fused_update) {
++		FusedUpdate(payload, groups.size());
++		return;
++	}
+ 	idx_t payload_idx = 0;
+ 	auto &aggregates = layout_ptr->GetAggregates();
+ 	RowOperationsState row_state(*aggregate_allocator);
+@@ -161,8 +346,50 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ }
+ 
+ void PerfectAggregateHashTable::Combine(PerfectAggregateHashTable &other) {
++	CombineRange(other, 0, total_groups, *aggregate_allocator);
++	StoreAllocator(other);
++}
++
++void PerfectAggregateHashTable::StoreAllocator(PerfectAggregateHashTable &other) {
++	// FIXME: after moving the arena allocator, we currently have to ensure that the pointer is not nullptr, because the
++	// FIXME: Destroy()-function of the hash table expects an allocator in some cases (e.g., for sorted aggregates)
++	stored_allocators.push_back(std::move(other.aggregate_allocator));
++	other.aggregate_allocator = make_uniq<ArenaAllocator>(allocator);
++}
++
++void PerfectAggregateHashTable::StoreAllocator(unique_ptr<ArenaAllocator> allocator_p) {
++	stored_allocators.push_back(std::move(allocator_p));
++}
++
++void PerfectAggregateHashTable::CombineRange(PerfectAggregateHashTable &other, idx_t begin, idx_t end,
++                                             ArenaAllocator &range_allocator) {
+ 	D_ASSERT(total_groups == other.total_groups);
+ 	D_ASSERT(tuple_size == other.tuple_size);
++	D_ASSERT(begin <= end && end <= total_groups);
++
++	// combine all replicas of the source into replica 0 of this HT
++	CombineReplicas(other, 0, begin, end, range_allocator);
++	for (idx_t i = begin; i < end; i++) {
++		if (other.group_is_set[i]) {
++			group_is_set[i] = true;
++		}
++	}
++}
++
++void PerfectAggregateHashTable::FoldReplicas() {
++	if (!replicas_folded) {
++		// fold the replicated states of this HT into replica 0 before producing results
++		replicas_folded = true;
++		if (replica_count > 1) {
++			CombineReplicas(*this, 1, 0, total_groups, *aggregate_allocator);
++		}
++	}
++}
++
++void PerfectAggregateHashTable::CombineReplicas(PerfectAggregateHashTable &source, idx_t first_replica, idx_t begin,
++                                                idx_t end, ArenaAllocator &combine_allocator) {
++	D_ASSERT(total_groups == source.total_groups);
++	D_ASSERT(tuple_size == source.tuple_size);
+ 
+ 	Vector source_addresses(LogicalType::POINTER);
+ 	Vector target_addresses(LogicalType::POINTER);
+@@ -170,32 +397,24 @@ void PerfectAggregateHashTable::Combine(PerfectAggregateHashTable &other) {
+ 	auto target_addresses_ptr = FlatVector::GetData<data_ptr_t>(target_addresses);
+ 
+ 	// iterate over all entries of both hash tables and call combine for all entries that can be combined
+-	data_ptr_t source_ptr = other.data;
+-	data_ptr_t target_ptr = data;
+ 	idx_t combine_count = 0;
+-	RowOperationsState row_state(*aggregate_allocator);
+-	for (idx_t i = 0; i < total_groups; i++) {
+-		auto has_entry_source = other.group_is_set[i];
++	RowOperationsState row_state(combine_allocator);
++	for (idx_t i = begin; i < end; i++) {
+ 		// we only have any work to do if the source has an entry for this group
+-		if (has_entry_source) {
+-			group_is_set[i] = true;
+-			source_addresses_ptr[combine_count] = source_ptr;
+-			target_addresses_ptr[combine_count] = target_ptr;
++		if (!source.group_is_set[i]) {
++			continue;
++		}
++		for (idx_t r = first_replica; r < source.replica_count; r++) {
++			source_addresses_ptr[combine_count] = source.data + (r * total_groups + i) * tuple_size;
++			target_addresses_ptr[combine_count] = data + i * tuple_size;
+ 			combine_count++;
+ 			if (combine_count == STANDARD_VECTOR_SIZE) {
+ 				RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
+ 				combine_count = 0;
+ 			}
+ 		}
+-		source_ptr += tuple_size;
+-		target_ptr += tuple_size;
+ 	}
+ 	RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
+-
+-	// FIXME: after moving the arena allocator, we currently have to ensure that the pointer is not nullptr, because the
+-	// FIXME: Destroy()-function of the hash table expects an allocator in some cases (e.g., for sorted aggregates)
+-	stored_allocators.push_back(std::move(other.aggregate_allocator));
+-	other.aggregate_allocator = make_uniq<ArenaAllocator>(allocator);
+ }
+ 
+ template <class T>
+@@ -253,12 +472,20 @@ static void ReconstructGroupVector(uint32_t group_values[], Value &min, idx_t re
+ }
+ 
+ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
+-	auto data_pointers = FlatVector::GetData<data_ptr_t>(addresses);
++	FoldReplicas();
++	Scan(scan_position, total_groups, result, addresses, *aggregate_allocator);
++}
++
++void PerfectAggregateHashTable::Scan(idx_t &scan_position, idx_t end_position, DataChunk &result,
++                                     Vector &scan_addresses, ArenaAllocator &scan_allocator) {
++	D_ASSERT(end_position <= total_groups);
++	D_ASSERT(replicas_folded || replica_count == 1);
++	auto data_pointers = FlatVector::GetData<data_ptr_t>(scan_addresses);
+ 	uint32_t group_values[STANDARD_VECTOR_SIZE];
+ 
+-	// iterate over the HT until we either have exhausted the entire HT, or
++	// iterate over the HT until we either have exhausted the range, or filled up the result chunk
+ 	idx_t entry_count = 0;
+-	for (; scan_position < total_groups; scan_position++) {
++	for (; scan_position < end_position; scan_position++) {
+ 		if (group_is_set[scan_position]) {
+ 			// this group is set: add it to the set of groups to extract
+ 			data_pointers[entry_count] = data + tuple_size * scan_position;
+@@ -282,8 +509,8 @@ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
+ 	}
+ 	// then construct the payloads
+ 	result.SetCardinality(entry_count);
+-	RowOperationsState row_state(*aggregate_allocator);
+-	RowOperations::FinalizeStates(row_state, *layout_ptr, addresses, result, grouping_columns);
++	RowOperationsState row_state(scan_allocator);
++	RowOperations::FinalizeStates(row_state, *layout_ptr, scan_addresses, result, grouping_columns);
+ }
+ 
+ void PerfectAggregateHashTable::Destroy() {
+@@ -305,7 +532,7 @@ void PerfectAggregateHashTable::Destroy() {
+ 	// iterate over all initialised slots of the hash table
+ 	RowOperationsState row_state(*aggregate_allocator);
+ 	data_ptr_t payload_ptr = data;
+-	for (idx_t i = 0; i < total_groups; i++) {
++	for (idx_t i = 0; i < total_groups * replica_count; i++) {
+ 		data_pointers[count++] = payload_ptr;
+ 		if (count == STANDARD_VECTOR_SIZE) {
+ 			RowOperations::DestroyStates(row_state, *layout_ptr, addresses, count);
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 9134893..2e30809 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -11,6 +11,8 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/function/function_binder.hpp"
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
++#include "duckdb/storage/buffer_manager.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+@@ -124,11 +126,15 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
++//! Maximum number of bits for a perfect hash table that exceeds the perfect_ht_threshold setting
++static constexpr idx_t LARGE_PERFECT_HT_MAX_BITS = 22;
++
+ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, vector<idx_t> &bits_per_group) {
+ 	if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+ 		return false;
+ 	}
+ 	idx_t perfect_hash_bits = 0;
++	const idx_t threshold = Settings::Get<PerfectHtThresholdSetting>(context);
+ 	for (idx_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
+ 		auto &group = op.groups[group_idx];
+ 		auto &stats = op.group_stats[group_idx];
+@@ -227,17 +233,31 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 		bits_per_group.push_back(required_bits);
+ 		perfect_hash_bits += required_bits;
+ 		// check if we have exceeded the bits for the hash
+-		if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)) {
++		if (perfect_hash_bits > MaxValue<idx_t>(threshold, LARGE_PERFECT_HT_MAX_BITS)) {
+ 			// too many bits for perfect hash
+ 			return false;
+ 		}
+ 	}
++	idx_t state_size = 0;
+ 	for (auto &expression : op.expressions) {
+ 		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+ 		if (aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback()) {
+ 			// distinct aggregates are not supported in perfect hash aggregates
+ 			return false;
+ 		}
++		state_size += AlignValue(aggregate.function.GetStateSizeCallback()(aggregate.function));
++	}
++	if (perfect_hash_bits > threshold) {
++		// beyond the threshold we only use a perfect hash table if it is dense and fits comfortably in memory
++		const idx_t total_groups = idx_t(1) << perfect_hash_bits;
++		if (!op.has_estimated_cardinality || op.estimated_cardinality < total_groups / 4) {
++			return false;
++		}
++		const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++		const auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
++		if (threads * total_groups * (state_size + 1) > max_memory / 8) {
++			return false;
++		}
+ 	}
+ 	return true;
+ }
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..7fdb023 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -70,8 +70,12 @@ const TupleDataLayout &RadixPartitionedHashTable::GetLayout() const {
+ 
+ unique_ptr<GroupedAggregateHashTable> RadixPartitionedHashTable::CreateHT(ClientContext &context, const idx_t capacity,
+                                                                           const idx_t radix_bits) const {
+-	return make_uniq<GroupedAggregateHashTable>(context, BufferAllocator::Get(context), group_types, op.payload_types,
+-	                                            op.bindings, capacity, radix_bits, group_validity);
++	auto ht = make_uniq<GroupedAggregateHashTable>(context, BufferAllocator::Get(context), group_types,
++	                                               op.payload_types, op.bindings, capacity, radix_bits, group_validity);
++	if (partition_key_count != 0) {
++		ht->SetPartitionKeyCount(partition_key_count);
++	}
++	return ht;
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/include/duckdb/execution/aggregate_hashtable.hpp b/src/include/duckdb/execution/aggregate_hashtable.hpp
+index 5846343..ff79039 100644
+--- a/src/include/duckdb/execution/aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/aggregate_hashtable.hpp
+@@ -121,6 +121,8 @@ public:
+ 	bool HLLEnabled() const;
+ 	//! Get HLL count
+ 	idx_t GetHLLUpperBound() const;
++	//! Take the radix (partition) bits of the group hash from the first 'count' group columns only (0 = off)
++	void SetPartitionKeyCount(idx_t count);
+ 
+ 	//! Executes the filter(if any) and update the aggregates
+ 	void Combine(GroupedAggregateHashTable &other);
+@@ -176,6 +178,10 @@ private:
+ 	bool enable_hll;
+ 	//! The associated HLL
+ 	HyperLogLog hll;
++	//! If > 0, the radix bits of the group hashes are computed from the first partition_key_count group columns
++	idx_t partition_key_count = 0;
++	//! Scratch vector for hashing the partition key columns
++	unique_ptr<Vector> partition_key_hashes;
+ 
+ 	//! The active arena allocator used by the aggregates for their internal state
+ 	shared_ptr<ArenaAllocator> aggregate_allocator;
+@@ -218,6 +224,8 @@ private:
+ 	void ReinsertTuples(PartitionedTupleData &data);
+ 
+ 	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter);
++	//! Computes the hashes of the groups (respecting partition_key_count)
++	void HashGroups(DataChunk &groups, Vector &hashes);
+ 
+ 	//! Does the actual group matching / creation
+ 	idx_t FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes, Vector &addresses,
+diff --git a/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp b/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
+index 939f743..4e84003 100644
+--- a/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
++++ b/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
+@@ -34,12 +34,17 @@ public:
+ public:
+ 	// Source interface
+ 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
++	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
++	                                                 GlobalSourceState &gstate) const override;
+ 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+ 	                                 OperatorSourceInput &input) const override;
+ 
+ 	bool IsSource() const override {
+ 		return true;
+ 	}
++	bool ParallelSource() const override {
++		return true;
++	}
+ 	OrderPreservationType SourceOrder() const override {
+ 		return OrderPreservationType::NO_ORDER;
+ 	}
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..8e5a977 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -27,6 +27,9 @@ struct JoinFilterPushdownColumn {
+ 	ColumnBinding probe_column_index;
+ 	//! The type of the value in storage (LogicalGet)
+ 	LogicalType storage_type;
++	//! If set, the probe expression is "storage_value - storage_offset" (integral compression), so a join key value v
++	//! corresponds to storage value v + storage_offset
++	Value storage_offset;
+ };
+ 
+ struct JoinFilterGlobalState {
+@@ -89,8 +92,8 @@ public:
+ 	                     idx_t filter_col_idx) const;
+ 
+ private:
+-	void PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
+-	                  idx_t filter_idx, idx_t filter_col_idx) const;
++	void PushInFilter(const ClientContext &context, const JoinFilterPushdownFilter &info, JoinHashTable &ht,
++	                  const PhysicalOperator &op, idx_t filter_idx, idx_t filter_col_idx) const;
+ 
+ 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
+ 	bool CanUseBloomFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+diff --git a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+index 9e51344..3276742 100644
+--- a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
++++ b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+@@ -41,6 +41,9 @@ public:
+ 	OperatorResultType ProbePerfectHashTable(ExecutionContext &context, DataChunk &input, DataChunk &lhs_output_columns,
+ 	                                         DataChunk &chunk, OperatorState &state);
+ 	bool BuildPerfectHashTable(LogicalType &type);
++	//! For joins that propagate the build side: transfer the per-slot match flags to the build tuples
++	//! (must be called once after all probing is done, before scanning the HT for unmatched tuples)
++	void PropagateFoundMatches();
+ 
+ private:
+ 	void FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec, SelectionVector &probe_sel_vec,
+@@ -67,6 +70,10 @@ private:
+ 	ValidityMask bitmap_build_idx;
+ 	//! Stores the number of unique keys in the build side
+ 	idx_t unique_keys = 0;
++	//! For joins that propagate the build side: build tuple address of each slot
++	unsafe_unique_array<data_ptr_t> slot_to_row;
++	//! For joins that propagate the build side: whether each slot was matched during the probe
++	unsafe_unique_array<uint8_t> slot_found;
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+index 211c27b..c17f743 100644
+--- a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+@@ -27,8 +27,27 @@ public:
+ 	//! Combines the target perfect aggregate HT into this one
+ 	void Combine(PerfectAggregateHashTable &other);
+ 
++	//! Combines the slots [begin, end) of the target perfect aggregate HT into this one, using the given allocator
++	//! Concurrent calls are safe as long as they operate on disjoint slot ranges
++	void CombineRange(PerfectAggregateHashTable &other, idx_t begin, idx_t end, ArenaAllocator &range_allocator);
++	//! Takes ownership of the aggregate allocator of the other HT (after it has been fully combined into this one)
++	void StoreAllocator(PerfectAggregateHashTable &other);
++	//! Takes ownership of the given allocator
++	void StoreAllocator(unique_ptr<ArenaAllocator> allocator);
++	//! Fold the replicated states into replica 0 (must be called once before concurrent range scans)
++	void FoldReplicas();
++
+ 	//! Scan the HT starting from the scan_position
+ 	void Scan(idx_t &scan_position, DataChunk &result);
++	//! Scan the HT slots [scan_position, end_position), using the given address vector and allocator
++	//! Concurrent calls are safe as long as they operate on disjoint slot ranges and use their own vector/allocator
++	//! (FoldReplicas must have been called before)
++	void Scan(idx_t &scan_position, idx_t end_position, DataChunk &result, Vector &scan_addresses,
++	          ArenaAllocator &scan_allocator);
++
++	idx_t TotalGroups() const {
++		return total_groups;
++	}
+ 
+ protected:
+ 	Vector addresses;
+@@ -42,6 +61,25 @@ protected:
+ 	idx_t tuple_size;
+ 	//! The number of grouping columns
+ 	idx_t grouping_columns;
++	//! The number of replicated states per group (power of two); rows are spread over replicas to break
++	//! read-modify-write dependency chains on the same state
++	idx_t replica_count;
++	//! Whether replicas > 0 have been folded into replica 0
++	bool replicas_folded;
++
++	//! Kinds of aggregates the fused single-pass update supports
++	enum class FusedAggregateKind : uint8_t { COUNT_STAR, SUM_INT32, SUM_INT64, AVG_INT32, AVG_INT64 };
++	struct FusedAggregate {
++		FusedAggregateKind kind;
++		//! Offset of the state within the tuple
++		idx_t state_offset;
++		//! Index of the input column in the payload chunk (unused for COUNT_STAR)
++		idx_t payload_idx;
++	};
++	//! If all aggregates are simple int64-state sum/avg/count_star, their states are updated directly with typed
++	//! loops instead of going through the generic aggregate update callbacks
++	bool use_fused_update;
++	vector<FusedAggregate> fused_aggregates;
+ 
+ 	// The actual pointer to the data
+ 	data_ptr_t data;
+@@ -64,6 +102,14 @@ protected:
+ private:
+ 	//! Destroy the perfect aggregate HT (called automatically by the destructor)
+ 	void Destroy();
++	//! Combine the states of replicas first_replica..replica_count-1 of "source" into replica 0 of this HT,
++	//! for the slots [begin, end)
++	void CombineReplicas(PerfectAggregateHashTable &source, idx_t first_replica, idx_t begin, idx_t end,
++	                     ArenaAllocator &combine_allocator);
++	//! Classify the aggregates and enable the fused update if all of them are supported
++	void InitializeFusedUpdate();
++	//! Update all aggregate states of the rows with typed loops (requires use_fused_update)
++	void FusedUpdate(DataChunk &payload, idx_t count);
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+index cf294cf..2cb308d 100644
+--- a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
++++ b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+@@ -35,6 +35,8 @@ public:
+ 	vector<Value> grouping_values;
+ 	//! Whether there are no NULLs in the groups
+ 	const TupleDataValidityType group_validity;
++	//! If > 0, partition the HTs on the hash of the first partition_key_count group columns only
++	idx_t partition_key_count = 0;
+ 
+ public:
+ 	//! Sink Interface
+diff --git a/src/include/duckdb/planner/filter/bloom_filter.hpp b/src/include/duckdb/planner/filter/bloom_filter.hpp
+index bff73c0..a3c1bf0 100644
+--- a/src/include/duckdb/planner/filter/bloom_filter.hpp
++++ b/src/include/duckdb/planner/filter/bloom_filter.hpp
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "duckdb/common/atomic.hpp"
+ #include "duckdb/common/serializer/deserializer.hpp"
+ #include "duckdb/common/serializer/serializer.hpp"
+ #include "duckdb/planner/table_filter.hpp"
+@@ -32,10 +33,47 @@ public:
+ 		return initialized;
+ 	}
+ 
++	//! Provide the [min, max] range of the (single, integral) build key before Initialize. If the range is dense
++	//! enough relative to the number of rows, Initialize builds an exact bitmap indexed by (key - min) instead.
++	void SetKeyRange(const Value &min, const Value &max);
++	//! Whether the filter is an exact key bitmap (keys must be inserted with InsertKey instead of InsertHashes)
++	bool IsExact() const {
++		return exact;
++	}
++	PhysicalType ExactKeyType() const {
++		return exact_type;
++	}
++	inline void InsertKey(const int64_t key) const {
++		const uint64_t offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(exact_min);
++		if (DUCKDB_UNLIKELY(offset >= exact_bits)) {
++			// should not happen (the range covers all build keys), but stay correct: let everything pass
++			exact_overflow.store(true, std::memory_order_relaxed);
++			return;
++		}
++		std::atomic<uint64_t> &slot = *reinterpret_cast<std::atomic<uint64_t> *>(&bf[offset >> 6]);
++		slot.fetch_or(1ULL << (offset & 63), std::memory_order_relaxed);
++	}
++	inline bool LookupKey(const int64_t key) const {
++		const uint64_t offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(exact_min);
++		return offset < exact_bits && ((bf[offset >> 6] >> (offset & 63)) & 1ULL);
++	}
++	bool ExactOverflow() const {
++		return exact_overflow.load(std::memory_order_relaxed);
++	}
++
+ private:
+ 	idx_t num_sectors;
+ 	uint64_t bitmask; // num_sectors - 1 -> used to get the sector offset
+ 
++	//! Exact bitmap mode
++	bool has_key_range = false;
++	bool exact = false;
++	PhysicalType exact_type = PhysicalType::INVALID;
++	int64_t exact_min = 0;
++	int64_t exact_max = 0;
++	uint64_t exact_bits = 0;
++	mutable std::atomic<bool> exact_overflow {false};
++
+ 	bool initialized = false;
+ 	AllocatedData buf_;
+ 	uint64_t *bf;
+@@ -81,6 +119,8 @@ public:
+ private:
+ 	static void HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
+ 	                         BFTableFilterState &state);
++	idx_t FilterExact(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
++	                  BFTableFilterState &state) const;
+ 
+ 	bool Equals(const TableFilter &other) const override;
+ 	unique_ptr<TableFilter> Copy() const override;
+diff --git a/src/include/duckdb/storage/table/row_group_collection.hpp b/src/include/duckdb/storage/table/row_group_collection.hpp
+index ee0cae8..7ec38ca 100644
+--- a/src/include/duckdb/storage/table/row_group_collection.hpp
++++ b/src/include/duckdb/storage/table/row_group_collection.hpp
+@@ -167,6 +167,9 @@ public:
+ 	idx_t GetRowGroupSize() const {
+ 		return row_group_size;
+ 	}
++	//! Number of vectors handed out per parallel scan task. Collections with few row groups compared to the thread
++	//! count are split into sub-row-group morsels so that all threads can participate.
++	static idx_t GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count);
+ 	void SetRowGroupAppendMode(RowGroupAppendMode mode);
+ 	//! Returns the total amount of segments - use sparingly, as this forces all segments to be loaded
+ 	idx_t GetSegmentCount();
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..81f64ce 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -8,6 +8,8 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -50,6 +52,28 @@ bool PushdownJoinFilterExpression(Expression &expr, JoinFilterPushdownColumn &fi
+ 		}
+ 		return PushdownJoinFilterExpression(*bound_cast.child, filter);
+ 	}
++	case ExpressionClass::BOUND_FUNCTION: {
++		// We allow pushing through integral compression (input - offset), the filter values are shifted back later
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (!StringUtil::StartsWith(func.function.name, "__internal_compress_integral_") ||
++		    func.children.size() != 2 || !filter.storage_offset.IsNull()) {
++			return false;
++		}
++		if (func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		const auto &src = func.children[0]->return_type;
++		if (!src.IsIntegral() || !expr.return_type.IsIntegral() ||
++		    GetTypeIdSize(src.InternalType()) > GetTypeIdSize(PhysicalType::INT64)) {
++			return false;
++		}
++		auto &offset = func.children[1]->Cast<BoundConstantExpression>().value;
++		if (offset.IsNull()) {
++			return false;
++		}
++		filter.storage_offset = offset;
++		return PushdownJoinFilterExpression(*func.children[0], filter);
++	}
+ 	default:
+ 		return false;
+ 	}
+@@ -103,6 +127,7 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
+ 			for (auto &child_column : columns) {
+ 				JoinFilterPushdownColumn new_col;
+ 				new_col.probe_column_index = child_bindings[child_column.probe_column_index.column_index];
++				new_col.storage_offset = child_column.storage_offset;
+ 				child_columns.push_back(new_col);
+ 			}
+ 			// then recurse into the child
+@@ -272,7 +297,8 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	// Even if we cannot find any table sources in which we can push down filters,
+ 	// we still initialize the aggregate states so that we have the possibility of doing a perfect hash join
+ 	// TODO: Can ExpressionType::COMPARE_NOT_DISTINCT_FROM be used with perfect hash joins?
+-	const auto compute_aggregates_anyway = join.join_type == JoinType::INNER && join.conditions.size() == 1 &&
++	const auto compute_aggregates_anyway = (join.join_type == JoinType::INNER || join.join_type == JoinType::RIGHT) &&
++	                                       join.conditions.size() == 1 &&
+ 	                                       pushdown_info->join_condition.size() == 1 &&
+ 	                                       join.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
+ 	                                       TypeIsIntegral(join.conditions[0].right->return_type.InternalType());
+@@ -302,7 +328,9 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// the build side is the (deduplicated) set of correlated values that occur on the other side
++			// of the delim join, so it usually covers only a fraction of the probe-side key domain
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}
+diff --git a/src/optimizer/join_order/cardinality_estimator.cpp b/src/optimizer/join_order/cardinality_estimator.cpp
+index f09070c..e9d2a9c 100644
+--- a/src/optimizer/join_order/cardinality_estimator.cpp
++++ b/src/optimizer/join_order/cardinality_estimator.cpp
+@@ -263,12 +263,22 @@ double CardinalityEstimator::CalculateUpdatedDenom(Subgraph2Denominator left, Su
+ 	}
+ 	case JoinType::SEMI:
+ 	case JoinType::ANTI: {
++		double selectivity = CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		if (filter.filter_info->join_type == JoinType::SEMI && filter.filter_info->right_set) {
++			// a semi join keeps at most the fraction of the key domain present in its (small) RHS
++			auto tdom = filter.has_distinct_count_hll ? static_cast<double>(filter.distinct_count_hll)
++			                                          : static_cast<double>(filter.distinct_count_no_hll);
++			auto rhs_cardinality = GetNumerator(*filter.filter_info->right_set);
++			if (tdom > 0 && rhs_cardinality >= 1 && rhs_cardinality < tdom) {
++				selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);
++			}
++		}
+ 		if (JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&
+ 		    JoinRelationSet::IsSubset(*right.relations, *filter.filter_info->right_set)) {
+-			new_denom = left.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++			new_denom = left.denom * selectivity;
+ 			return new_denom;
+ 		}
+-		new_denom = right.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		new_denom = right.denom * selectivity;
+ 		return new_denom;
+ 	}
+ 	default:
+diff --git a/src/optimizer/join_order/relation_manager.cpp b/src/optimizer/join_order/relation_manager.cpp
+index 18498c9..6b054a9 100644
+--- a/src/optimizer/join_order/relation_manager.cpp
++++ b/src/optimizer/join_order/relation_manager.cpp
+@@ -202,6 +202,50 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
+ 	AddRelation(input_op, parent, child_stats);
+ }
+ 
++static bool IsAggregateRangeComparison(const Expression &expr, idx_t aggregate_index) {
++	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
++	    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		for (auto &child : conj.children) {
++			if (IsAggregateRangeComparison(*child, aggregate_index)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++		return false;
++	}
++	switch (expr.GetExpressionType()) {
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		break;
++	default:
++		return false;
++	}
++	auto &comp = expr.Cast<BoundComparisonExpression>();
++	auto is_aggr_ref = [&](const Expression &side) {
++		return side.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
++		       side.Cast<BoundColumnRefExpression>().binding.table_index == aggregate_index;
++	};
++	return (is_aggr_ref(*comp.left) && comp.right->IsFoldable()) ||
++	       (is_aggr_ref(*comp.right) && comp.left->IsFoldable());
++}
++
++static bool FilterHasAggregateRangePredicate(const vector<reference<LogicalOperator>> &filters,
++                                             idx_t aggregate_index) {
++	for (auto &filter : filters) {
++		for (auto &expr : filter.get().expressions) {
++			if (IsAggregateRangeComparison(*expr, aggregate_index)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
+ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, LogicalOperator &input_op,
+                                            vector<reference<LogicalOperator>> &filter_operators,
+                                            optional_ptr<LogicalOperator> parent) {
+@@ -274,6 +318,13 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
+ 		if (!datasource_filters.empty()) {
+ 			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
+ 			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
++			if (FilterHasAggregateRangePredicate(datasource_filters, aggr.aggregate_index)) {
++				// range predicates on aggregate results (HAVING sum(x) > c) usually keep few groups
++				operator_stats.cardinality =
++				    MaxValue<idx_t>(LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
++				                                            RelationStatisticsHelper::DEFAULT_SELECTIVITY),
++				                    1);
++			}
+ 		}
+ 		ModifyStatsIfLimit(limit_op.get(), child_stats);
+ 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..e766a2c 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -79,6 +80,40 @@ idx_t RelationStatisticsHelper::GetDistinctCount(LogicalGet &get, ClientContext
+ 	return distinct_count;
+ }
+ 
++//! Selectivity assumed for substring / pattern matching filters on strings (LIKE '%abc%', contains, regex)
++static constexpr double STRING_PATTERN_SELECTIVITY = 0.05;
++
++//! Whether the table filter is (or is a conjunction containing) a string pattern match against a constant pattern
++static bool IsStringPatternFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conj = filter.Cast<ConjunctionAndFilter>();
++		for (auto &child : conj.child_filters) {
++			if (IsStringPatternFilter(*child)) {
++				return true;
++			}
++		}
++		return false;
++	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr = *filter.Cast<ExpressionFilter>().expr;
++		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++			return false;
++		}
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (func.children.size() < 2 || func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &name = func.function.name;
++		return name == "contains" || name == "like" || name == "~~" || name == "ilike" || name == "~~*" ||
++		       name == "like_escape" || name == "ilike_escape" || name == "regexp_matches" || name == "suffix" ||
++		       name == "ends_with";
++	}
++	default:
++		return false;
++	}
++}
++
+ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
+ 	auto return_stats = RelationStats();
+ 
+@@ -119,6 +154,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 	if (!get.table_filters.filters.empty()) {
+ 		column_statistics = nullptr;
+ 		bool has_non_optional_filters = false;
++		bool has_string_pattern_filter = false;
+ 		for (auto &it : get.table_filters.filters) {
+ 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
+ 				if (get.function.statistics_extended) {
+@@ -139,15 +175,20 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
+ 
+ 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
+ 				has_non_optional_filters = true;
++				if (IsStringPatternFilter(*it.second)) {
++					has_string_pattern_filter = true;
++				}
+ 			}
+ 		}
+ 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
+ 		// and there are other table filters (i.e cost > 50), use default selectivity.
++		// substring / pattern matching filters (i.e name LIKE '%abc%') are typically more selective.
+ 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+ 		if (!has_equality_filter && has_non_optional_filters) {
+-			cardinality_after_filters = MaxValue<idx_t>(
+-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+-			    1U);
++			double selectivity =
++			    has_string_pattern_filter ? STRING_PATTERN_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			cardinality_after_filters =
++			    MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * selectivity), 1U);
+ 		}
+ 		if (base_table_cardinality == 0) {
+ 			cardinality_after_filters = 0;
+diff --git a/src/optimizer/optimizer.cpp b/src/optimizer/optimizer.cpp
+index 1210285..d0a9de1 100644
+--- a/src/optimizer/optimizer.cpp
++++ b/src/optimizer/optimizer.cpp
+@@ -49,6 +49,8 @@ namespace duckdb {
+ Optimizer::Optimizer(Binder &binder, ClientContext &context) : context(context), binder(binder), rewriter(context) {
+ 	rewriter.rules.push_back(make_uniq<ConstantOrderNormalizationRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<ConstantFoldingRule>(rewriter));
++	// derive join-dependent filters before distributivity factors out common terms from the root OR
++	rewriter.rules.push_back(make_uniq<JoinDependentFilterRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<DistributivityRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<ArithmeticSimplificationRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<CaseSimplificationRule>(rewriter));
+@@ -66,7 +68,6 @@ Optimizer::Optimizer(Binder &binder, ClientContext &context) : context(context),
+ 	rewriter.rules.push_back(make_uniq<RegexOptimizationRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<EmptyNeedleRemovalRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<EnumComparisonRule>(rewriter));
+-	rewriter.rules.push_back(make_uniq<JoinDependentFilterRule>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<TimeStampComparison>(rewriter));
+ 	rewriter.rules.push_back(make_uniq<PredicateFactoringRule>(rewriter));
+ 
+diff --git a/src/planner/binder/query_node/plan_select_node.cpp b/src/planner/binder/query_node/plan_select_node.cpp
+index 335ccdb..7abd4cf 100644
+--- a/src/planner/binder/query_node/plan_select_node.cpp
++++ b/src/planner/binder/query_node/plan_select_node.cpp
+@@ -1,4 +1,14 @@
+ #include "duckdb/planner/binder.hpp"
++#include "duckdb/function/aggregate_function.hpp"
++#include "duckdb/planner/column_binding_map.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_subquery_expression.hpp"
++#include "duckdb/planner/expression/bound_window_expression.hpp"
++#include "duckdb/planner/expression_iterator.hpp"
++#include "duckdb/planner/operator/logical_window.hpp"
++#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/planner/operator/list.hpp"
+@@ -8,7 +18,375 @@
+ 
+ namespace duckdb {
+ 
++namespace {
++
++//! Rewrites a WHERE conjunct "... (SELECT min/max(x) FROM <subset of the outer FROM> WHERE <subset of the outer
++//! conjuncts> AND <equalities on outer columns>) ..." into a window aggregate over the outer join, partitioned by the
++//! correlated outer columns. This is valid when the tables of the subquery map onto distinct outer tables, every
++//! subquery conjunct is also an outer conjunct, and the remaining ("extra") outer tables and conjuncts only connect
++//! to the subquery tables through the correlated columns: then the rows of a partition are copies of the rows the
++//! subquery aggregates over, and MIN/MAX is insensitive to duplicates.
++class SubqueryToWindowRewriter {
++public:
++	explicit SubqueryToWindowRewriter(Binder &binder) : binder(binder) {
++	}
++
++	bool TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root);
++
++private:
++	static void CollectConjuncts(unique_ptr<Expression> &expr, vector<unique_ptr<Expression> *> &out) {
++		if (expr->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++			for (auto &child : expr->Cast<BoundConjunctionExpression>().children) {
++				CollectConjuncts(child, out);
++			}
++			return;
++		}
++		out.push_back(&expr);
++	}
++	static bool CollectJoinTree(LogicalOperator &op, vector<reference<LogicalGet>> &gets,
++	                            vector<reference<Expression>> &conjuncts) {
++		switch (op.type) {
++		case LogicalOperatorType::LOGICAL_GET:
++			gets.push_back(op.Cast<LogicalGet>());
++			return true;
++		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
++			return CollectJoinTree(*op.children[0], gets, conjuncts) && CollectJoinTree(*op.children[1], gets, conjuncts);
++		case LogicalOperatorType::LOGICAL_FILTER: {
++			auto &filter = op.Cast<LogicalFilter>();
++			if (!filter.projection_map.empty()) {
++				return false;
++			}
++			for (auto &expr : filter.expressions) {
++				conjuncts.push_back(*expr);
++			}
++			return CollectJoinTree(*op.children[0], gets, conjuncts);
++		}
++		default:
++			return false;
++		}
++	}
++	static bool OnlyReferencesTables(const Expression &expr, const unordered_set<idx_t> &tables) {
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			return false;
++		}
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr.Cast<BoundColumnRefExpression>();
++			return colref.depth == 0 && tables.find(colref.binding.table_index) != tables.end();
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
++			if (!OnlyReferencesTables(child, tables)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	//! Remap the bindings of a (copied) subquery expression to the outer bindings
++	bool Remap(unique_ptr<Expression> &expr) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY || expr->IsVolatile()) {
++			return false;
++		}
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++			auto &colref = expr->Cast<BoundColumnRefExpression>();
++			if (colref.depth == 0) {
++				auto entry = binding_map.find(colref.binding);
++				if (entry == binding_map.end()) {
++					return false;
++				}
++				colref.binding = entry->second;
++				return true;
++			}
++			if (colref.depth == 1 && extra_tables.find(colref.binding.table_index) != extra_tables.end()) {
++				colref.depth = 0;
++				return true;
++			}
++			return false;
++		}
++		bool result = true;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			if (result && !Remap(child)) {
++				result = false;
++			}
++		});
++		return result;
++	}
++	static bool ConjunctEquals(const Expression &a, const Expression &b) {
++		if (a.Equals(b)) {
++			return true;
++		}
++		if (a.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON ||
++		    b.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++			return false;
++		}
++		auto &left = a.Cast<BoundComparisonExpression>();
++		auto &right = b.Cast<BoundComparisonExpression>();
++		return right.GetExpressionType() == FlipComparisonExpression(left.GetExpressionType()) &&
++		       left.left->Equals(*right.right) && left.right->Equals(*right.left);
++	}
++	static bool IsSupportedPartitionType(const LogicalType &type) {
++		// partitioning must never be coarser than value equality (e.g. -0.0 vs 0.0 for floating point)
++		if (type.IsIntegral()) {
++			return true;
++		}
++		switch (type.id()) {
++		case LogicalTypeId::BOOLEAN:
++		case LogicalTypeId::VARCHAR:
++		case LogicalTypeId::DATE:
++		case LogicalTypeId::TIMESTAMP:
++		case LogicalTypeId::DECIMAL:
++		case LogicalTypeId::UUID:
++			return true;
++		default:
++			return false;
++		}
++	}
++	static optional_ptr<unique_ptr<Expression>> FindSubquery(unique_ptr<Expression> &expr, idx_t &count) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
++			count++;
++			return &expr;
++		}
++		optional_ptr<unique_ptr<Expression>> result;
++		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
++			auto child_result = FindSubquery(child, count);
++			if (child_result) {
++				result = child_result;
++			}
++		});
++		return result;
++	}
++
++private:
++	Binder &binder;
++	column_binding_map_t<ColumnBinding> binding_map;
++	unordered_set<idx_t> extra_tables;
++};
++
++bool SubqueryToWindowRewriter::TryRewrite(unique_ptr<Expression> &condition, unique_ptr<LogicalOperator> &root) {
++	if (!condition->HasSubquery()) {
++		return false;
++	}
++	// (1) find exactly one conjunct holding exactly one correlated scalar subquery
++	vector<unique_ptr<Expression> *> conjuncts;
++	CollectConjuncts(condition, conjuncts);
++	optional_idx subquery_conjunct;
++	optional_ptr<unique_ptr<Expression>> subquery_ptr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		auto &conjunct = *conjuncts[i];
++		if (conjunct->IsVolatile()) {
++			return false;
++		}
++		if (!conjunct->HasSubquery()) {
++			continue;
++		}
++		idx_t count = 0;
++		auto found = FindSubquery(conjunct, count);
++		if (subquery_conjunct.IsValid() || count != 1 || !found) {
++			return false;
++		}
++		subquery_conjunct = i;
++		subquery_ptr = found;
++	}
++	if (!subquery_conjunct.IsValid()) {
++		return false;
++	}
++	auto &subquery = (*subquery_ptr)->Cast<BoundSubqueryExpression>();
++	if (subquery.subquery_type != SubqueryType::SCALAR || !subquery.IsCorrelated() || !subquery.subquery.plan) {
++		return false;
++	}
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (col.depth != 1 || !IsSupportedPartitionType(col.type)) {
++			return false;
++		}
++	}
++	// (2) peel the subquery plan: projections of the single aggregate, then an ungrouped MIN/MAX aggregate
++	reference<LogicalOperator> sub_op = *subquery.subquery.plan;
++	optional_ptr<ColumnBinding> projected;
++	ColumnBinding target;
++	while (sub_op.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
++		auto &proj = sub_op.get().Cast<LogicalProjection>();
++		if (proj.expressions.size() != 1 || proj.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
++			return false;
++		}
++		if (projected && (projected->table_index != proj.table_index || projected->column_index != 0)) {
++			return false;
++		}
++		auto &colref = proj.expressions[0]->Cast<BoundColumnRefExpression>();
++		if (colref.depth != 0) {
++			return false;
++		}
++		target = colref.binding;
++		projected = &target;
++		sub_op = *proj.children[0];
++	}
++	if (sub_op.get().type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
++		return false;
++	}
++	auto &aggr_op = sub_op.get().Cast<LogicalAggregate>();
++	if (!aggr_op.groups.empty() || aggr_op.grouping_sets.size() > 1 || !aggr_op.grouping_functions.empty() ||
++	    aggr_op.expressions.size() != 1 || aggr_op.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
++		return false;
++	}
++	if (aggr_op.grouping_sets.size() == 1 && !aggr_op.grouping_sets[0].empty()) {
++		return false;
++	}
++	if (projected && (projected->table_index != aggr_op.aggregate_index || projected->column_index != 0)) {
++		return false;
++	}
++	auto &aggr = aggr_op.expressions[0]->Cast<BoundAggregateExpression>();
++	if ((aggr.function.name != "min" && aggr.function.name != "max") || aggr.children.size() != 1 ||
++	    aggr.IsDistinct() || aggr.filter || aggr.order_bys || aggr.return_type != subquery.return_type) {
++		return false;
++	}
++	vector<reference<LogicalGet>> sub_gets;
++	vector<reference<Expression>> sub_conjuncts;
++	if (!CollectJoinTree(*aggr_op.children[0], sub_gets, sub_conjuncts)) {
++		return false;
++	}
++	// (3) the outer FROM must be a plain join tree as well
++	vector<reference<LogicalGet>> outer_gets;
++	vector<reference<Expression>> outer_conjuncts;
++	if (!CollectJoinTree(*root, outer_gets, outer_conjuncts)) {
++		return false;
++	}
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i != subquery_conjunct.GetIndex()) {
++			outer_conjuncts.push_back(**conjuncts[i]);
++		}
++	}
++	// (4) match every subquery scan to a distinct outer scan of the same table
++	vector<bool> outer_matched(outer_gets.size(), false);
++	for (auto &sub_get_ref : sub_gets) {
++		auto &sub_get = sub_get_ref.get();
++		auto table = sub_get.GetTable();
++		if (!table || !sub_get.table_filters.filters.empty() || sub_get.dynamic_filters || sub_get.ordinality_idx.IsValid()) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t o = 0; o < outer_gets.size() && !found; o++) {
++			auto &outer_get = outer_gets[o].get();
++			if (outer_matched[o] || outer_get.GetTable().get() != table.get() ||
++			    outer_get.function.name != sub_get.function.name || !outer_get.table_filters.filters.empty() ||
++			    outer_get.dynamic_filters || outer_get.ordinality_idx.IsValid()) {
++				continue;
++			}
++			found = true;
++			outer_matched[o] = true;
++			auto &sub_ids = sub_get.GetColumnIds();
++			auto &outer_ids = outer_get.GetColumnIds();
++			for (idx_t s = 0; s < sub_ids.size(); s++) {
++				for (idx_t k = 0; k < outer_ids.size(); k++) {
++					if (sub_ids[s] == outer_ids[k]) {
++						binding_map[ColumnBinding(sub_get.table_index, s)] = ColumnBinding(outer_get.table_index, k);
++						break;
++					}
++				}
++			}
++		}
++		if (!found) {
++			return false;
++		}
++	}
++	for (idx_t o = 0; o < outer_gets.size(); o++) {
++		if (!outer_matched[o]) {
++			extra_tables.insert(outer_gets[o].get().table_index);
++		}
++	}
++	if (extra_tables.empty()) {
++		return false;
++	}
++	// (5) every subquery conjunct must be an outer conjunct after remapping
++	vector<bool> conjunct_matched(outer_conjuncts.size(), false);
++	column_binding_set_t equality_columns;
++	for (auto &sub_conjunct : sub_conjuncts) {
++		auto remapped = sub_conjunct.get().Copy();
++		if (!Remap(remapped)) {
++			return false;
++		}
++		bool found = false;
++		for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++			if (ConjunctEquals(*remapped, outer_conjuncts[k].get())) {
++				conjunct_matched[k] = true;
++				found = true;
++			}
++		}
++		if (!found) {
++			return false;
++		}
++		if (remapped->GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
++			auto &comp = remapped->Cast<BoundComparisonExpression>();
++			for (auto side : {comp.left.get(), comp.right.get()}) {
++				if (side->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++					equality_columns.insert(side->Cast<BoundColumnRefExpression>().binding);
++				}
++			}
++		}
++	}
++	// the remaining outer conjuncts may only restrict the extra tables
++	for (idx_t k = 0; k < outer_conjuncts.size(); k++) {
++		auto &conjunct = outer_conjuncts[k].get();
++		if (conjunct.IsVolatile() || conjunct.HasSubquery()) {
++			return false;
++		}
++		if (!conjunct_matched[k] && !OnlyReferencesTables(conjunct, extra_tables)) {
++			return false;
++		}
++	}
++	// every correlated column belongs to an extra table and is NULL-rejected by an equality
++	vector<unique_ptr<Expression>> partitions;
++	for (auto &col : subquery.binder->correlated_columns) {
++		if (extra_tables.find(col.binding.table_index) == extra_tables.end() ||
++		    equality_columns.find(col.binding) == equality_columns.end()) {
++			return false;
++		}
++		partitions.push_back(make_uniq<BoundColumnRefExpression>(col.name, col.type, col.binding));
++	}
++	auto aggr_child = aggr.children[0]->Copy();
++	if (!Remap(aggr_child)) {
++		return false;
++	}
++
++	// (6) rewrite: filter(other conjuncts) -> window(min/max over partition) -> filter(subquery conjunct)
++	auto window_index = binder.GenerateTableIndex();
++	auto window_expr = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_AGGREGATE, aggr.return_type,
++	                                                    make_uniq<AggregateFunction>(aggr.function),
++	                                                    aggr.bind_info ? aggr.bind_info->Copy() : nullptr);
++	window_expr->children.push_back(std::move(aggr_child));
++	window_expr->partitions = std::move(partitions);
++	window_expr->ignore_nulls = false;
++	window_expr->distinct = false;
++	window_expr->start = WindowBoundary::UNBOUNDED_PRECEDING;
++	window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;
++	auto result_name = subquery.GetName();
++	auto result_type = subquery.return_type;
++
++	// replace the subquery by a reference to the window result (this destroys the subquery)
++	*subquery_ptr = make_uniq<BoundColumnRefExpression>(result_name, result_type, ColumnBinding(window_index, 0));
++	auto filter = make_uniq<LogicalFilter>();
++	unique_ptr<Expression> subquery_expr;
++	for (idx_t i = 0; i < conjuncts.size(); i++) {
++		if (i == subquery_conjunct.GetIndex()) {
++			subquery_expr = std::move(*conjuncts[i]);
++		} else {
++			filter->expressions.push_back(std::move(*conjuncts[i]));
++		}
++	}
++	if (!filter->expressions.empty()) {
++		filter->AddChild(std::move(root));
++		root = std::move(filter);
++	}
++	auto window = make_uniq<LogicalWindow>(window_index);
++	window->expressions.push_back(std::move(window_expr));
++	window->AddChild(std::move(root));
++	root = std::move(window);
++	condition = std::move(subquery_expr);
++	return true;
++}
++
++} // namespace
++
+ unique_ptr<LogicalOperator> Binder::PlanFilter(unique_ptr<Expression> condition, unique_ptr<LogicalOperator> root) {
++	SubqueryToWindowRewriter rewriter(*this);
++	rewriter.TryRewrite(condition, root);
+ 	PlanSubqueries(condition, root);
+ 	auto filter = make_uniq<LogicalFilter>(std::move(condition));
+ 	filter->AddChild(std::move(root));
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..9936cc4 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -11,17 +11,97 @@ static constexpr idx_t LOG_SECTOR_SIZE = 6;             // a sector is 64 bits,
+ static constexpr idx_t SHIFT_MASK = 0x3F3F3F3F3F3F3F3F; // 6 bits for 64 positions
+ static constexpr idx_t N_BITS = 4;                      // the number of bits to set per hash
+ 
++// exact bitmap mode: at most this many bits per build row, and at most this many bits in total
++// (the join hash table's pointer table already uses at least 128 bits per build row)
++static constexpr idx_t MAX_EXACT_BITS_PER_KEY = 128;
++static constexpr idx_t MAX_EXACT_BITS = (1ULL << 29);
++
++static bool ExactKeyTypeSupported(PhysicalType type) {
++	switch (type) {
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int64_t ExactKeyValue(const Value &value) {
++	switch (value.type().InternalType()) {
++	case PhysicalType::INT8:
++		return value.GetValueUnsafe<int8_t>();
++	case PhysicalType::INT16:
++		return value.GetValueUnsafe<int16_t>();
++	case PhysicalType::INT32:
++		return value.GetValueUnsafe<int32_t>();
++	case PhysicalType::INT64:
++		return value.GetValueUnsafe<int64_t>();
++	case PhysicalType::UINT8:
++		return value.GetValueUnsafe<uint8_t>();
++	case PhysicalType::UINT16:
++		return value.GetValueUnsafe<uint16_t>();
++	case PhysicalType::UINT32:
++		return value.GetValueUnsafe<uint32_t>();
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
++void BloomFilter::SetKeyRange(const Value &min, const Value &max) {
++	has_key_range = false;
++	if (min.IsNull() || max.IsNull() || min.type() != max.type()) {
++		return;
++	}
++	const auto type = min.type().InternalType();
++	if (!ExactKeyTypeSupported(type)) {
++		return;
++	}
++	const auto min_key = ExactKeyValue(min);
++	const auto max_key = ExactKeyValue(max);
++	if (min_key > max_key) {
++		return;
++	}
++	has_key_range = true;
++	exact_type = type;
++	exact_min = min_key;
++	exact_max = max_key;
++}
++
+ void BloomFilter::Initialize(ClientContext &context_p, idx_t number_of_rows) {
+ 	BufferManager &buffer_manager = BufferManager::GetBufferManager(context_p);
+ 
+-	const idx_t min_bits = std::max<idx_t>(MIN_NUM_BITS, number_of_rows * MIN_NUM_BITS_PER_KEY);
+-	num_sectors = std::min(NextPowerOfTwo(min_bits) >> LOG_SECTOR_SIZE, MAX_NUM_SECTORS);
+-	bitmask = num_sectors - 1;
++	exact = false;
++	exact_overflow.store(false, std::memory_order_relaxed);
++	if (has_key_range) {
++		// range - 1 computed in unsigned arithmetic, min <= max is guaranteed by SetKeyRange
++		const uint64_t range_minus_one = static_cast<uint64_t>(exact_max) - static_cast<uint64_t>(exact_min);
++		if (range_minus_one < MAX_EXACT_BITS && range_minus_one < number_of_rows * MAX_EXACT_BITS_PER_KEY) {
++			exact = true;
++			exact_bits = range_minus_one + 1;
++		}
++	}
++
++	idx_t num_words;
++	if (exact) {
++		num_words = (exact_bits + 63) / 64;
++		num_sectors = 0;
++		bitmask = 0;
++	} else {
++		const idx_t min_bits = std::max<idx_t>(MIN_NUM_BITS, number_of_rows * MIN_NUM_BITS_PER_KEY);
++		num_sectors = std::min(NextPowerOfTwo(min_bits) >> LOG_SECTOR_SIZE, MAX_NUM_SECTORS);
++		bitmask = num_sectors - 1;
++		num_words = num_sectors;
++	}
+ 
+-	buf_ = buffer_manager.GetBufferAllocator().Allocate(64 + num_sectors * sizeof(uint64_t));
++	buf_ = buffer_manager.GetBufferAllocator().Allocate(64 + num_words * sizeof(uint64_t));
+ 	// make sure blocks is a 64-byte aligned pointer, i.e., cache-line aligned
+ 	bf = reinterpret_cast<uint64_t *>((64ULL + reinterpret_cast<uint64_t>(buf_.get())) & ~63ULL);
+-	std::fill_n(bf, num_sectors, 0);
++	std::fill_n(bf, num_words, 0);
+ 
+ 	initialized = true;
+ }
+@@ -93,6 +173,112 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 	}
+ }
+ 
++template <class T>
++static idx_t TemplatedFilterExact(const BloomFilter &bf, const T *data, const SelectionVector &data_sel,
++                                  const ValidityMask &validity, const SelectionVector &sel, const idx_t count,
++                                  const bool filters_null_values, SelectionVector &result_sel) {
++	idx_t found_count = 0;
++	const bool sel_set = sel.IsSet();
++	if (validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			const auto row_idx = sel_set ? sel.get_index(i) : i;
++			const auto data_idx = data_sel.get_index(i);
++			result_sel.set_index(found_count, row_idx);
++			found_count += bf.LookupKey(static_cast<int64_t>(data[data_idx]));
++		}
++	} else {
++		for (idx_t i = 0; i < count; i++) {
++			const auto row_idx = sel_set ? sel.get_index(i) : i;
++			const auto data_idx = data_sel.get_index(i);
++			result_sel.set_index(found_count, row_idx);
++			if (validity.RowIsValid(data_idx)) {
++				found_count += bf.LookupKey(static_cast<int64_t>(data[data_idx]));
++			} else {
++				found_count += !filters_null_values;
++			}
++		}
++	}
++	return found_count;
++}
++
++idx_t BFTableFilter::FilterExact(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
++                                 BFTableFilterState &state) const {
++	// get a view on the keys such that entry i corresponds to the i-th approved tuple
++	UnifiedVectorFormat vdata;
++	const SelectionVector *data_sel;
++	const_data_ptr_t data;
++	const ValidityMask *validity;
++	if (keys_v.GetVectorType() == VectorType::FLAT_VECTOR) {
++		data = FlatVector::GetData(keys_v);
++		validity = &FlatVector::Validity(keys_v);
++		data_sel = sel.IsSet() ? &sel : FlatVector::IncrementalSelectionVector();
++	} else {
++		if (sel.IsSet()) {
++			state.keys_sliced_v.Slice(keys_v, sel, approved_tuple_count);
++			state.keys_sliced_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		} else {
++			keys_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		}
++		data = vdata.data;
++		validity = &vdata.validity;
++		data_sel = vdata.sel;
++	}
++
++	idx_t found_count;
++	switch (filter.ExactKeyType()) {
++	case PhysicalType::INT8:
++		found_count = TemplatedFilterExact<int8_t>(filter, reinterpret_cast<const int8_t *>(data), *data_sel, *validity,
++		                                           sel, approved_tuple_count, filters_null_values, state.bf_sel);
++		break;
++	case PhysicalType::INT16:
++		found_count = TemplatedFilterExact<int16_t>(filter, reinterpret_cast<const int16_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::INT32:
++		found_count = TemplatedFilterExact<int32_t>(filter, reinterpret_cast<const int32_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::INT64:
++		found_count = TemplatedFilterExact<int64_t>(filter, reinterpret_cast<const int64_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::UINT8:
++		found_count = TemplatedFilterExact<uint8_t>(filter, reinterpret_cast<const uint8_t *>(data), *data_sel,
++		                                            *validity, sel, approved_tuple_count, filters_null_values,
++		                                            state.bf_sel);
++		break;
++	case PhysicalType::UINT16:
++		found_count = TemplatedFilterExact<uint16_t>(filter, reinterpret_cast<const uint16_t *>(data), *data_sel,
++		                                             *validity, sel, approved_tuple_count, filters_null_values,
++		                                             state.bf_sel);
++		break;
++	case PhysicalType::UINT32:
++		found_count = TemplatedFilterExact<uint32_t>(filter, reinterpret_cast<const uint32_t *>(data), *data_sel,
++		                                             *validity, sel, approved_tuple_count, filters_null_values,
++		                                             state.bf_sel);
++		break;
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++
++	if (found_count == approved_tuple_count) {
++		return approved_tuple_count;
++	}
++	// state.bf_sel holds the original row indices of the surviving tuples
++	if (sel.IsSet()) {
++		for (idx_t idx = 0; idx < found_count; idx++) {
++			sel.set_index(idx, state.bf_sel.get_index(idx));
++		}
++	} else {
++		sel.Initialize(state.bf_sel);
++	}
++	approved_tuple_count = found_count;
++	return approved_tuple_count;
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+@@ -101,6 +287,17 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		state.current_capacity = approved_tuple_count;
+ 	}
+ 
++	if (filter.IsExact()) {
++		if (filter.ExactOverflow()) {
++			return approved_tuple_count;
++		}
++		if (keys_v.GetType().InternalType() == filter.ExactKeyType()) {
++			return FilterExact(keys_v, sel, approved_tuple_count, state);
++		}
++		// unexpected key type: we cannot filter, let everything pass
++		return approved_tuple_count;
++	}
++
+ 	HashInternal(keys_v, sel, approved_tuple_count, state);
+ 
+ 	idx_t found_count;
+@@ -133,6 +330,15 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ }
+ 
+ bool BFTableFilter::FilterValue(const Value &value) const {
++	if (filter.IsExact()) {
++		if (value.IsNull()) {
++			return !filters_null_values;
++		}
++		if (filter.ExactOverflow() || value.type().InternalType() != filter.ExactKeyType()) {
++			return true;
++		}
++		return filter.LookupKey(ExactKeyValue(value));
++	}
+ 	const auto hash = value.Hash();
+ 	return filter.LookupOne(hash);
+ }
+@@ -171,6 +377,10 @@ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, con
+ }
+ 
+ FilterPropagateResult BFTableFilter::CheckStatistics(BaseStatistics &stats) const {
++	if (filter.IsExact()) {
++		// the min/max filters pushed alongside take care of range-based pruning
++		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
++	}
+ 	switch (stats.GetType().InternalType()) {
+ 	case PhysicalType::UINT8:
+ 		return TemplatedCheckStatistics<uint8_t>(filter, stats);
+diff --git a/src/storage/data_table.cpp b/src/storage/data_table.cpp
+index 456ca86..b7bb64c 100644
+--- a/src/storage/data_table.cpp
++++ b/src/storage/data_table.cpp
+@@ -15,6 +15,7 @@
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/parser/constraints/list.hpp"
+ #include "duckdb/planner/constraints/list.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+@@ -272,6 +273,10 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
+ 	idx_t parallel_scan_vector_count = row_group_size / STANDARD_VECTOR_SIZE;
+ 	if (ClientConfig::GetConfig(context).verify_parallelism) {
+ 		parallel_scan_vector_count = 1;
++	} else {
++		auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++		parallel_scan_vector_count =
++		    RowGroupCollection::GetParallelScanMorselVectors(GetTotalRows(), row_group_size, threads);
+ 	}
+ 	idx_t parallel_scan_tuple_count = STANDARD_VECTOR_SIZE * parallel_scan_vector_count;
+ 	return GetTotalRows() / parallel_scan_tuple_count + 1;
+diff --git a/src/storage/table/column_segment.cpp b/src/storage/table/column_segment.cpp
+index d20171f..76d18e8 100644
+--- a/src/storage/table/column_segment.cpp
++++ b/src/storage/table/column_segment.cpp
+@@ -7,6 +7,12 @@
+ #include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
+ #include "duckdb/planner/filter/struct_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/expression/bound_between_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/storage/data_pointer.hpp"
+ #include "duckdb/storage/table/append_state.hpp"
+ #include "duckdb/storage/table/scan_state.hpp"
+@@ -402,6 +408,324 @@ static idx_t TemplatedNullSelection(UnifiedVectorFormat &vdata, SelectionVector
+ 	}
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Dense mask evaluation of AND/OR trees of constant comparisons
++//===--------------------------------------------------------------------===//
++static bool IsDenseComparison(ExpressionType type) {
++	switch (type) {
++	case ExpressionType::COMPARE_EQUAL:
++	case ExpressionType::COMPARE_NOTEQUAL:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool SupportsDenseMask(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONSTANT_COMPARISON: {
++		auto &constant_filter = filter.Cast<ConstantFilter>();
++		return !constant_filter.constant.IsNull() && IsDenseComparison(constant_filter.comparison_type);
++	}
++	case TableFilterType::CONJUNCTION_AND:
++	case TableFilterType::CONJUNCTION_OR: {
++		auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
++		                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
++		                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
++		if (conjunction.child_filters.empty()) {
++			return false;
++		}
++		for (auto &child : conjunction.child_filters) {
++			if (!SupportsDenseMask(*child)) {
++				return false;
++			}
++		}
++		return true;
++	}
++	default:
++		return false;
++	}
++}
++
++template <class T, class OP>
++static void DenseComparisonMask(const T *__restrict data, const T predicate, idx_t count, uint8_t *__restrict mask) {
++	for (idx_t i = 0; i < count; i++) {
++		mask[i] = OP::Operation(data[i], predicate);
++	}
++}
++
++template <class T>
++static void DenseComparison(ExpressionType type, const T *data, const T predicate, idx_t count, uint8_t *mask) {
++	switch (type) {
++	case ExpressionType::COMPARE_EQUAL:
++		DenseComparisonMask<T, Equals>(data, predicate, count, mask);
++		break;
++	case ExpressionType::COMPARE_NOTEQUAL:
++		DenseComparisonMask<T, NotEquals>(data, predicate, count, mask);
++		break;
++	case ExpressionType::COMPARE_LESSTHAN:
++		DenseComparisonMask<T, LessThan>(data, predicate, count, mask);
++		break;
++	case ExpressionType::COMPARE_GREATERTHAN:
++		DenseComparisonMask<T, GreaterThan>(data, predicate, count, mask);
++		break;
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		DenseComparisonMask<T, LessThanEquals>(data, predicate, count, mask);
++		break;
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++		DenseComparisonMask<T, GreaterThanEquals>(data, predicate, count, mask);
++		break;
++	default:
++		throw InternalException("Unsupported comparison type in DenseComparison");
++	}
++}
++
++static void DenseCombine(bool is_and, uint8_t *mask, const uint8_t *child_mask, idx_t count) {
++	if (is_and) {
++		for (idx_t i = 0; i < count; i++) {
++			mask[i] &= child_mask[i];
++		}
++	} else {
++		for (idx_t i = 0; i < count; i++) {
++			mask[i] |= child_mask[i];
++		}
++	}
++}
++
++static bool IsDenseColumnRef(const Expression &expr, const LogicalType &type) {
++	return expr.GetExpressionClass() == ExpressionClass::BOUND_REF &&
++	       expr.Cast<BoundReferenceExpression>().index == 0 && expr.return_type == type;
++}
++
++static bool IsDenseConstant(const Expression &expr, const LogicalType &type) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return false;
++	}
++	auto &value = expr.Cast<BoundConstantExpression>().value;
++	return !value.IsNull() && value.type() == type;
++}
++
++//! Whether the expression is a tree of AND/OR over comparisons of the (single) column with constants
++static bool SupportsDenseExpression(const Expression &expr, const LogicalType &type) {
++	switch (expr.GetExpressionClass()) {
++	case ExpressionClass::BOUND_CONJUNCTION: {
++		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
++		if (conjunction.children.empty()) {
++			return false;
++		}
++		for (auto &child : conjunction.children) {
++			if (!SupportsDenseExpression(*child, type)) {
++				return false;
++			}
++		}
++		return true;
++	}
++	case ExpressionClass::BOUND_COMPARISON: {
++		auto &comparison = expr.Cast<BoundComparisonExpression>();
++		if (!IsDenseComparison(comparison.GetExpressionType())) {
++			return false;
++		}
++		return (IsDenseColumnRef(*comparison.left, type) && IsDenseConstant(*comparison.right, type)) ||
++		       (IsDenseConstant(*comparison.left, type) && IsDenseColumnRef(*comparison.right, type));
++	}
++	case ExpressionClass::BOUND_BETWEEN: {
++		auto &between = expr.Cast<BoundBetweenExpression>();
++		return IsDenseColumnRef(*between.input, type) && IsDenseConstant(*between.lower, type) &&
++		       IsDenseConstant(*between.upper, type);
++	}
++	default:
++		return false;
++	}
++}
++
++template <class T>
++static void DenseExpressionMask(const Expression &expr, const T *data, idx_t count, uint8_t *mask) {
++	switch (expr.GetExpressionClass()) {
++	case ExpressionClass::BOUND_CONJUNCTION: {
++		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
++		bool is_and = conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
++		D_ASSERT(is_and || conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_OR);
++		DenseExpressionMask<T>(*conjunction.children[0], data, count, mask);
++		uint8_t child_mask[STANDARD_VECTOR_SIZE];
++		for (idx_t child_idx = 1; child_idx < conjunction.children.size(); child_idx++) {
++			DenseExpressionMask<T>(*conjunction.children[child_idx], data, count, child_mask);
++			DenseCombine(is_and, mask, child_mask, count);
++		}
++		break;
++	}
++	case ExpressionClass::BOUND_COMPARISON: {
++		auto &comparison = expr.Cast<BoundComparisonExpression>();
++		auto comparison_type = comparison.GetExpressionType();
++		if (comparison.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
++			// constant on the left: flip the comparison
++			auto predicate = comparison.left->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++			DenseComparison<T>(FlipComparisonExpression(comparison_type), data, predicate, count, mask);
++		} else {
++			auto predicate = comparison.right->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++			DenseComparison<T>(comparison_type, data, predicate, count, mask);
++		}
++		break;
++	}
++	case ExpressionClass::BOUND_BETWEEN: {
++		auto &between = expr.Cast<BoundBetweenExpression>();
++		auto lower = between.lower->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++		auto upper = between.upper->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++		DenseComparison<T>(between.lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO
++		                                           : ExpressionType::COMPARE_GREATERTHAN,
++		                   data, lower, count, mask);
++		uint8_t child_mask[STANDARD_VECTOR_SIZE];
++		DenseComparison<T>(between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO
++		                                           : ExpressionType::COMPARE_LESSTHAN,
++		                   data, upper, count, child_mask);
++		DenseCombine(true, mask, child_mask, count);
++		break;
++	}
++	default:
++		throw InternalException("Unsupported expression in DenseExpressionMask");
++	}
++}
++
++//! Evaluates the filter on rows [0, count) of the flat data array, writing 1/0 per row into mask
++//! (the validity of the rows is not taken into account)
++template <class T>
++static void DenseFilterMask(const TableFilter &filter, const T *data, idx_t count, uint8_t *mask) {
++	if (filter.filter_type == TableFilterType::EXPRESSION_FILTER) {
++		DenseExpressionMask<T>(*filter.Cast<ExpressionFilter>().expr, data, count, mask);
++		return;
++	}
++	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
++		auto &constant_filter = filter.Cast<ConstantFilter>();
++		auto predicate = constant_filter.constant.GetValueUnsafe<T>();
++		DenseComparison<T>(constant_filter.comparison_type, data, predicate, count, mask);
++		return;
++	}
++	D_ASSERT(filter.filter_type == TableFilterType::CONJUNCTION_AND ||
++	         filter.filter_type == TableFilterType::CONJUNCTION_OR);
++	bool is_and = filter.filter_type == TableFilterType::CONJUNCTION_AND;
++	auto &conjunction = is_and ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
++	                           : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
++	DenseFilterMask<T>(*conjunction.child_filters[0], data, count, mask);
++	uint8_t child_mask[STANDARD_VECTOR_SIZE];
++	for (idx_t child_idx = 1; child_idx < conjunction.child_filters.size(); child_idx++) {
++		DenseFilterMask<T>(*conjunction.child_filters[child_idx], data, count, child_mask);
++		DenseCombine(is_and, mask, child_mask, count);
++	}
++}
++
++template <class T>
++static void DenseFilterSelection(SelectionVector &sel, UnifiedVectorFormat &vdata, const TableFilter &filter,
++                                 idx_t &approved_tuple_count) {
++	D_ASSERT(approved_tuple_count <= STANDARD_VECTOR_SIZE);
++	uint8_t mask[STANDARD_VECTOR_SIZE];
++	auto data = UnifiedVectorFormat::GetData<T>(vdata);
++	if (sel.IsSet()) {
++		// gather the selected values so the filter is evaluated only on the selected rows
++		T values[STANDARD_VECTOR_SIZE];
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			values[i] = data[sel.get_index(i)];
++		}
++		DenseFilterMask<T>(filter, values, approved_tuple_count, mask);
++	} else {
++		DenseFilterMask<T>(filter, data, approved_tuple_count, mask);
++	}
++	auto &validity = vdata.validity;
++	SelectionVector result_sel(approved_tuple_count);
++	idx_t result_count = 0;
++	if (validity.AllValid()) {
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			auto idx = sel.get_index(i);
++			result_sel.set_index(result_count, idx);
++			result_count += mask[i];
++		}
++	} else {
++		// NULL rows never pass a tree of AND/OR comparisons
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			auto idx = sel.get_index(i);
++			result_sel.set_index(result_count, idx);
++			result_count += mask[i] && validity.RowIsValid(idx);
++		}
++	}
++	sel.Initialize(result_sel);
++	approved_tuple_count = result_count;
++}
++
++//! Evaluate an AND/OR tree of constant comparisons with one dense pass per comparison when possible
++static bool TryDenseFilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
++                                    const TableFilter &filter, idx_t &approved_tuple_count) {
++	if (approved_tuple_count == 0 || approved_tuple_count > STANDARD_VECTOR_SIZE || vdata.sel->IsSet()) {
++		return false;
++	}
++	switch (vector.GetType().InternalType()) {
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++	case PhysicalType::UINT64:
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::INT128:
++	case PhysicalType::UINT128:
++	case PhysicalType::FLOAT:
++	case PhysicalType::DOUBLE:
++		break;
++	default:
++		return false;
++	}
++	if (filter.filter_type == TableFilterType::EXPRESSION_FILTER) {
++		if (!SupportsDenseExpression(*filter.Cast<ExpressionFilter>().expr, vector.GetType())) {
++			return false;
++		}
++	} else if (!SupportsDenseMask(filter)) {
++		return false;
++	}
++	switch (vector.GetType().InternalType()) {
++	case PhysicalType::UINT8:
++		DenseFilterSelection<uint8_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::UINT16:
++		DenseFilterSelection<uint16_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::UINT32:
++		DenseFilterSelection<uint32_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::UINT64:
++		DenseFilterSelection<uint64_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::INT8:
++		DenseFilterSelection<int8_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::INT16:
++		DenseFilterSelection<int16_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::INT32:
++		DenseFilterSelection<int32_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::INT64:
++		DenseFilterSelection<int64_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::INT128:
++		DenseFilterSelection<hugeint_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::UINT128:
++		DenseFilterSelection<uhugeint_t>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::FLOAT:
++		DenseFilterSelection<float>(sel, vdata, filter, approved_tuple_count);
++		break;
++	case PhysicalType::DOUBLE:
++		DenseFilterSelection<double>(sel, vdata, filter, approved_tuple_count);
++		break;
++	default:
++		throw InternalException("Unsupported type in TryDenseFilterSelection");
++	}
++	return true;
++}
++
+ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
+                                      const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
+                                      idx_t &approved_tuple_count) {
+@@ -412,10 +736,69 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
+ 	}
+ 	case TableFilterType::CONJUNCTION_OR: {
+ 		// similar to the CONJUNCTION_AND, but we need to take care of the SelectionVectors (OR all of them)
++		if (TryDenseFilterSelection(sel, vector, vdata, filter, approved_tuple_count)) {
++			return approved_tuple_count;
++		}
+ 		auto &state = filter_state.Cast<ConjunctionOrFilterState>();
+ 		idx_t count_total = 0;
+ 		SelectionVector result_sel(approved_tuple_count);
+ 		auto &conjunction_or = filter.Cast<ConjunctionOrFilter>();
++
++		// fast path: union via a per-row bitmap (linear time) when all row indices fit in a vector
++		bool indices_in_range = true;
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			if (sel.get_index(i) >= STANDARD_VECTOR_SIZE) {
++				indices_in_range = false;
++				break;
++			}
++		}
++		if (indices_in_range) {
++			bool matched[STANDARD_VECTOR_SIZE];
++			for (idx_t i = 0; i < approved_tuple_count; i++) {
++				matched[sel.get_index(i)] = false;
++			}
++			idx_t matched_count = 0;
++			for (idx_t child_idx = 0; child_idx < conjunction_or.child_filters.size(); child_idx++) {
++				if (matched_count == approved_tuple_count) {
++					break;
++				}
++				// gather the rows that have not passed any previous child yet
++				SelectionVector temp_sel(approved_tuple_count);
++				idx_t remaining_count = 0;
++				for (idx_t i = 0; i < approved_tuple_count; i++) {
++					auto idx = sel.get_index(i);
++					if (!matched[idx]) {
++						temp_sel.set_index(remaining_count++, idx);
++					}
++				}
++				if (remaining_count == 0) {
++					break;
++				}
++				auto &child_filter = *conjunction_or.child_filters[child_idx];
++				idx_t temp_tuple_count = remaining_count;
++				idx_t temp_count = FilterSelection(temp_sel, vector, vdata, child_filter, *state.child_states[child_idx],
++				                                   scan_count, temp_tuple_count);
++				for (idx_t i = 0; i < temp_count; i++) {
++					auto new_idx = temp_sel.get_index(i);
++					D_ASSERT(new_idx < STANDARD_VECTOR_SIZE);
++					if (!matched[new_idx]) {
++						matched[new_idx] = true;
++						matched_count++;
++					}
++				}
++			}
++			// emit matched rows in input order
++			for (idx_t i = 0; i < approved_tuple_count; i++) {
++				auto idx = sel.get_index(i);
++				if (matched[idx]) {
++					result_sel.set_index(count_total++, idx);
++				}
++			}
++			sel.Initialize(result_sel);
++			approved_tuple_count = count_total;
++			return approved_tuple_count;
++		}
++
+ 		for (idx_t child_idx = 0; child_idx < conjunction_or.child_filters.size(); child_idx++) {
+ 			auto &child_filter = *conjunction_or.child_filters[child_idx];
+ 			SelectionVector temp_sel;
+@@ -561,6 +944,9 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
+ 		return bloom_filter.Filter(vector, sel, approved_tuple_count, state);
+ 	}
+ 	case TableFilterType::EXPRESSION_FILTER: {
++		if (TryDenseFilterSelection(sel, vector, vdata, filter, approved_tuple_count)) {
++			return approved_tuple_count;
++		}
+ 		auto &state = filter_state.Cast<ExpressionFilterState>();
+ 		SelectionVector result_sel(approved_tuple_count);
+ 		if (scan_count > STANDARD_VECTOR_SIZE) {
+diff --git a/src/storage/table/row_group_collection.cpp b/src/storage/table/row_group_collection.cpp
+index 9adc32f..c7b3d32 100644
+--- a/src/storage/table/row_group_collection.cpp
++++ b/src/storage/table/row_group_collection.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/main/profiling_utils.hpp"
+ #include "duckdb/main/query_profiler.hpp"
+ #include "duckdb/parallel/task_executor.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
+ #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+ #include "duckdb/storage/data_table.hpp"
+@@ -275,6 +276,18 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
+ 	return row_group.GetNode().InitializeScanWithOffset(state, row_group, vector_index);
+ }
+ 
++idx_t RowGroupCollection::GetParallelScanMorselVectors(idx_t total_rows, idx_t row_group_size, idx_t thread_count) {
++	// aim for a few morsels per thread, but never smaller than the minimum morsel size or larger than a row group
++	static constexpr idx_t MORSELS_PER_THREAD = 4;
++	static constexpr idx_t MIN_MORSEL_VECTORS = 4;
++	auto row_group_vectors = MaxValue<idx_t>(1, row_group_size / STANDARD_VECTOR_SIZE);
++	auto total_vectors = (total_rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
++	auto target_morsels = MaxValue<idx_t>(1, thread_count) * MORSELS_PER_THREAD;
++	auto morsel_vectors = (total_vectors + target_morsels - 1) / target_morsels;
++	morsel_vectors = MaxValue<idx_t>(morsel_vectors, MIN_MORSEL_VECTORS);
++	return MinValue<idx_t>(morsel_vectors, row_group_vectors);
++}
++
+ void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
+ 	state.collection = this;
+ 	state.row_groups = GetRowGroups();
+@@ -307,12 +320,24 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
+ 			auto row_start = state.current_row_group->GetRowStart();
+ 			collection = state.collection;
+ 			row_group = state.current_row_group;
++			idx_t morsel_vectors;
+ 			if (ClientConfig::GetConfig(context).verify_parallelism) {
++				morsel_vectors = 1;
++			} else {
++				auto scan_rows = state.max_row - state.row_groups->GetBaseRowId();
++				auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++				morsel_vectors = GetParallelScanMorselVectors(scan_rows, collection->GetRowGroupSize(), threads);
++			}
++			if (morsel_vectors * STANDARD_VECTOR_SIZE < current_row_group.count || state.vector_index > 0) {
++				// scan a part of the row group
+ 				vector_index = state.vector_index;
+-				max_row = row_start + MinValue<idx_t>(current_row_group.count,
+-				                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
+-				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
+-				state.vector_index++;
++				auto morsel_start = STANDARD_VECTOR_SIZE * vector_index;
++				auto morsel_end =
++				    MinValue<idx_t>(current_row_group.count, morsel_start + STANDARD_VECTOR_SIZE * morsel_vectors);
++				D_ASSERT(morsel_start < current_row_group.count);
++				max_row = row_start + morsel_end;
++				state.processed_rows += morsel_end - morsel_start;
++				state.vector_index += morsel_vectors;
+ 				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
+ 					state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+ 					state.vector_index = 0;

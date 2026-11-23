@@ -1,0 +1,31 @@
+{
+  "id": "E0001",
+  "title": "Merge 3 specialised systems: q13, q16, q21",
+  "started": "2026-11-22T19:16:12-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "53de1c433b75d20d84d1f442e6d76139628d5f7c",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.48291700000000004,
+  "summary": "I built and benchmarked the merged tree, and all three templates are faster than the current best. All three patches (q13, q16, q21) had already applied cleanly to the working tree, so there were no conflicts to combine and I made no extra code changes. The release build succeeded and every result check passed. Bench against the current best (quick check, 2 bindings per template, 4 hot runs each; changes under about 5% are noise): q13 went from 723.8 to 449.9 ms (-37.8%), q16 from 178.1 to 156.1 ms (-12.3%), q21 from 797.5 to 661.4 ms (-17.1%). Geomean is -23.3%. None of the changes slowed another template in the group, so I didn't guard or drop any of them.",
+  "notes": "The changes didn't conflict, because they touch separate code paths (aggregate, distinct partitioning, join filter). Each template's merged speedup is about what its own specialised run reported.",
+  "train_ratio": 0.7438861419319658,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.6351803196720056,
+    "q16": 0.7938455057304917,
+    "q21": 0.8163687664394199
+  },
+  "improved": [
+    "q13",
+    "q16",
+    "q21"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-22T19:20:34-05:00"
+}

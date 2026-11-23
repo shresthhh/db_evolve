@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "output": {
+    "groups": [
+      [
+        "q09",
+        "q18"
+      ],
+      [
+        "q21",
+        "q02"
+      ],
+      [
+        "q13",
+        "q16"
+      ],
+      [
+        "q01",
+        "q19"
+      ]
+    ],
+    "rationale": "I split the groups along two conflicts I found in the patches. The first is the hash-join bloom-filter rule (CanUseBloomFilter / FinalizeFilters in physical_hash_join.cpp, and JoinHashTable::Finalize). q09 drops the `conditions.size()==1` rule so multi-key joins get a filter built from the hash of key 0 only, and it adds that insertion in Finalize. q21 replaces the same line with `equality_predicate_columns.size()==1`, adds an exact key-bitmap mode that skips the hashed insert, and reads layout column 0 in Finalize. These are two different, overlapping changes to the same condition and the same insertion path, so q09 (2.07x) and q21 (1.21x) go in separate groups. The second conflict is the perfect aggregate hash table. q01 rewrites AddChunk, Combine and Scan to keep 4 copies of each group's state plus a fused int64 fast path. q13 rewrites the same Combine and Scan into CombineRange and striped parallel scans for large tables. So q01 and q13 are also separated.\n\nGroup {q09, q18}: Both change join filter pushdown and join-order estimates in the same direction. q09 lowers the estimate for LIKE filters and extends bloom filters to multi-key joins. q18 adds a HAVING selectivity and a SEMI-join estimate, and lets min/max and IN filters pass through compression projections. Where they touch the same lines in FinalizeFilters, the edits combine cleanly: q18 adds a storage-offset condition to `has_cast` and q09 adds an `is_first_condition` guard. This keeps q09's large gain safe.\n\nGroup {q21, q02}: q21's bloom-filter, bitmap and DELIM_GET pushdown work sits by itself. q02 changes only scan morsel sizes and a binder rewrite in plan_select_node, so nothing overlaps. Keeping q21 away from q13 also matters. q13 widens the perfect hash join (RIGHT joins, key ranges up to 2^22), and CanUseBloomFilter rejects perfect hash tables, so q13 could turn q21's dense-key joins into perfect joins and take away its bloom-filter gain.\n\nGroup {q13, q16}: q13 changes the perfect hash aggregate (larger threshold, parallel combine and source) and the perfect hash join. q16 changes only how the radix-partitioned GroupedAggregateHashTable partitions count(DISTINCT). They are different operators, and plan_aggregate's perfect-HT check already rejects DISTINCT, so q16's path is unaffected.\n\nGroup {q01, q19}: q01 changes avg.cpp and the perfect aggregate hash table, which is kept apart from q13. q19 changes optimizer rule order and dense-mask filter evaluation in column_segment.cpp. The files don't overlap at all, so q19 keeps its 2.14x gain."
+  },
+  "text": "{\"groups\":[[\"q09\",\"q18\"],[\"q21\",\"q02\"],[\"q13\",\"q16\"],[\"q01\",\"q19\"]],\"rationale\":\"I split the groups along two conflicts I found in the patches. The first is the hash-join bloom-filter rule (CanUseBloomFilter / FinalizeFilters in physical_hash_join.cpp, and JoinHashTable::Finalize). q09 drops the `conditions.size()==1` rule so multi-key joins get a filter built from the hash of key 0 only, and it adds that insertion in Finalize. q21 replaces the same line with `equality_predicate_columns.size()==1`, adds an exact key-bitmap mode that skips the hashed insert, and reads layout column 0 in Finalize. These are two different, overlapping changes to the same condition and the same insertion path, so q09 (2.07x) and q21 (1.21x) go in separate groups. The second conflict is the perfect aggregate hash table. q01 rewrites AddChunk, Combine and Scan to keep 4 copies of each group's state plus a fused int64 fast path. q13 rewrites the same Combine and Scan into CombineRange and striped parallel scans for large tables. So q01 and q13 are also separated.\\n\\nGroup {q09, q18}: Both change join filter pushdown and join-order estimates in the same direction. q09 lowers the estimate for LIKE filters and extends bloom filters to multi-key joins. q18 adds a HAVING selectivity and a SEMI-join estimate, and lets min/max and IN filters pass through compression projections. Where they touch the same lines in FinalizeFilters, the edits combine cleanly: q18 adds a storage-offset condition to `has_cast` and q09 adds an `is_first_condition` guard. This keeps q09's large gain safe.\\n\\nGroup {q21, q02}: q21's bloom-filter, bitmap and DELIM_GET pushdown work sits by itself. q02 changes only scan morsel sizes and a binder rewrite in plan_select_node, so nothing overlaps. Keeping q21 away from q13 also matters. q13 widens the perfect hash join (RIGHT joins, key ranges up to 2^22), and CanUseBloomFilter rejects perfect hash tables, so q13 could turn q21's dense-key joins into perfect joins and take away its bloom-filter gain.\\n\\nGroup {q13, q16}: q13 changes the perfect hash aggregate (larger threshold, parallel combine and source) and the perfect hash join. q16 changes only how the radix-partitioned GroupedAggregateHashTable partitions count(DISTINCT). They are different operators, and plan_aggregate's perfect-HT check already rejects DISTINCT, so q16's path is unaffected.\\n\\nGroup {q01, q19}: q01 changes avg.cpp and the perfect aggregate hash table, which is kept apart from q13. q19 changes optimizer rule order and dense-mask filter evaluation in column_segment.cpp. The files don't overlap at all, so q19 keeps its 2.14x gain.\"}",
+  "cost_usd": 0.32321300000000003,
+  "seconds": 41.111578702926636,
+  "error": ""
+}

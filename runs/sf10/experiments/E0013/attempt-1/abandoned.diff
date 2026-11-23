@@ -1,0 +1,151 @@
+diff --git a/src/execution/operator/join/perfect_hash_join_executor.cpp b/src/execution/operator/join/perfect_hash_join_executor.cpp
+index a92a2fe..094c350 100644
+--- a/src/execution/operator/join/perfect_hash_join_executor.cpp
++++ b/src/execution/operator/join/perfect_hash_join_executor.cpp
+@@ -68,9 +68,9 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 		return true; // Already true based on static statistics
+ 	}
+ 
+-	// We only do this optimization for inner joins with one integer equality condition
++	// We only do this optimization for inner/right joins with one integer equality condition
+ 	const auto key_type = op.conditions[0].left->return_type;
+-	if (op.join_type != JoinType::INNER || op.conditions.size() != 1 ||
++	if ((op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1 ||
+ 	    op.conditions[0].comparison != ExpressionType::COMPARE_EQUAL || !TypeIsInteger(key_type.InternalType())) {
+ 		return false;
+ 	}
+@@ -106,10 +106,17 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 
+ 	// The max size our build must have to run the perfect HJ
+ 	static constexpr idx_t MAX_BUILD_SIZE = 1048576;
+-	if (build_range > Hugeint::Convert(MAX_BUILD_SIZE)) {
++	// Larger ranges (and all RIGHT joins) are only allowed if the build keys densely cover the range
++	static constexpr idx_t MAX_DENSE_BUILD_SIZE = idx_t(1) << 22;
++	if (build_range > Hugeint::Convert(MAX_DENSE_BUILD_SIZE)) {
+ 		return false;
+ 	}
+ 	perfect_join_statistics.build_range = NumericCast<idx_t>(build_range);
++	if (op.join_type == JoinType::RIGHT || perfect_join_statistics.build_range > MAX_BUILD_SIZE) {
++		if (ht.Count() * 2 < perfect_join_statistics.build_range + 1) {
++			return false;
++		}
++	}
+ 
+ 	// If count is larger than range (duplicates), we bail out
+ 	if (ht.Count() > perfect_join_statistics.build_range) {
+@@ -164,6 +171,19 @@ bool PerfectHashJoinExecutor::FullScanHashTable(LogicalType &key_type) {
+ 	}
+ 	key_count = unique_keys; // do not consider keys out of the range
+ 
++	if (join.join_type == JoinType::RIGHT) {
++		// remember the build row of each slot so matches can be propagated to the outer scan
++		const auto row_count = ht.Count();
++		row_slots = make_unsafe_uniq_array_uninitialized<uint32_t>(row_count);
++		for (idx_t i = 0; i < row_count; i++) {
++			row_slots[i] = NumericLimits<uint32_t>::Maximum();
++		}
++		for (idx_t i = 0; i < key_count; i++) {
++			row_slots[sel_tuples.get_index(i)] = NumericCast<uint32_t>(sel_build.get_index(i));
++		}
++		slot_matched = make_unsafe_uniq_array<uint8_t>(build_size);
++	}
++
+ 	// Full scan the remaining build columns and fill the perfect hash table
+ 
+ 	for (idx_t i = 0; i < join.rhs_output_columns.col_types.size(); i++) {
+@@ -222,6 +242,10 @@ bool PerfectHashJoinExecutor::TemplatedFillSelectionVectorBuild(Vector &source,
+ 	// generate the selection vector
+ 	for (idx_t i = 0, sel_idx = 0; i < count; ++i) {
+ 		auto data_idx = vector_data.sel->get_index(i);
++		if (!vector_data.validity.RowIsValid(data_idx)) {
++			// NULL keys never match (they are only kept for RIGHT joins and emitted by the outer scan)
++			continue;
++		}
+ 		auto input_value = data[data_idx];
+ 		// add index to selection vector if value in the range
+ 		if (min_value <= input_value && input_value <= max_value) {
+@@ -281,6 +305,12 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
+ 	auto keys_count = state.join_keys.size();
+ 	// todo: add check for fast pass when probe is part of build domain
+ 	FillSelectionVectorSwitchProbe(keys_vec, state.build_sel_vec, state.probe_sel_vec, keys_count, probe_sel_count);
++	if (slot_matched) {
++		// RIGHT join: record which build slots found a match (benign race, every writer stores 1)
++		for (idx_t i = 0; i < probe_sel_count; i++) {
++			slot_matched[state.build_sel_vec.get_index(i)] = 1;
++		}
++	}
+ 
+ 	// If build is dense and probe is in build's domain, just reference probe
+ 	if (perfect_join_statistics.is_build_dense && keys_count == probe_sel_count) {
+@@ -298,6 +328,33 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
+ 	return OperatorResultType::NEED_MORE_INPUT;
+ }
+ 
++void PerfectHashJoinExecutor::PropagateMatches() {
++	if (!slot_matched) {
++		return;
++	}
++	// scan the rows in the same order as FullScanHashTable did
++	auto &data_collection = ht.GetDataCollection();
++	if (data_collection.ChunkCount() > 0) {
++		JoinHTScanState scan_state(data_collection, 0, data_collection.ChunkCount(),
++		                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
++		auto &iterator = scan_state.iterator;
++		const auto row_locations = iterator.GetRowLocations();
++		idx_t row_idx = 0;
++		do {
++			const auto count = iterator.GetCurrentChunkCount();
++			for (idx_t i = 0; i < count; i++, row_idx++) {
++				const auto slot = row_slots[row_idx];
++				if (slot != NumericLimits<uint32_t>::Maximum() && slot_matched[slot]) {
++					Store<bool>(true, row_locations[i] + ht.tuple_size);
++				}
++			}
++		} while (iterator.Next());
++		D_ASSERT(row_idx == ht.Count());
++	}
++	slot_matched.reset();
++	row_slots.reset();
++}
++
+ void PerfectHashJoinExecutor::FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec,
+                                                              SelectionVector &probe_sel_vec, idx_t count,
+                                                              idx_t &probe_sel_count) {
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index 7457b56..500084d 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -1381,6 +1381,10 @@ void HashJoinGlobalSourceState::PrepareProbe(HashJoinGlobalSinkState &sink) {
+ void HashJoinGlobalSourceState::PrepareScanHT(HashJoinGlobalSinkState &sink) {
+ 	D_ASSERT(global_stage != HashJoinSourceStage::SCAN_HT);
+ 	auto &ht = *sink.hash_table;
++	if (sink.perfect_join_executor) {
++		// the perfect hash table tracks matches per slot: hand them to the rows before scanning
++		sink.perfect_join_executor->PropagateMatches();
++	}
+ 
+ 	auto &data_collection = ht.GetDataCollection();
+ 	full_outer_chunk_idx = 0;
+diff --git a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+index 9e51344..01d12ec 100644
+--- a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
++++ b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+@@ -41,6 +41,8 @@ public:
+ 	OperatorResultType ProbePerfectHashTable(ExecutionContext &context, DataChunk &input, DataChunk &lhs_output_columns,
+ 	                                         DataChunk &chunk, OperatorState &state);
+ 	bool BuildPerfectHashTable(LogicalType &type);
++	//! For RIGHT joins: write the per-slot match flags into the found_match field of the build rows
++	void PropagateMatches();
+ 
+ private:
+ 	void FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec, SelectionVector &probe_sel_vec,
+@@ -67,6 +69,9 @@ private:
+ 	ValidityMask bitmap_build_idx;
+ 	//! Stores the number of unique keys in the build side
+ 	idx_t unique_keys = 0;
++	//! For RIGHT joins: the slot of each build row (in scan order), and whether a probe row matched the slot
++	unsafe_unique_array<uint32_t> row_slots;
++	unsafe_unique_array<uint8_t> slot_matched;
+ };
+ 
+ } // namespace duckdb

@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "output": {
+    "status": "ready",
+    "summary": "appended a comment to assert.cpp",
+    "generality": "comment only",
+    "notes": ""
+  },
+  "text": "{\"status\": \"ready\", \"summary\": \"appended a comment to assert.cpp\", \"generality\": \"comment only\", \"notes\": \"\"}",
+  "cost_usd": 0.0,
+  "seconds": 0.0,
+  "error": ""
+}

@@ -1,0 +1,16 @@
+{
+  "id": "E0001",
+  "title": "Lower cardinality estimate for substring-match table filters",
+  "started": "2026-11-17T02:07:53-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.6246644,
+  "summary": "I was stopped before I could check this change, so it is not ready to judge. There are no before/after numbers: `bench` and EXPLAIN were never run on the new build. The final working tree's build was still running when I had to stop, so I don't know if it compiles. An earlier build with most of the change (before I removed an unused helper and wired up relation_manager.cpp) printed BUILD OK.\n\nWhat the code does:\n- **Header** (`relation_statistics_helper.hpp`): adds `SUBSTRING_MATCH_SELECTIVITY = DEFAULT_SELECTIVITY * DEFAULT_SELECTIVITY` (0.04). Also adds two static helpers: `IsSubstringMatchPredicate(const Expression&)` and `IsSubstringMatchFilter(const TableFilter&)`.\n- **Predicate test** (`relation_statistics_helper.cpp`): `IsSubstringMatchPredicate` is true for `contains(x, <non-empty VARCHAR constant>)`, and for `~~` / `like_escape` whose constant pattern starts with '%' and has at least one character other than '%' or '_'. It also looks inside CONJUNCTION_AND. It never matches OR, NOT or `!~~`. `IsSubstringMatchFilter` checks ExpressionFilter and ConjunctionAndFilter table filters the same way.\n- **Scan estimate** (`ExtractGetStats`): when no equality filter fired and some non-optional table filter is a substring match, the estimate is base_cardinality * 0.04 instead of * 0.2.\n- **Unpushed filters** (`relation_manager.cpp`): a static `GetDatasourceFilterSelectivity` replaces the five DEFAULT_SELECTIVITY uses for LogicalFilters left above a scan. It returns 0.04 if any of their expressions is a substring match, otherwise 0.2.\n\nBaseline I did check: EXPLAIN of q09 estimates ~1,256,266 rows for lineitem\u22c8part\u22c8orders and ~5,057,324 for the top join. The part filter is pushed into the scan as `contains(p_name, 'ghost')`, so the table-filter path is the one that matters.",
+  "notes": "To finish: 1) run `dbe-tool build` and confirm the current tree compiles; 2) EXPLAIN q09.m0 and check that the scan estimate on part falls from ~40,000 to ~8,000 and whether the join order changes; 3) run the full `dbe-tool bench`. If results are mixed, try the issue's fallback of applying the lower selectivity only when the literal is at least 3 characters. Shell notes: python3, compound commands that `cd` first, and piping into grep all needed permission approval here, so make edits with the Edit tool and use absolute paths. Changing the header triggers a long rebuild (over 10 minutes), so run builds in the background.",
+  "finished": "2026-11-17T02:47:11-05:00"
+}

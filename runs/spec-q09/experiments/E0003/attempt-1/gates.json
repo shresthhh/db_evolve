@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/join_hashtable.cpp: adds __builtin_prefetch passes in three places: entry prefetch in ProbeForPointersInternal, row-pointer prefetch before row_matcher_build.Match in GetRowPointersInternal, and write prefetch of entries in InsertHashesLoop. None of them changes any logic. Prefetch is only a hint and cannot fault, even on a stale or unset pointer, so NULLs, empty inputs and linear-probe wraparound cannot affect correctness.",
+      "Every index is masked with ht.bitmask, so the computed addresses stay inside the entries array. In ProbeForPointersInternal, later probing rounds overwrite hashes_dense with offset|salt values, and masking those still gives a valid slot.",
+      "The guard is a fixed 1MB constant on the size of the pointer table (capacity * sizeof(ht_entry_t)). It is based on cache size, not on this dataset's tables or row counts. Any hash join with a build side of roughly 128K rows or more qualifies, which is a broad and natural class of queries.",
+      "The prefetches use no extra threads or memory and leave timing, settings and tests untouched. The change is small, compiled only under GCC/Clang, and does what the issue describes.",
+      "Minor point, not blocking: the guard expression is repeated in three places. It could be a small helper, but this is acceptable as written."
+    ],
+    "required_changes": []
+  }
+}

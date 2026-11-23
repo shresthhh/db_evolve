@@ -1,0 +1,16 @@
+{
+  "id": "E0001",
+  "title": "Early HT capacity adaptation when groups slightly exceed initial sink capacity",
+  "started": "2026-11-20T14:53:55-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.7631936,
+  "summary": "Added MaybeGrowEarly() in radix_partitioned_hashtable.cpp. When the per-thread HT fills (with more than 2 threads, not external, not yet adapted, capacity below ADAPTIVITY_THRESHOLD), it grows the HT using the HLL estimate instead of Abandon()ing it. The growth is capped at ADAPTIVITY_THRESHOLD, it never skips lookups, it does not set `adapted`, and MaybeRepartition still runs afterwards.\n\n1. The planner's exact criterion (dedup_pct/hll_pct > 2.0, sink_count >= 2*ResizeThreshold) never fires early enough on q16: q16 -1.8% (noise). At the second fill (~86k rows) the ratio is only ~1.55. It only passes 2.0 at ~129k of a ~150k-row task.\n2. A variant using min(materialized, hll) > ResizeThreshold and hll/sink <= 0.5 gave +0.9% (noise).\n3. The most aggressive variant fires at the first fill: hll = min(HLL upper bound, sink_count), hll > ResizeThreshold and hll/sink <= 0.8. It gave q16 -2.9%, -8.3% (the baseline jumped from 180 to 198 ms that run) and -3.7%.\n\nThe consistent effect is about 3-4%, below the 5% bar, so I'm abandoning. The working tree holds variant 3.",
+  "notes": "The hypothesis's premise only partly holds. Adding the plain GROUP BY brand,type,size count(*) to the join costs ~70 ms (about 130 ms vs about 63 ms for count/sum without it; single runs are noisy, 98-145 ms). Removing most of the Abandon thrashing recovers only ~5 ms. The rest is probably per-row group hashing and comparison on the string/compressed group keys, or the finalize/combine itself. Next step: profile the per-row HT work (FindOrCreateGroups, key compare/hash on the uhugeint-compressed string plus utinyint keys) rather than tuning capacity. If someone revisits early grow, the 2.0 dedup-ratio threshold from DecideAdaptation is the wrong test for early checks, because the ratio is structurally small early on.",
+  "finished": "2026-11-20T15:00:53-05:00"
+}

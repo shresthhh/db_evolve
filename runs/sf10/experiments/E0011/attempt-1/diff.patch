@@ -1,0 +1,48 @@
+diff --git a/src/optimizer/deliminator.cpp b/src/optimizer/deliminator.cpp
+index 210d17a..af0fb66 100644
+--- a/src/optimizer/deliminator.cpp
++++ b/src/optimizer/deliminator.cpp
+@@ -45,6 +45,27 @@ static bool IsEqualityJoinCondition(const JoinCondition &cond) {
+ 	}
+ }
+ 
++static bool HasBlockingOperator(const LogicalOperator &op) {
++	switch (op.type) {
++	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
++	case LogicalOperatorType::LOGICAL_WINDOW:
++	case LogicalOperatorType::LOGICAL_LIMIT:
++	case LogicalOperatorType::LOGICAL_ORDER_BY:
++	case LogicalOperatorType::LOGICAL_TOP_N:
++	case LogicalOperatorType::LOGICAL_DISTINCT:
++	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
++		return true;
++	default:
++		break;
++	}
++	for (auto &child : op.children) {
++		if (HasBlockingOperator(*child)) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op) {
+ 	root = op;
+ 
+@@ -63,7 +84,14 @@ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op
+ 		          [](const JoinWithDelimGet &lhs, const JoinWithDelimGet &rhs) { return lhs.depth > rhs.depth; });
+ 
+ 		bool all_removed = true;
+-		if (!candidate.joins.empty() && HasSelection(delim_join)) {
++		bool keep_deepest = !candidate.joins.empty() && HasSelection(delim_join);
++		if (keep_deepest && (delim_join.join_type == JoinType::SEMI || delim_join.join_type == JoinType::ANTI) &&
++		    !HasBlockingOperator(*delim_join.children[1])) {
++			// For SEMI/ANTI joins whose RHS has no blocking operators, the duplicate-eliminated set does not
++			// prune any expensive work: the semi/anti join itself performs the same filtering
++			keep_deepest = false;
++		}
++		if (keep_deepest) {
+ 			// Keep the deepest join with DelimGet in these cases,
+ 			// as the selection can greatly reduce the cost of the RHS child of the DelimJoin
+ 			candidate.joins.erase(candidate.joins.begin());

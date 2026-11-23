@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/common_subplan_optimizer.cpp:977: the change is one constant. CARDINALITY_RATIO in IsSelectiveMultiTablePlan goes from 2 to 8. It is a scale-invariant ratio of the estimated subplan cardinality to the largest base table in the subplan. It does not refer to any table, column, literal or row count. Any repeated multi-table subplan with a 2-8x reduction is affected the same way, whatever query it comes from.",
+      "Correctness: it only decides whether an existing, tested rewrite (CTE materialization of a common subplan) fires. Not firing leaves the original plan, so NULLs, empty inputs, types and parallelism behave as before. Non-deterministic expressions are not a new risk, because the rewrite already has to treat both occurrences as equivalent, and recomputing is the original semantics.",
+      "Unchanged: the 2048-row absolute threshold and the EndsInAggregateOrDistinct path, so small and aggregate/distinct common subplans are still materialized.",
+      "Performance trade-off (not a reason to reject): weakly selective common subplans over very large or expensive joins are now computed twice. The author states this risk. The measured gain is modest (median about -5%), and the change is a plausible heuristic retune that a maintainer could accept.",
+      "No timing, settings, test or shell changes, and no dead or duplicated code."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/optimizer/common_subplan_optimizer.cpp:977: the change is one constant. CARDINALITY_RATIO in IsSelectiveMultiTablePlan goes from 2 to 8. It is a scale-invariant ratio of the estimated subplan cardinality to the largest base table in the subplan. It does not refer to any table, column, literal or row count. Any repeated multi-table subplan with a 2-8x reduction is affected the same way, whatever query it comes from.\",\"Correctness: it only decides whether an existing, tested rewrite (CTE materialization of a common subplan) fires. Not firing leaves the original plan, so NULLs, empty inputs, types and parallelism behave as before. Non-deterministic expressions are not a new risk, because the rewrite already has to treat both occurrences as equivalent, and recomputing is the original semantics.\",\"Unchanged: the 2048-row absolute threshold and the EndsInAggregateOrDistinct path, so small and aggregate/distinct common subplans are still materialized.\",\"Performance trade-off (not a reason to reject): weakly selective common subplans over very large or expensive joins are now computed twice. The author states this risk. The measured gain is modest (median about -5%), and the change is a plausible heuristic retune that a maintainer could accept.\",\"No timing, settings, test or shell changes, and no dead or duplicated code.\"],\"required_changes\":[]}",
+  "cost_usd": 0.12917720000000002,
+  "seconds": 18.818691730499268,
+  "error": ""
+}

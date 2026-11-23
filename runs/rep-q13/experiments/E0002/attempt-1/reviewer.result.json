@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/function/scalar/string/contains.cpp: the new SSE2 block search is a general speed-up of FindStrInStr, used by contains, LIKE '%x%', strpos and similar functions. It runs only for needles of 2+ bytes and haystacks of needle_size+15 to 256 bytes. It refers to no tables, columns, literals or data.",
+      "Loads stay in bounds (read from the code, not tested): the new path needs num_starts >= 16. The furthest first-byte load ends at num_starts-1 = haystack_size-needle_size. The furthest last-byte load ends at haystack_size-1. The overlapping final block starts at num_starts-16 >= 0, and its skip count is between 1 and 15, so the shift is well defined.",
+      "Returns the same offset as the old path: blocks are scanned in order and the lowest candidate in each block is checked first, so the first match is returned. A 2-byte needle compares zero middle bytes, which is fine. Comparison is byte by byte, so UTF-8 behaves as before.",
+      "Non-SSE2 builds, 1-byte needles, haystacks shorter than needle_size+15 and haystacks over 256 bytes all keep the existing path. The author did not run sqllogictests, only their own SQL spot checks."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/function/scalar/string/contains.cpp: the new SSE2 block search is a general speed-up of FindStrInStr, used by contains, LIKE '%x%', strpos and similar functions. It runs only for needles of 2+ bytes and haystacks of needle_size+15 to 256 bytes. It refers to no tables, columns, literals or data.\",\"Loads stay in bounds (read from the code, not tested): the new path needs num_starts >= 16. The furthest first-byte load ends at num_starts-1 = haystack_size-needle_size. The furthest last-byte load ends at haystack_size-1. The overlapping final block starts at num_starts-16 >= 0, and its skip count is between 1 and 15, so the shift is well defined.\",\"Returns the same offset as the old path: blocks are scanned in order and the lowest candidate in each block is checked first, so the first match is returned. A 2-byte needle compares zero middle bytes, which is fine. Comparison is byte by byte, so UTF-8 behaves as before.\",\"Non-SSE2 builds, 1-byte needles, haystacks shorter than needle_size+15 and haystacks over 256 bytes all keep the existing path. The author did not run sqllogictests, only their own SQL spot checks.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1222284,
+  "seconds": 20.679373741149902,
+  "error": ""
+}

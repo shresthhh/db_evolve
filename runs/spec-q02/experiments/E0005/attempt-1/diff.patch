@@ -1,0 +1,13 @@
+diff --git a/src/optimizer/common_subplan_optimizer.cpp b/src/optimizer/common_subplan_optimizer.cpp
+index 2432abd..32216ec 100644
+--- a/src/optimizer/common_subplan_optimizer.cpp
++++ b/src/optimizer/common_subplan_optimizer.cpp
+@@ -974,7 +974,7 @@ private:
+ 
+ 	static bool IsSelectiveMultiTablePlan(unique_ptr<LogicalOperator> &op) {
+ 		static constexpr idx_t CARDINALITY_THRESHOLD = 2048;
+-		static constexpr idx_t CARDINALITY_RATIO = 2;
++		static constexpr idx_t CARDINALITY_RATIO = 8;
+ 
+ 		// Must have an estimated cardinality
+ 		if (!op->has_estimated_cardinality) {

@@ -1,0 +1,12 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 0d1cea6..5642ed4 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -197,7 +197,7 @@ static inline void PrefetchWrite(const void *p) {
+ }
+ 
+ //! How many iterations ahead to prefetch hash table entries
+-static constexpr idx_t HT_PREFETCH_DISTANCE = 16;
++static constexpr idx_t HT_PREFETCH_DISTANCE = 32;
+ //! Only prefetch if the pointer table is larger than this (smaller tables are likely cache-resident)
+ static constexpr idx_t HT_PREFETCH_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL;

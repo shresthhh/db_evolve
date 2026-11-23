@@ -1,0 +1,48 @@
+[
+  {
+    "title": "Perfect hash join for RIGHT joins with dense keys up to 2^22",
+    "hypothesis": "q13 HASH_JOIN (RIGHT, o_custkey = c_custkey, build = 1.5M customer keys, dense) costs 1.76s CPU of the ~2.5s query. PerfectHashJoinExecutor::CanDoPerfectHashJoin (perfect_hash_join_executor.cpp:73) rejects every join type except INNER, and MAX_BUILD_SIZE=1048576 (line 108) is below a 1.5M key range. Two more gates also block it: JoinFilterPushdownOptimizer's compute_aggregates_anyway (join_filter_pushdown_optimizer.cpp:275) is INNER-only, so with the probe key behind a compress projection there is no build min/max; and the dup check `ht.Count() > build_range` (line 115) is off by one (the range holds build_range+1 values), so it rejects every fully dense key set, INNER joins included. In an earlier run of this system the same change took the join from 1.87s to 0.19s CPU (q13 -20%).",
+    "plan": "1) perfect_hash_join_executor.cpp CanDoPerfectHashJoin: also allow JoinType::RIGHT (and the matching RIGHT_SEMI/ANTI only if simple), raise MAX_BUILD_SIZE to 1<<22, fix the dup check to `ht.Count() > build_range + 1`. 2) In the perfect build fill (FullScanHashTable/BuildPerfectHashTable), check build-key validity, because RIGHT joins keep NULL-key build rows with has_null=false. For RIGHT joins, set the found-match flag in the HT row (the same flag the normal HT uses for the RIGHT outer scan) when probing, so that PhysicalHashJoin's existing ScanFullOuter still emits unmatched build rows. Or, simpler, keep a per-slot bool matched array and change the outer scan. Pick whichever the existing code supports with less change. 3) join_filter_pushdown_optimizer.cpp:275: set compute_aggregates_anyway for RIGHT joins too, so build min/max gets computed. 4) Check that physical_hash_join.cpp:1004 then takes the perfect path. Add a sqllogictest for RIGHT/LEFT join with NULL build keys, duplicate keys, and unmatched rows.",
+    "target_files": [
+      "src/execution/operator/join/perfect_hash_join_executor.cpp",
+      "src/execution/operator/join/physical_hash_join.cpp",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp"
+    ],
+    "expected_gain": "q13 -15..-20% (join operator ~1.7s CPU -> ~0.2s)",
+    "generality": "Any LEFT/RIGHT outer join where a dense integer key is built (FK->PK outer joins, common in TPC-H/DS style queries). INNER joins with a fully dense key range also gain from the off-by-one fix. Downside: memory for ranges up to 4M slots, so keep a density guard (count >= range/4 or similar).",
+    "risk": "Medium: outer-join correctness (unmatched build rows, NULL keys, duplicate build keys must fall back). The previous run hit 3 silent gates; check each one with EXPLAIN ANALYZE/profile.",
+    "status": "accepted",
+    "filed": "g1r1",
+    "experiment": "E0001"
+  },
+  {
+    "title": "SIMD first+last-byte candidate filter in FindStrInStr with overlapping tail block",
+    "hypothesis": "q13 orders TABLE_SCAN with the `o_comment NOT LIKE '%a%b%'` filter takes 2.58s CPU, the largest operator. like.cpp:260/285 calls FindStrInStr (contains.cpp:76), which uses memchr on the first needle byte and then memcmp; on ~50-byte comments with common first bytes this means many memchr calls/branches. An SSE2/SWAR scan comparing the first and last needle bytes at their offsets over 16-byte blocks filters candidates in bulk. In the previous run a scalar tail killed the gain (-2%), while an overlapping final block gave q13 -12%.",
+    "plan": "contains.cpp FindStrInStr(const unsigned char*,...): for needle_size>=2 and haystack_size <= 256, loop over 16-byte blocks: load hay[i..i+16] and hay[i+n-1..i+n-1+16], cmpeq against the broadcast first/last byte, AND, movemask; for each set bit, memcmp the middle. For the final partial block, load an overlapping block ending at the last valid start and shift the mask to drop positions already checked; no scalar tail. Guard with __SSE2__, otherwise use a 64-bit SWAR fallback or the existing path. Keep the existing path for long haystacks.",
+    "target_files": [
+      "src/function/scalar/string/contains.cpp"
+    ],
+    "expected_gain": "q13 -8..-12%",
+    "generality": "All contains/LIKE '%x%'/strpos/string_split on short strings, which are common in analytical filters. Long strings are unchanged.",
+    "risk": "Low-medium: off-by-one in the overlap mask and reads past the end of the buffer (only load inside [0, haystack_size)). Fuzz with sqllogictests for needles at the start/end and haystacks of 1..40 bytes.",
+    "status": "retired",
+    "filed": "g1r1",
+    "experiment": "E0002"
+  },
+  {
+    "title": "Large perfect hash aggregate (up to 22 bits) with parallel combine and source",
+    "hypothesis": "q13 inner HASH_GROUP_BY on c_custkey (1.5M groups, dense integer key, count) costs 2.51s CPU. The radix HT is used because the key range exceeds perfect_ht_threshold. A perfect array aggregate indexed by key-min avoids hashing/probing. The earlier run measured -18.6%, but only after the combine (striped locks) and the source (block-parallel scan) were parallelised; serial versions gave 3.6%.",
+    "plan": "physical_perfect_hash_aggregate / the planner selection in plan_aggregate.cpp: allow perfect HA when stats give a range up to 2^22 with a density/memory guard; make Combine merge in parallel over stripes, and make GetData a parallel source over blocks of slots.",
+    "target_files": [
+      "src/execution/operator/aggregate/physical_perfect_hash_aggregate.cpp",
+      "src/execution/perfect_aggregate_hashtable.cpp",
+      "src/execution/physical_plan/plan_aggregate.cpp"
+    ],
+    "expected_gain": "q13 -15..-18%",
+    "generality": "GROUP BY on dense integer keys (PKs/FKs) with large cardinality. Sparse ranges stay on radix because of the density guard.",
+    "risk": "Medium-high: larger diff; per-thread memory of 4M slots x threads, so it needs a memory guard.",
+    "status": "accepted",
+    "filed": "g1r1",
+    "experiment": "E0003"
+  }
+]

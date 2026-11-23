@@ -1,0 +1,51 @@
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..e4e7aa1 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -468,6 +469,38 @@ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t colu
+ 		}
+ 		return cardinality_after_filters;
+ 	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		// positive substring search: contains(col, 'literal')
++		// longer literals are more selective; scale the default selectivity down per character
++		auto &expr_filter = filter.Cast<ExpressionFilter>();
++		if (expr_filter.expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++			return cardinality_after_filters;
++		}
++		auto &func = expr_filter.expr->Cast<BoundFunctionExpression>();
++		if (func.function.name != "contains" || func.children.size() != 2) {
++			return cardinality_after_filters;
++		}
++		auto child_class = func.children[0]->GetExpressionClass();
++		if (child_class != ExpressionClass::BOUND_REF && child_class != ExpressionClass::BOUND_COLUMN_REF) {
++			return cardinality_after_filters;
++		}
++		if (func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return cardinality_after_filters;
++		}
++		auto &constant = func.children[1]->Cast<BoundConstantExpression>().value;
++		if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
++			return cardinality_after_filters;
++		}
++		auto literal_length = StringValue::Get(constant).size();
++		if (literal_length == 0) {
++			return cardinality_after_filters;
++		}
++		auto selectivity = RelationStatisticsHelper::DEFAULT_SELECTIVITY *
++		                   pow(0.75, static_cast<double>(MinValue<idx_t>(literal_length, 64)));
++		selectivity = MaxValue(selectivity, 0.01);
++		auto estimate = static_cast<idx_t>(ceil(static_cast<double>(cardinality) * selectivity));
++		return MinValue(MaxValue<idx_t>(estimate, 1), cardinality_after_filters);
++	}
+ 	default:
+ 		return cardinality_after_filters;
+ 	}

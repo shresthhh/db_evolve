@@ -1,0 +1,25 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "Merge conflict in FinalizeFilters (physical_hash_join.cpp): the bloom filter is pushed only when there is no cast, no storage_offset and join_condition[filter_idx]==0. This is correct. The multi-key BF is built in JoinHashTable::Finalize from VectorOperations::Hash of the gathered first key column (condition_types[0]), so the probe side's hash of an un-cast, un-shifted column matches it. Single-key HTs still insert in InsertHashes, so no key is inserted twice.",
+      "CastJoinFilterValueToStorage: computes storage = key + offset in HUGEINT with TryAdd. It returns false on overflow or a failed cast, and the caller then skips the filter. NULL is left as is and the existing IsNull check skips it. Every consumer of storage_type (the min/max filter and the IN/range filters) goes through this helper, so no pushed filter can use a value without the offset applied.",
+      "Range-set path in PushInFilter: in_list is unique (built from a set) and IsDenseRange has already sorted it for integral non-UHUGEINT types. The type equality check and the IsIntegral/UHUGEINT guard keep it consistent. gaps.size() >= max_filter_count > split_count, so nth_element stays in bounds. The ranges cover every key, and the result is wrapped in an OptionalFilter (zonemap only), so a filter that is too broad can never drop rows. The extra cost is limited to scanning at most 64x the dynamic_or_filter_threshold keys.",
+      "Optimizer pushdown through __internal_compress_integral_*: it takes only one offset level, requires a constant non-NULL offset and a source type no wider than 64 bits, and carries the offset through set-operation children. These are general rules based on the plan's shape.",
+      "Cardinality changes (SEMI denominator from tdom/RHS cardinality, an extra cut for HAVING-style range predicates on aggregate results with a floor of 1, and 0.05 selectivity for LIKE/contains filters) only affect estimates and cannot change results. They key on expression shape and function class, never on names or literals.",
+      "The prefetch code in join_hashtable.cpp depends on a size threshold (a 4MB pointer table) and does not affect correctness.",
+      "Nothing in the diff refers to tables, columns, literals or dataset sizes, and it does not touch timing, settings defaults or tests."
+    ],
+    "required_changes": []
+  }
+}

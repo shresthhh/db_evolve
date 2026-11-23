@@ -1,0 +1,18 @@
+{
+  "accept": false,
+  "reasons": [
+    "no visible template faster beyond its noise (best: q16 +0.3%; needs at least -5%)",
+    "visible geomean got slower (+0.3%)"
+  ],
+  "rule": "templates",
+  "train_ratio": 1.0034666753131527,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "improved": [],
+  "regressed": [],
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 1.0034666753131527
+  },
+  "passes": 4
+}

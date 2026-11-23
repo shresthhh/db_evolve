@@ -1,0 +1,27 @@
+{
+  "id": "E0004",
+  "title": "Hash join prefetch v2: build insert + probe, software-pipelined, LLC-sized threshold",
+  "started": "2026-11-20T00:40:59-05:00",
+  "base": "0c47211ada6381cbc3ea87d7518b4c41a8a9556e",
+  "candidate": "f0d9e1f9517988ef435167cd958db3ecb9b74267",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.4293312,
+  "summary": "I added software prefetching to the hash join, all in src/execution/join_hashtable.cpp. q09 ran -12.9% (514.9 \u2192 448.7 ms) and then -14.6% (520.3 \u2192 444.2 ms) in two benches against the current best. Both benches also checked results, and they matched.\n\nThe changes:\n(a) Two file-local helpers, PrefetchRead and PrefetchWrite, which wrap __builtin_prefetch under GCC/Clang and do nothing on other compilers. A prefetch distance of 16. A gate, ShouldPrefetch(ht), that is true only when capacity*sizeof(ht_entry_t) is over 4MB.\n(b) ProbeForPointersInternal takes a new template parameter, PREFETCH, chosen once per call in ProbeForPointers. When it is set, iteration i prefetches entries[hashes_dense[i+16] & bitmask]. The non-prefetch version is the same code as before.\n(c) GetRowPointersInternal: when the gate is on, a short loop prefetches the build-row pointers for keys_to_compare_sel before row_matcher_build.Match.\n(d) InsertHashesLoop (the build): when the gate is on, each insert iteration prefetches, for write, the entry 16 positions ahead in remaining_sel.\n(e) ScanStructure::AdvancePointers: after following a chain pointer that isn't null, it prefetches the next row. This code only runs when chains_longer_than_one is set.\n\nThere are no header changes and no change in behaviour, since a prefetch is only a hint.",
+  "notes": "The gain was much larger than E0003 measured (-13% to -15% vs about -5%). That supports the idea that prefetching a fixed distance ahead inside the loops, with build and probe together, beats a 2048-wide pre-pass. I did not test each part on its own, so I don't know how much each one contributes. I also did not test other distances (8 or 32) or other thresholds. A possible follow-up is prefetching the hash-table entry again in the linear-probe retry loop that runs after key mismatches. That loop is rare, so it is probably minor.",
+  "train_ratio": 0.9012713663889029,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q09": 0.9012713663889029
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-20T00:45:24-05:00"
+}

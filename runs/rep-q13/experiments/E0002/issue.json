@@ -1,0 +1,13 @@
+{
+  "title": "SIMD first+last-byte candidate filter in FindStrInStr with overlapping tail block",
+  "hypothesis": "q13 orders TABLE_SCAN with the `o_comment NOT LIKE '%a%b%'` filter takes 2.58s CPU, the largest operator. like.cpp:260/285 calls FindStrInStr (contains.cpp:76), which uses memchr on the first needle byte and then memcmp; on ~50-byte comments with common first bytes this means many memchr calls/branches. An SSE2/SWAR scan comparing the first and last needle bytes at their offsets over 16-byte blocks filters candidates in bulk. In the previous run a scalar tail killed the gain (-2%), while an overlapping final block gave q13 -12%.",
+  "plan": "contains.cpp FindStrInStr(const unsigned char*,...): for needle_size>=2 and haystack_size <= 256, loop over 16-byte blocks: load hay[i..i+16] and hay[i+n-1..i+n-1+16], cmpeq against the broadcast first/last byte, AND, movemask; for each set bit, memcmp the middle. For the final partial block, load an overlapping block ending at the last valid start and shift the mask to drop positions already checked; no scalar tail. Guard with __SSE2__, otherwise use a 64-bit SWAR fallback or the existing path. Keep the existing path for long haystacks.",
+  "target_files": [
+    "src/function/scalar/string/contains.cpp"
+  ],
+  "expected_gain": "q13 -8..-12%",
+  "generality": "All contains/LIKE '%x%'/strpos/string_split on short strings, which are common in analytical filters. Long strings are unchanged.",
+  "risk": "Low-medium: off-by-one in the overlap mask and reads past the end of the buffer (only load inside [0, haystack_size)). Fuzz with sqllogictests for needles at the start/end and haystacks of 1..40 bytes.",
+  "status": "open",
+  "filed": "g1r1"
+}

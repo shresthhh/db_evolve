@@ -1,0 +1,61 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 95070eb..1baae98 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -164,6 +164,9 @@ static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const
+ 	}
+ }
+ 
++//! Hash tables whose pointer array exceeds this size (roughly L2-sized) get software prefetching during probing
++static constexpr idx_t HT_PREFETCH_THRESHOLD_BYTES = 1ULL << 20;
++
+ template <bool HAS_SEL>
+ idx_t GetOptionalIndex(const SelectionVector *sel, const idx_t idx) {
+ 	return HAS_SEL ? sel->get_index(idx) : idx;
+@@ -191,6 +194,15 @@ static idx_t ProbeForPointersInternal(JoinHashTable::ProbeState &state, JoinHash
+ 
+ 	idx_t keys_to_compare_count = 0;
+ 
++#if defined(__GNUC__) || defined(__clang__)
++	// for hash tables that exceed the cache, issue prefetches for all entries up front so the misses overlap
++	if (ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES) {
++		for (idx_t i = 0; i < count; i++) {
++			__builtin_prefetch(&entries[hashes_dense[i] & ht.bitmask]);
++		}
++	}
++#endif
++
+ 	for (idx_t i = 0; i < count; i++) {
+ 		auto row_hash = hashes_dense[i]; // hashes have been flattened before -> always access dense
+ 		auto row_ht_offset = row_hash & ht.bitmask;
+@@ -288,6 +300,15 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 			break;
+ 		}
+ 
++#if defined(__GNUC__) || defined(__clang__)
++		if (ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES) {
++			const auto row_ptrs = FlatVector::GetData<data_ptr_t>(pointers_result_v);
++			for (idx_t i = 0; i < keys_to_compare_count; i++) {
++				__builtin_prefetch(row_ptrs[state.keys_to_compare_sel.get_index(i)]);
++			}
++		}
++#endif
++
+ 		// Perform row comparisons, after Match function call salt_match_sel will point to the keys that match
+ 		keys_no_match_count = 0;
+ 		const idx_t keys_match_count =
+@@ -646,6 +667,14 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 	while (remaining_count > 0) {
+ 		idx_t salt_match_count = 0;
+ 
++#if defined(__GNUC__) || defined(__clang__)
++		if (ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES) {
++			for (idx_t i = 0; i < remaining_count; i++) {
++				__builtin_prefetch(&entries[ht_offsets[remaining_sel->get_index(i)] & ht.bitmask], 1);
++			}
++		}
++#endif
++
+ 		// iterate over each entry to find out whether it belongs to an existing list or will start a new list
+ 		for (idx_t i = 0; i < remaining_count; i++) {
+ 			const idx_t row_index = remaining_sel->get_index(i);

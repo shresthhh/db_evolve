@@ -1,0 +1,175 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..9f78640 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -13,6 +13,7 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ 
+ namespace duckdb {
++extern int dbe_ablate;
+ 
+ using ValidityBytes = TupleDataLayout::ValidityBytes;
+ 
+@@ -577,7 +578,9 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, Vector &group_hashe
+ 	const auto new_group_count = FindOrCreateGroups(groups, group_hashes, state.addresses, state.new_groups);
+ 	VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(layout_ptr->GetAggrOffset()), payload.size());
+ 
+-	UpdateAggregates(payload, filter);
++	if (!(dbe_ablate & 2)) {
++		UpdateAggregates(payload, filter);
++	}
+ 
+ 	return new_group_count;
+ }
+@@ -749,7 +752,14 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
+ 		}
+ 		occupied_count = 0; // Have to set to 0 for next iterations
+ 
+-		if (new_entry_count != 0) {
++		if (new_entry_count != 0 && (dbe_ablate & 4096) && radix_bits == 0) {
++			static data_t dummy_row[4096];
++			for (idx_t new_entry_idx = 0; new_entry_idx < new_entry_count; new_entry_idx++) {
++				const auto index = empty_vector.get_index_unsafe(new_entry_idx);
++				entries[ht_offsets[index]].SetPointer(dummy_row);
++				addresses[index] = dummy_row;
++			}
++		} else if (new_entry_count != 0) {
+ 			// Append everything that belongs to an empty group
+ 			optional_ptr<PartitionedTupleData> data;
+ 			optional_ptr<PartitionedTupleDataAppendState> append_state;
+@@ -763,8 +773,10 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
+ 				append_state = &state.partitioned_append_state;
+ 			}
+ 			data->AppendUnified(*append_state, state.group_chunk, empty_vector, new_entry_count);
+-			RowOperations::InitializeStates(*layout_ptr, append_state->chunk_state.row_locations,
+-			                                *FlatVector::IncrementalSelectionVector(), new_entry_count);
++			if (!(dbe_ablate & 1)) {
++				RowOperations::InitializeStates(*layout_ptr, append_state->chunk_state.row_locations,
++				                                *FlatVector::IncrementalSelectionVector(), new_entry_count);
++			}
+ 
+ 			// Set the entry pointers in the 1st part of the HT now that the data has been appended
+ 			const auto row_locations = FlatVector::GetData<data_ptr_t>(append_state->chunk_state.row_locations);
+@@ -899,7 +911,13 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
+ 			throw InterruptException();
+ 		}
+ 		const auto input_chunk_size = fm_state.groups.size();
++		if (dbe_ablate & 256) {
++			continue;
++		}
+ 		FindOrCreateGroups(fm_state.groups, fm_state.hashes, fm_state.group_addresses, fm_state.new_groups_sel);
++		if (dbe_ablate & 128) {
++			continue;
++		}
+ 		RowOperations::CombineStates(state.row_state, *layout_ptr, fm_state.scan_state.chunk_state.row_locations,
+ 		                             fm_state.group_addresses, input_chunk_size);
+ 		if (layout_ptr->HasDestructor()) {
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..c99ad97 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -11,7 +11,17 @@
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/storage/temporary_memory_manager.hpp"
+ 
++#include "duckdb/main/client_config.hpp"
+ namespace duckdb {
++int dbe_ablate = 0;
++static void DbeReadAblate(ClientContext &context) {
++	Value v;
++	if (ClientConfig::GetConfig(context).GetUserVariable("dbe_ablate", v) && !v.IsNull()) {
++		dbe_ablate = v.GetValue<int32_t>();
++	} else {
++		dbe_ablate = 0;
++	}
++}
+ 
+ RadixPartitionedHashTable::RadixPartitionedHashTable(GroupingSet &grouping_set_p, const GroupedAggregateData &op_p,
+                                                      TupleDataValidityType group_validity_p)
+@@ -278,7 +288,10 @@ RadixHTConfig::RadixHTConfig(RadixHTGlobalSinkState &sink_p)
+ }
+ 
+ void RadixHTConfig::SetRadixBits(const idx_t &radix_bits_p) {
+-	const auto max_bits = MinValue(maximum_sink_radix_bits, ExternalRadixBits(true));
++	auto max_bits = MinValue(maximum_sink_radix_bits, ExternalRadixBits(true));
++	if (dbe_ablate & (1024 | 2048)) {
++		max_bits = maximum_sink_radix_bits;
++	}
+ 	SetRadixBitsInternal(MinValue(radix_bits_p, max_bits), false);
+ }
+ 
+@@ -354,6 +367,15 @@ idx_t RadixHTConfig::MaximumSinkRadixBits() const {
+ 	} else {
+ 		bits = MAXIMUM_FINAL_SINK_RADIX_BITS;
+ 	}
++	if (dbe_ablate & 512) {
++		bits = MAXIMUM_FINAL_SINK_RADIX_BITS;
++	}
++	if (dbe_ablate & 1024) {
++		return 9;
++	}
++	if (dbe_ablate & 2048) {
++		return 10;
++	}
+ 	// Capped by external radix bits
+ 	return MinValue(bits, ExternalRadixBits(false));
+ }
+@@ -399,6 +421,7 @@ RadixHTLocalSinkState::RadixHTLocalSinkState(ClientContext &, const RadixPartiti
+ }
+ 
+ unique_ptr<GlobalSinkState> RadixPartitionedHashTable::GetGlobalSinkState(ClientContext &context) const {
++	DbeReadAblate(context);
+ 	return make_uniq<RadixHTGlobalSinkState>(context, *this);
+ }
+ 
+@@ -551,8 +574,16 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 	auto &lstate = input.local_state.Cast<RadixHTLocalSinkState>();
+ 	if (!lstate.ht) {
+ 		lstate.local_sink_capacity = gstate.config.sink_capacity;
++		if (dbe_ablate & 4) {
++			lstate.local_sink_capacity = 1 << 22;
++		}
+ 		lstate.ht = CreateHT(context.client, lstate.local_sink_capacity, gstate.config.GetRadixBits());
+-		if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD) {
++		if (dbe_ablate & 8) {
++			lstate.adapted = true;
++		} else if (dbe_ablate & 32) {
++			lstate.ht->SkipLookups();
++			lstate.adapted = true;
++		} else if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD) {
+ 			// Not using grow strategy, so we enable the HLL to potentially adapt later
+ 			lstate.ht->EnableHLL(true);
+ 		} else {
+@@ -875,14 +906,16 @@ void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlob
+ 		ht->Abandon();
+ 	}
+ 
+-	// Now combine the uncombined data using this thread's HT
+-	ht->Combine(*partition.data, &partition.progress);
+-	partition.progress = 1;
++	if (!(dbe_ablate & 16)) {
++		// Now combine the uncombined data using this thread's HT
++		ht->Combine(*partition.data, &partition.progress);
++		partition.progress = 1;
+ 
+-	// Move the combined data back to the partition
+-	partition.data = make_uniq<TupleDataCollection>(BufferManager::GetBufferManager(gstate.context),
+-	                                                sink.radix_ht.GetLayoutPtr(), MemoryTag::HASH_TABLE);
+-	partition.data->Combine(*ht->AcquirePartitionedData()->GetPartitions()[0]);
++		// Move the combined data back to the partition
++		partition.data = make_uniq<TupleDataCollection>(BufferManager::GetBufferManager(gstate.context),
++		                                                sink.radix_ht.GetLayoutPtr(), MemoryTag::HASH_TABLE);
++		partition.data->Combine(*ht->AcquirePartitionedData()->GetPartitions()[0]);
++	}
+ 
+ 	// Update thread-global state
+ 	auto guard = sink.Lock();
+@@ -920,7 +953,7 @@ void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSo
+ 		scan_status = RadixHTScanStatus::IN_PROGRESS;
+ 	}
+ 
+-	if (!data_collection.Scan(scan_state, scan_chunk)) {
++	if ((dbe_ablate & 64) || !data_collection.Scan(scan_state, scan_chunk)) {
+ 		if (sink.scan_pin_properties == TupleDataPinProperties::DESTROY_AFTER_DONE) {
+ 			data_collection.Reset();
+ 		}

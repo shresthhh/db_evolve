@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "in_clause_rewriter.cpp: the new gate depends only on the query's shape. It requires an integral left type that is not HUGEINT or UHUGEINT, at most 64 entries, and every entry a non-NULL BoundConstantExpression of exactly the left type. It names no tables, columns, literals or data sizes. Lists with fewer than 6 entries still become OR conjunctions as before.",
+      "execute_operator.cpp: the bitmap logic is sound. The bitmap is used only when range < 4096, and 64 x 64 bits covers that. Casting signed values to uint64 before subtracting gives the correct offsets modulo 2^64 for negative values and for the full INT64 range. Values outside [min, max] are rejected before the bitmap is indexed. The values[64] array is protected by the n > 64 bail-out.",
+      "NULL handling is correct. A NULL on the left gives NULL, and so does a constant NULL vector. NULL constants never reach the fast path because of the gate, so NOT IN keeps its semantics. The fast path also bails out if the left vector's type differs from the expression's declared type.",
+      "Small cost: the constants are re-read and sorted, and the bitmap rebuilt, for every chunk. With at most 64 values this is negligible. Caching the prepared table in ExpressionState would be a possible later improvement, not a blocker.",
+      "The change does not touch timing, settings or tests, and does not move work to load time or background threads."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"in_clause_rewriter.cpp: the new gate depends only on the query's shape. It requires an integral left type that is not HUGEINT or UHUGEINT, at most 64 entries, and every entry a non-NULL BoundConstantExpression of exactly the left type. It names no tables, columns, literals or data sizes. Lists with fewer than 6 entries still become OR conjunctions as before.\",\"execute_operator.cpp: the bitmap logic is sound. The bitmap is used only when range < 4096, and 64 x 64 bits covers that. Casting signed values to uint64 before subtracting gives the correct offsets modulo 2^64 for negative values and for the full INT64 range. Values outside [min, max] are rejected before the bitmap is indexed. The values[64] array is protected by the n > 64 bail-out.\",\"NULL handling is correct. A NULL on the left gives NULL, and so does a constant NULL vector. NULL constants never reach the fast path because of the gate, so NOT IN keeps its semantics. The fast path also bails out if the left vector's type differs from the expression's declared type.\",\"Small cost: the constants are re-read and sorted, and the bitmap rebuilt, for every chunk. With at most 64 values this is negligible. Caching the prepared table in ExpressionState would be a possible later improvement, not a blocker.\",\"The change does not touch timing, settings or tests, and does not move work to load time or background threads.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1331812,
+  "seconds": 30.039312839508057,
+  "error": ""
+}

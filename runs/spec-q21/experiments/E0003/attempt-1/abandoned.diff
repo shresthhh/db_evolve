@@ -1,0 +1,48 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..1f77b22 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -770,9 +770,9 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// bf is only supported for joins with a single equality condition as the Filter API only allows
++	// single-column filters so far (the bf only hashes the equality columns, which come first)
++	const bool can_use_bf = ht->equality_predicate_columns.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 0801577..ac2970d 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -210,12 +210,12 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	case JoinType::LEFT:
+ 	case JoinType::OUTER:
+ 	case JoinType::ANTI:
+-	case JoinType::RIGHT_ANTI:
+-	case JoinType::RIGHT_SEMI:
+ 		// cannot generate join filters for these join types
+ 		// mark/single - cannot change cardinality of probe side
+ 		// left/outer always need to include every row from probe side
+-		// FIXME: anti/right_anti - we could do this, but need to invert the join conditions
++		// FIXME: anti - we could do this, but need to invert the join conditions
++		// note: right_semi/right_anti only emit build rows, and probe rows without a match never influence the
++		// output (they set no match flags), so filtering the probe side by the build keys is safe for those
+ 		return;
+ 	default:
+ 		break;
+@@ -302,7 +302,9 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// a delim get is the deduplicated key set of the outer side, which is typically much smaller than the
++			// probe side - treat it as filtering (the probe > build cardinality check still guards the bloom filter)
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}

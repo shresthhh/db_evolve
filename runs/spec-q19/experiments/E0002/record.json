@@ -1,0 +1,27 @@
+{
+  "id": "E0002",
+  "title": "Linear-time union in scan ConjunctionOr filter",
+  "started": "2026-11-20T23:51:15-05:00",
+  "base": "19d14c8bae37d370aec82fe6e64b9c9447568ecf",
+  "candidate": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.1000128,
+  "summary": "The issue's hypothesis was wrong. The lineitem OR-of-ranges filter is not a ConjunctionOrFilter. FilterCombiner::TryPushdownOrClause only builds ConjunctionOrFilter for an OR of plain comparisons, so an OR of BETWEEN/AND ranges is pushed as an EXPRESSION_FILTER and runs through ExpressionExecutor::SelectExpression. Replacing the quadratic union in CONJUNCTION_OR alone (the plan as written) moved the isolated scan only 2.62s\u21922.39s cumulative.\n\nAll changes are in src/storage/table/column_segment.cpp:\n1. New dense-mask path (TryDenseFilterSelection), used by both EXPRESSION_FILTER and CONJUNCTION_OR. It applies when the column is numeric (int8..int128, uint8..uint128, float, double), the vector is flat (vdata.sel unset), and the filter is a tree of AND/OR over comparisons (=, <>, <, >, <=, >=) and BETWEEN between the column itself (BOUND_REF index 0, same type) and non-NULL constants of exactly the column type. Each comparison becomes one branchless loop writing a 0/1 mask, AND/OR combine the masks, and the selection is emitted in input order. If the incoming sel is non-identity, the selected values are gathered into a compact buffer first. NULL rows are dropped at the end via validity, which is correct because the tree has no NOT. Anything else falls through to the existing code.\n2. CONJUNCTION_OR fallback: the O(n\u00b2) duplicate-check union is replaced by a per-row bool bitmap. Later children only see rows not yet matched, and the output keeps input order. This only applies when all sel indices are < STANDARD_VECTOR_SIZE; otherwise the old loop runs (scan_count can exceed the vector size).\n\nMeasured with dbe-tool on my build:\n- Isolated `count(*) WHERE OR of 3 ranges`: scan 2.32s\u21920.97s cumulative, 0.305s\u21920.134s wall. That is now the same cost as a single BETWEEN (0.97s).\n- bench q19: \u22127.3% and \u221211.3% on two runs (155\u2192144ms, 163\u2192145ms).\n- An intermediate version without the gather (masking all 2048 rows even with a sparse incoming sel) was +5.2% slower on q19 on two runs. The gather fixed that.\n- bench result checks passed on every run.",
+  "notes": "- Profile ToString looks the same for ConjunctionOrFilter and ExpressionFilter. Check which TableFilterType actually reaches FilterSelection before optimizing it.\n- In the scan, the OR filter often runs after more selective filters (shipinstruct eq, the bloom-filter dynamic filter), so work must stay proportional to the incoming sel. Dense evaluation of the full vector cost +5%; gathering first fixed it.\n- Possible follow-up: make TryPushdownOrClause build ConjunctionOr-of-ConjunctionAnd TableFilters for OR-of-ranges. That would also enable zonemap pruning through ConjunctionOrFilter::CheckStatistics, but it is a riskier plan-level change.\n- The remaining lineitem scan cost in q19 is the other filters: the string-equality filter, the optional IN filter on another string column, and the bloom-filter dynamic filter.",
+  "train_ratio": 0.6213228105878142,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q19": 0.6213228105878142
+  },
+  "improved": [
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-21T00:06:01-05:00"
+}

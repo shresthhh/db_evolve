@@ -1,0 +1,27 @@
+{
+  "id": "E0005",
+  "title": "Partition count(DISTINCT) radix table on the group-key hash only",
+  "started": "2026-11-20T21:06:35-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "084cba35c5dc243f7353ec8dcacb699f227beeda",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.1442592,
+  "summary": "The count(DISTINCT) hash table for a grouped aggregate now takes its partition bits from the hash of the GROUP BY columns only. The tree builds. q16 measured 193.5 \u2192 167.9 ms (-13.3%) on the first bench and 180.8 \u2192 158.7 ms (-12.2%) on a second full bench. Both runs passed the result check.\n\nHow it works:\n- **Hash table (`aggregate_hashtable.cpp/.hpp`):** new `SetPartitionKeyCount(n)` setter (0 means off) and a private `HashGroups` helper. The helper computes the usual hash over all group columns, then hashes the first n columns the same way `DataChunk::Hash` does. It copies only the radix-bit range (`RadixPartitioning::Mask(MAX_RADIX_BITS)`, bits 36\u201347) from that key hash into the full hash. Salt bits and pointer-table bits still come from the full hash.\n- **Where it applies:** `AddChunk(groups, payload, filter)` and `FindOrCreateGroups(groups, addresses, new_groups)` both use the helper. The dictionary/constant fast path is skipped when the option is on.\n- **Why it is consistent:** combine, repartition, resize, spilling and finalize all reuse the stored hash column, so every insert into the table uses the same hash.\n- **Radix table (`radix_partitioned_hashtable.cpp/.hpp`):** new public field `partition_key_count`, passed to every table built by `CreateHT`.\n- **Hash aggregate constructor (`physical_hash_aggregate.cpp`):** when `estimated_cardinality >= 4096` (q16 estimates about 64k), each distinct radix table of a non-empty grouping set gets `partition_key_count = grouping_set.size()`. The grouping set is an ordered set, so the group columns come first in the distinct table, before the distinct argument columns.\n- **Effect:** every distinct partition holds complete groups, so each distinct-finalize task feeds far fewer groups into its local main table.\n\nCorrectness checks: I compared results on this build against equivalent queries using `len(list_distinct(list(x)))` and `list_sum(list_distinct(...))`. They are not a run of the original engine. All matched:\n- ROLLUP over an int key and a VARCHAR key with NULLs, with count(DISTINCT), count(DISTINCT) FILTER and sum(DISTINCT), on 2M rows and 25k groups.\n- GROUPING SETS including the empty set and count(DISTINCT) of a group column itself, on a real table with dictionary-compressed columns.\n- A spilling case at memory_limit 60MB with 4 threads, 6M rows and 300k groups. The list_distinct reference ran out of memory at 60MB, so it was checked without the limit.\n\nI did not add a temporary counter to confirm that the main local hash table stops abandoning. The measured gain made that check unnecessary.",
+  "notes": "The gain (-12 to -13%) matches the hypothesis that re-sinking the distinct tuples into the main table was the cost. Other users of the hash table (streaming window, recursive CTE) pass their own hashes or do not set the option, so they are unaffected.\n\nFollow-up ideas:\n- The same splice could serve other two-level aggregations, for example a single-group-column dictionary path that hashes the group key directly.\n- Since distinct partitions now hold whole groups, the distinct finalize could skip the main-table combine entirely and write final results per partition. That is a bigger change but removes the main finalize.\n- The 4096 cardinality gate is a heuristic. A runtime check on the HLL of the group columns would be more robust.",
+  "train_ratio": 0.8424702978420423,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 0.8424702978420423
+  },
+  "improved": [
+    "q16"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T21:13:56-05:00"
+}

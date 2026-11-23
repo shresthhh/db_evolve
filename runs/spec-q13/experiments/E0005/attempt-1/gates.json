@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/function/scalar/string/contains.cpp: this is a general Mu\u0142a-style first+last byte substring search inside FindStrInStr. It uses SSE2 with a SWAR fallback and gates only on needle length >= 2 and haystack size <= 256. It never refers to a query, table, column or literal.",
+      "Bounds: with position_count = haystack_size - (needle_size-1), the highest byte any SSE2 or SWAR load reads is start+last_offset+15 (or +7), which is at most haystack_size-1. The overlapping final block shifts its mask by (i+B-position_count), which lands each bit on position i+j. No over-read and no position is skipped.",
+      "SWAR uses the exact zero-byte formula ~(((x&0x7F..)+0x7F..)|x|0x7F..), so it gives no false positives. Bits are visited low to high, so the leftmost match is returned, matching the old memchr+Contains<> path.",
+      "Edge cases behave correctly: an empty haystack, a needle longer than the haystack (returns INVALID_INDEX before the block search), needle_size==2 (the middle memcmp is skipped), and empty needles (handled by the caller). Big-endian and non-GCC builds keep the original path.",
+      "No cost is moved elsewhere, nothing in timing or measurement is touched, and the change is small and self-contained."
+    ],
+    "required_changes": []
+  }
+}

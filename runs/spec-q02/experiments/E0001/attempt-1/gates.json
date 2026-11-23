@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/storage/table/row_group_collection.cpp GetParallelScanMorselVectors: the morsel size depends only on the total row count, the configured row_group_size and the scheduler thread count. It aims for 4 morsels per thread, uses at least 4 vectors and never more than one row group. Nothing in it refers to table names, columns, literals or this dataset. Large tables reach the row-group cap and keep the old whole-row-group path.",
+      "NextParallelScan: the sub-row-group branch is the existing verify_parallelism path, which already starts scans at a vector offset through InitializeScanWithOffset. It now advances by N vectors instead of 1. The `|| state.vector_index > 0` term finishes a row group that was already partly handed out. So the scan stays correct even if the thread count changes during a scan and the morsel size changes with it, or if a row group is larger than the collection's row_group_size. batch_index still increases on every handout, so order-preserving sinks are unaffected. processed_rows now counts each morsel's rows. Before, the verify path never added to it at all, so this fixes a small progress-bar bug.",
+      "src/storage/data_table.cpp MaxThreads: uses the same helper, so the number of tasks matches the number of morsels handed out. It never raises the thread count above what the user configured.",
+      "No changes to timing, settings, tests or output. The change is small and focused. The only cost is more lock acquisitions and more batches for small and medium tables, which the minimum morsel size limits."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0008",
+  "title": "Contains-filter scan selectivity to flip q09 build sides at SF10",
+  "started": "2026-11-17T18:56:09-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "f3239195db92fccd7fb0c344e2aa0b6a04be2ed8",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.454971,
+  "summary": "In src/optimizer/join_order/relation_statistics_helper.cpp, I added a file-local `IsContainsFilter(const TableFilter&)`. It matches an ExpressionFilter whose expression is a BoundFunctionExpression named \"contains\" with 2 children, where the second child is a non-NULL VARCHAR constant of at least 3 bytes. It also recurses into ConjunctionAndFilter children. When a scan has no equality filter and a non-optional filter is a contains filter, ExtractGetStats now uses DEFAULT_SELECTIVITY*0.2 = 0.04 instead of 0.2. Only estimates change; no headers were touched.\n\nSTEP 1 (EXPLAIN ANALYZE on q09.m0): the part estimate drops from 400k to about 80k, and the join order changes completely. part\u22c8partsupp (436k actual) is now the build side for the lineitem probe. The orderkey join now builds on the 3.27M lineitem stream with the 15M-row orders as the probe. Total time went from about 1.2s to 0.95s in the profile.\n\nSTEP 2 (full bench): q09 went from 1211 to 709 ms (-41.4%), and a re-run gave 1096 to 702 ms (-36%). Geomean -6.5%. The other templates were within noise. q04 was +5.6% in the first run, but re-running it gave -16.1%; it has no contains filter, so its plan can't be affected.",
+  "notes": "At SF10 this flips the q09 plan as the hypothesis predicted, unlike E0002 at SF1. The selectivity constant (0.04) is a heuristic. The 3-byte minimum on the literal is a guard against short, common needles flipping joins the wrong way. A possible follow-up is to scale selectivity with literal length, or to apply a similar reduction to multi-wildcard LIKE patterns (e.g. '%a%b%'), which DuckDB does not rewrite to contains(). In the new q09 plan, lineitem still gets only min/max dynamic filters, with no bloom filter on l_partkey, which may be worth looking into.",
+  "train_ratio": 0.9703874800057445,
+  "val_ratio": 0.9945021327101758,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.062305313588855,
+    "q03": 1.0120676949656744,
+    "q04": 1.067275583672147,
+    "q05": 1.0242647480801161,
+    "q07": 0.9922674366498893,
+    "q08": 0.9717845689487743,
+    "q09": 0.6208736780191891,
+    "q13": 0.9662087558398812,
+    "q14": 0.9832712526249336,
+    "q16": 1.0338462380000346,
+    "q17": 1.0099467906640458,
+    "q18": 0.9921077662902725,
+    "q19": 0.9640770756392031,
+    "q22": 0.983362223220295
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-17T19:14:49-05:00"
+}

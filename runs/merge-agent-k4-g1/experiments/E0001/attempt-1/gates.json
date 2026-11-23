@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "This is a clean merge of the q01 and q19 changes, which were accepted separately. Neither change is altered and there are no new source edits. Nothing in the diff refers to table names, column names, literals or dataset sizes.",
+      "avg.cpp: the int64 state is used only when min/max statistics times max_cardinality prove the sum fits in int64. Finalize goes through hugeint, so the result matches the hugeint path. Decimal avg keeps its scale divisor through bind_data in GetAverageDivident. Marking avg as NOT_ORDER_DEPENDENT applies only to the exact integer state paths.",
+      "perfect_aggregate_hashtable.cpp: replication is limited to order-independent, non-DISTINCT aggregates and a 1MB array size. Combine merges all of the source's replicas into the target's replica 0. Scan folds the table's own replicas exactly once (guarded by replicas_folded). Destroy covers every replica. The fused update is limited to count_star, sum_no_overflow and avg with 8-byte or 16-byte int64 states, INT32/INT64 inputs, no FILTER, no DISTINCT and no destructor. NULL rows are skipped through validity.",
+      "column_segment.cpp: the dense mask path runs only on flat numeric vectors with non-NULL constants and AND/OR/comparison/BETWEEN trees on column 0. NULL rows are excluded through validity. The bitmap union only runs when every sel index is below STANDARD_VECTOR_SIZE; otherwise the original loop runs. Output keeps input order.",
+      "optimizer.cpp: moving JoinDependentFilterRule before DistributivityRule only reorders existing rewrite rules. That rule only adds derived filters, so results stay correct."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,31 @@
+$ ninja -C /home/shresth/dev/db_evolve/work/build/slot0 -j 8
+ninja: Entering directory `/home/shresth/dev/db_evolve/work/build/slot0'
+[1/28] Building CXX object src/optimizer/compressed_materialization/CMakeFiles/duckdb_optimizer_compressed_materialization.dir/ub_duckdb_optimizer_compressed_materialization.cpp.o
+[2/28] Building CXX object src/optimizer/pullup/CMakeFiles/duckdb_optimizer_pullup.dir/ub_duckdb_optimizer_pullup.cpp.o
+[3/28] Building CXX object src/optimizer/pushdown/CMakeFiles/duckdb_optimizer_pushdown.dir/ub_duckdb_optimizer_pushdown.cpp.o
+[4/28] Building CXX object src/optimizer/statistics/operator/CMakeFiles/duckdb_optimizer_statistics_op.dir/ub_duckdb_optimizer_statistics_op.cpp.o
+[5/28] Building CXX object src/optimizer/join_order/CMakeFiles/duckdb_optimizer_join_order.dir/ub_duckdb_optimizer_join_order.cpp.o
+[6/28] Building CXX object src/planner/CMakeFiles/duckdb_planner.dir/ub_duckdb_planner.cpp.o
+[7/28] Building CXX object src/optimizer/CMakeFiles/duckdb_optimizer.dir/ub_duckdb_optimizer.cpp.o
+[8/28] Building CXX object src/optimizer/rule/CMakeFiles/duckdb_optimizer_rules.dir/ub_duckdb_optimizer_rules.cpp.o
+[9/28] Building CXX object src/planner/binder/query_node/CMakeFiles/duckdb_bind_query_node.dir/ub_duckdb_bind_query_node.cpp.o
+[10/28] Building CXX object src/planner/subquery/CMakeFiles/duckdb_planner_subquery.dir/ub_duckdb_planner_subquery.cpp.o
+[11/28] Building CXX object src/execution/nested_loop_join/CMakeFiles/duckdb_nested_loop_join.dir/ub_duckdb_nested_loop_join.cpp.o
+[12/28] Building CXX object src/planner/expression_binder/CMakeFiles/duckdb_expression_binders.dir/ub_duckdb_expression_binders.cpp.o
+[13/28] Building CXX object src/planner/operator/CMakeFiles/duckdb_planner_operator.dir/ub_duckdb_planner_operator.cpp.o
+[14/28] Building CXX object src/planner/binder/tableref/CMakeFiles/duckdb_bind_tableref.dir/ub_duckdb_bind_tableref.cpp.o
+[15/28] Building CXX object src/execution/operator/join/CMakeFiles/duckdb_operator_join.dir/ub_duckdb_operator_join.cpp.o
+[16/28] Building CXX object src/execution/CMakeFiles/duckdb_execution.dir/ub_duckdb_execution.cpp.o
+[17/28] Building CXX object src/storage/serialization/CMakeFiles/duckdb_storage_serialization.dir/ub_duckdb_storage_serialization.cpp.o
+[18/28] Building CXX object src/execution/physical_plan/CMakeFiles/duckdb_physical_plan.dir/ub_duckdb_physical_plan.cpp.o
+[19/28] Updating .cache/clangd (slot0)
+[20/28] Building CXX object src/common/CMakeFiles/duckdb_common.dir/ub_duckdb_common.cpp.o
+[21/28] Linking CXX static library src/libduckdb_static.a
+[22/28] Linking CXX shared library extension/tpch/tpch.duckdb_extension
+[23/28] Linking CXX shared library extension/core_functions/core_functions.duckdb_extension
+[24/28] Linking CXX executable tools/plan_serializer
+[25/28] Linking CXX shared library src/libduckdb.so
+[26/28] Linking CXX shared library extension/parquet/parquet.duckdb_extension
+[27/28] repository
+[28/28] Linking CXX executable duckdb
+

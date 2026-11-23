@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "join_filter_pushdown_optimizer.cpp: the new BOUND_FUNCTION case matches the engine's own `__internal_compress_integral_*(x, const)` function that compressed materialization inserts. It does not refer to any table, column or literal from the query. Any hash join whose probe key passes through a CM integral compress projection qualifies.",
+      "Semantics check: compress_integral.cpp:21 computes `input - min_val` and asserts min_val <= input, so c == k exactly when x == k + offset. FinalizeFilters shifts min/max by adding the offset in hugeint and then casting to the storage type; if the cast fails the column is skipped. Because the shift is monotonic with no wrap, the GE/LE/single-value ConstantFilters stay correct for =, <, > and the other comparisons.",
+      "Exact BF: lookups test (x - offset) using wrapping uint64 arithmetic. Every value x - offset that equals a build key is found, so the filter has no false negatives. A hashed (non-exact) BF is never pushed for an offset column. As a further guard, Filter, FilterValue and CheckStatistics let every row pass when has_key_offset is set and the filter is not exact. In the stats overlap check, the range bounds are computed in hugeint, so they cannot overflow.",
+      "Guards are in place: the IN-list filter is skipped for offset columns; UINT64 and hugeint inputs are rejected; chained offsets are rejected through the HasOffset check; the offset is copied into UNION children; TopN and RowGroupPruner, which reuse GetPushdownFilterTargets with unshifted boundary values, return early. NULL min/max still follows the existing `continue` path.",
+      "The serialization fields 203/204 are optional with defaults, so older plans stay compatible. The prefetch experiment (Part B) was removed and nothing from it is left in the diff. No tests, settings or timing code are touched."
+    ],
+    "required_changes": []
+  }
+}

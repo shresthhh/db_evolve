@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "output": {
+    "status": "ready",
+    "summary": "I left the code as it was. The q02 and q21 patches had both applied cleanly to the working tree, so nothing needed combining. The tree builds (BUILD OK). On the quick bench (2 bindings per template, 4 hot runs each), against the current best: q02 went from 82.4 to 40.3 ms (-51.1%), q21 from 832.5 to 697.7 ms (-16.2%), and the geomean is -36.0%. Neither change slowed the other template, so I didn't guard or drop either one.",
+    "generality": "The scope is the same as the two source changes, unchanged by the merge. The q02 change rewrites a correlated MIN/MAX scalar subquery taken over a subset of the outer join into a window aggregate, and uses sub-row-group scan morsels for tables with few row groups. The q21 change adds an exact key-bitmap mode for the join bloom filter (BF), for dense integer keys, and pushes the BF into subquery scans that feed a DELIM_GET build. Each one only applies in the plan shapes it was written for.",
+    "notes": "The two patches touched different logic, so there was nothing to reconcile. The bench I ran was the quick check only; I didn't run the longer interleaved timing."
+  },
+  "text": "{\"status\":\"ready\",\"summary\":\"I left the code as it was. The q02 and q21 patches had both applied cleanly to the working tree, so nothing needed combining. The tree builds (BUILD OK). On the quick bench (2 bindings per template, 4 hot runs each), against the current best: q02 went from 82.4 to 40.3 ms (-51.1%), q21 from 832.5 to 697.7 ms (-16.2%), and the geomean is -36.0%. Neither change slowed the other template, so I didn't guard or drop either one.\",\"generality\":\"The scope is the same as the two source changes, unchanged by the merge. The q02 change rewrites a correlated MIN/MAX scalar subquery taken over a subset of the outer join into a window aggregate, and uses sub-row-group scan morsels for tables with few row groups. The q21 change adds an exact key-bitmap mode for the join bloom filter (BF), for dense integer keys, and pushes the BF into subquery scans that feed a DELIM_GET build. Each one only applies in the plan shapes it was written for.\",\"notes\":\"The two patches touched different logic, so there was nothing to reconcile. The bench I ran was the quick check only; I didn't run the longer interleaved timing.\"}",
+  "cost_usd": 0.06880299999999999,
+  "seconds": 39.74769473075867,
+  "error": ""
+}

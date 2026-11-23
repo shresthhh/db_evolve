@@ -1,0 +1,27 @@
+{
+  "id": "E0004",
+  "title": "Perfect hash join for RIGHT joins on dense unique build keys",
+  "started": "2026-11-20T13:49:34-05:00",
+  "base": "3f681052d02888a9e4890373f5b1799644bae2c3",
+  "candidate": "6d8309dd1704585b563824468a1591c78480b328",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.6416496,
+  "summary": "I extended the perfect hash join to RIGHT outer joins (build side preserved) and allowed dense build key ranges up to 2^22. Measured on q13: the bench went from 563.4 to 448.8 ms (-20.3%). The HASH_JOIN operator dropped from 1.87s to 0.19s CPU. The only new cost is 0.16s in the decompress projection above the join, because it now gets dictionary vectors.\n\nChanges:\n1) perfect_hash_join_executor.cpp, CanDoPerfectHashJoin:\n   - Accepts JoinType::RIGHT as well as INNER, with the same single integer-equality condition.\n   - Bails out if the build min or max is NULL.\n   - Allows build ranges between 2^20 and 2^22 only if two guards hold. Density: Count*4 >= range+1. Memory: slots*(8+1+sum of rhs_output type sizes) <= max_memory/8.\n   - Fixed an off-by-one in the duplicate early-out: it was `Count > range` and is now `Count > range+1`. The old check rejected every fully dense unique key set, for INNER joins too. It is only a heuristic; the build fill still detects duplicates exactly.\n2) The build fill now skips NULL keys. RIGHT-join hash tables keep rows with NULL keys but leave has_null false, so without this the garbage key value of a NULL row could match.\n3) For joins that propagate the build side:\n   - FullScanHashTable records slot_to_row (the tuple address of each slot) and a zeroed per-slot slot_found byte array.\n   - ProbePerfectHashTable sets slot_found for every matched slot.\n   - A new PerfectHashJoinExecutor::PropagateFoundMatches() stores true at row+tuple_size for each found slot. This is the same flag JoinHashTable::ScanFullOuter reads. It is called from HashJoinGlobalSourceState::PrepareScanHT under the source lock, after the probe pipeline has finished, so the existing full-outer scan works unchanged. The tuple pointers stay valid because ScanKeyColumn pins with KEEP_EVERYTHING_PINNED.\n4) join_filter_pushdown_optimizer.cpp: `compute_aggregates_anyway` now also covers RIGHT joins, so the build min/max is computed even when no table scan takes the pushed filter. Without this the RIGHT join never got a range: here the probe keys sit behind a compress projection.\n\nCorrectness checks all matched the same query forced onto the regular join (keys cast to VARCHAR). They covered:\n- NULL build keys with a 2M range on the large path\n- NULL probe keys\n- unmatched build rows\n- VARCHAR and DOUBLE build output columns\n- a sparse range (keys spaced by 3)\n- duplicate build keys, which fall back to the regular join\n- an empty probe side, which outputs all build rows\n- a single-row build\n- an all-NULL build\n- INNER joins on dense keys\n- customer/orders LEFT and RIGHT joins with selective ON predicates",
+  "notes": "My first build showed no effect (-4%, which is noise) because two more gates outside the issue's plan blocked the path:\n(a) JoinFilterPushdownOptimizer computes min/max aggregates without a probe-side scan target only for INNER joins.\n(b) The duplicate early-out `Count > build_range` was off by one, so a fully dense key set 1..N was always rejected. This also affected INNER joins before this change.\n\nThings to know:\n- RIGHT-join hash tables store rows with NULL keys but do not set has_null, so any perfect-path code must check key validity.\n- Concurrent writes of the found byte are plain stores of the same value.\n\nFollow-ups:\n- The decompress projection above the join now gets dictionary vectors (0.16s CPU). A compress/decompress pair around the join that cancels out could be removed.\n- The PERFECT_HASH_GROUP_BY (0.45s) and the scan (2.47s, a string LIKE filter) now dominate q13.",
+  "train_ratio": 0.8073092036401344,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.8073092036401344
+  },
+  "improved": [
+    "q13"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-20T14:01:12-05:00"
+}

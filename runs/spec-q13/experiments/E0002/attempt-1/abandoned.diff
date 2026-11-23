@@ -1,0 +1,29 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..13d1cfe 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -1022,8 +1022,11 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &left, DataChunk &r
+ 					auto idx = chain_match_sel_vector.get_index(i);
+ 					// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
+ 					// threads Technically it is, but it does not matter, since the only value that can be written is
+-					// "true"
+-					Store<bool>(true, ptrs[idx] + ht.tuple_size);
++					// "true". Only write when not yet set, to avoid invalidating shared cache lines
++					const auto found_ptr = ptrs[idx] + ht.tuple_size;
++					if (!Load<bool>(found_ptr)) {
++						Store<bool>(true, found_ptr);
++					}
+ 				}
+ 			}
+ 
+@@ -1165,7 +1168,10 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys) {
+ 			// for each match found in the current pass - mark the match as found
+ 			for (idx_t i = 0; i < result_count; i++) {
+ 				auto idx = chain_match_sel_vector.get_index(i);
+-				Store<bool>(true, ptrs[idx] + ht.tuple_size);
++				const auto found_ptr = ptrs[idx] + ht.tuple_size;
++				if (!Load<bool>(found_ptr)) {
++					Store<bool>(true, found_ptr);
++				}
+ 			}
+ 		}

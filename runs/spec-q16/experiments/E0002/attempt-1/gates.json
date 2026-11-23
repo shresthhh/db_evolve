@@ -1,0 +1,21 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/aggregate_hashtable.cpp:758 adds one condition, `layout_ptr->AllConstant()`, to the choice between staging new groups in `unpartitioned_data` and appending them straight to `partitioned_data`. The condition depends only on the physical layout type (whether it has heap columns such as VARCHAR or LIST). It names no query, table, column, literal or data size.",
+      "Correctness: the direct partitioned-append path was already used for any chunk with many new groups. Code downstream already handles an empty `unpartitioned_data` (Abandon, AcquirePartitionedData, Resize), so heap layouts take a path that already existed. This holds for NULLs, empty inputs, spilling and parallel execution.",
+      "There is no measurement tampering, no shift of cost to unmeasured phases, and no dead code. It is a minimal one-line change with an explanatory comment. The measured gain is small (about 5% median) but looks real, and it applies to any multi-threaded GROUP BY or DISTINCT on string keys."
+    ],
+    "required_changes": []
+  }
+}

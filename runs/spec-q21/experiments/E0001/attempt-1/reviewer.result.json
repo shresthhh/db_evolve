@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp CanUseBloomFilter: the gate changes from `conditions.size()==1` to `equality_predicate_columns.size()==1`, and `cmp == COMPARE_EQUAL` is still required. The JoinHashTable constructor (join_hashtable.cpp:43-60) asserts that equality conditions come first and hashes only those columns. So when there is one equality, the bloom filter holds Hash(cond[0]) and PushBloomFilter's use of conditions[0] and NullValuesAreEqual(0) points at the right key. A non-equality condition reaching FinalizeFilters fails the cmp check, so it never gets a bloom filter. Combining one EQUAL with one NOT DISTINCT FROM gives size 2, so the filter stays off; a single NOT DISTINCT FROM is excluded by the cmp check. I found no input that gives a wrong result. NULL handling is the same as before.",
+      "join_filter_pushdown_optimizer.cpp: for a DELIM_GET build side, build_side_has_filter is now always true instead of IsFiltering(probe side). This is a general cost heuristic with no names, literals or dataset knowledge in it. The existing probe>build cardinality check and the adaptive SelectivityOptionalFilter still limit the downside. Join-type safety for pushdown is decided elsewhere and is unchanged.",
+      "The change is small and clean, matches the issue, and contains nothing tied to the benchmark. The measured gain is modest, around 4-7.5%, but real."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"physical_hash_join.cpp CanUseBloomFilter: the gate changes from `conditions.size()==1` to `equality_predicate_columns.size()==1`, and `cmp == COMPARE_EQUAL` is still required. The JoinHashTable constructor (join_hashtable.cpp:43-60) asserts that equality conditions come first and hashes only those columns. So when there is one equality, the bloom filter holds Hash(cond[0]) and PushBloomFilter's use of conditions[0] and NullValuesAreEqual(0) points at the right key. A non-equality condition reaching FinalizeFilters fails the cmp check, so it never gets a bloom filter. Combining one EQUAL with one NOT DISTINCT FROM gives size 2, so the filter stays off; a single NOT DISTINCT FROM is excluded by the cmp check. I found no input that gives a wrong result. NULL handling is the same as before.\",\"join_filter_pushdown_optimizer.cpp: for a DELIM_GET build side, build_side_has_filter is now always true instead of IsFiltering(probe side). This is a general cost heuristic with no names, literals or dataset knowledge in it. The existing probe>build cardinality check and the adaptive SelectivityOptionalFilter still limit the downside. Join-type safety for pushdown is decided elsewhere and is unchanged.\",\"The change is small and clean, matches the issue, and contains nothing tied to the benchmark. The measured gain is modest, around 4-7.5%, but real.\"],\"required_changes\":[]}",
+  "cost_usd": 0.22348679999999999,
+  "seconds": 34.84183478355408,
+  "error": ""
+}

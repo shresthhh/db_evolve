@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The diff is the union of three changes that were each accepted on their own: a large perfect hash aggregate with striped parallel combine and a parallel source (perfect_aggregate_hashtable.cpp, physical_perfecthash_aggregate.cpp, plan_aggregate.cpp); a perfect hash join for RIGHT joins (perfect_hash_join_executor.cpp, physical_hash_join.cpp, join_filter_pushdown_optimizer.cpp); and partitioning the count(DISTINCT) radix table on the group-key hash (aggregate_hashtable.cpp, radix_partitioned_hashtable.cpp, physical_hash_aggregate.cpp). The files they touch do not overlap, and I found no edits beyond the source patches.",
+      "All gates depend on general plan or data properties: the number of perfect-hash bits against the threshold, how dense the estimated cardinality is, max_memory divided by threads, whether the build keys are dense and unique, the join type, and an estimated cardinality of at least 4096 for distinct partitioning. Nothing names a table, column, literal or scale factor.",
+      "Correctness guards are in place. The RIGHT-join perfect hash join skips NULL build keys when filling the selection vector, bails out when min or max is NULL, and fixes the off-by-one in the duplicate check. Parallel combine takes a lock per stripe and uses a separate arena per thread. The parallel scan gives each thread its own address vector and allocator. SetPartitionKeyCount turns itself off unless the partition key is a strict prefix of the group columns, and it skips the compressed-groups fast path so hashing stays consistent.",
+      "Interaction check: distinct aggregates never reach the perfect hash aggregate path (CanUsePerfectHashAggregate rejects them), so the q16 distinct partitioning and the q13 perfect hash aggregate change cannot apply to the same operator."
+    ],
+    "required_changes": []
+  }
+}

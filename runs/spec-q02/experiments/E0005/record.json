@@ -1,0 +1,28 @@
+{
+  "id": "E0005",
+  "title": "Raise selectivity ratio required to materialize a common multi-table subplan",
+  "started": "2026-11-19T23:46:25-05:00",
+  "base": "fa5fe35db0c12f28f99bbc74bbeb251e46e774c5",
+  "candidate": "2c8bb5e819a3f5507c9a42337fb4969d3440d3ba",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q02 +1.6%; needs at least -5%)",
+    "visible geomean got slower (+1.6%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.31626760000000004,
+  "summary": "I changed one constant in CommonSubplanFinder::IsSelectiveMultiTablePlan (src/optimizer/common_subplan_optimizer.cpp:977): CARDINALITY_RATIO goes from 2 to 8. A non-aggregate multi-table subplan estimated above 2048 rows is now materialized only if its estimate is below 1/8 of its largest base table. The 2048 threshold and the aggregate/distinct path are unchanged. The tree builds (BUILD OK). EXPLAIN ANALYZE of q02.m0 confirms the __common_subplan CTE is gone (the baseline plan in .dbe/profile.md has it). supplier\u22c8nation\u22c8region is now computed separately in the outer query and in the decorrelated min() subquery, with direct table-scan build sides and dynamic filters on supplier and partsupp. Results matched in every bench run. Six bench runs on q02 (best vs mine, ms): 49.9\u219247.9 (-4.1%), 52.6\u219255.0 (+4.7%), 51.5\u219248.1 (-6.5%), 55.2\u219242.8 (-22.5%), 51.7\u219248.7 (-5.9%), 49.1\u219246.6 (-5.1%). The median is about -5.5%, much less than the -20 to -25% the issue predicted. The baseline ran at about 50 ms in bench, not the 68 ms the hypothesis measured, so the barrier costs less than estimated in this harness. The gain is real but small and noisy, close to the 5% bar.",
+  "notes": "The issue predicted 68\u219250 ms, but the harness baseline is already about 50 ms, so the measured gain is only about 5% (median of 6 runs) and noisy, with one run at +4.7% and one at -22.5%. Without the CTE the join order looks the same as the baseline's CTE body: supplier probes the nation\u22c8region build, and partsupp probes part. So the gain comes from removing the barrier and the copy, not from a different join order. In the new plan the time goes mainly to the partsupp scan (~0.14s cumulative across threads), the part scan with its suffix filter (0.05s) and the supplier scan (0.06s). Follow-up: the decorrelated subquery side still rescans partsupp and supplier; sharing one partsupp scan between the outer side and the min() side is a possible next step.",
+  "train_ratio": 1.0160596065392178,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0160596065392178
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-19T23:49:25-05:00"
+}

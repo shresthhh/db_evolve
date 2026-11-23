@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp: removes the conditions.size()==1 limit so composite equality joins can push a bloom filter for the first key. It applies only when join_condition[filter_idx]==0 and both cmp and ht->conditions[0] are COMPARE_EQUAL. The has_cast, perfect-HT, build_side_has_filter and probe>build guards are kept. Nothing refers to the workload's names, literals or sizes.",
+      "join_hashtable.cpp Finalize: for multi-key HTs, gathers key column 0 from the stored rows with condition_types[0] and hashes it with VectorOperations::Hash, matching the probe-side BFTableFilter hash. InsertHashes skips the combined row hash when there are multiple keys. No other code reads the HT's bloom_filter (checked by grep).",
+      "The HT keeps op.conditions order (equality conditions first), so condition index 0 in FinalizeFilters is the same condition PushBloomFilter uses (conditions[0], NullValuesAreEqual(0)).",
+      "NULLs: the first condition must be COMPARE_EQUAL, so NULL probe keys never match and filtering them is correct. Build rows with NULL keys are either left out of the HT or only add false positives. The filter cannot drop a probe row that has a match.",
+      "Parallel finalize inserts into the bloom filter from several threads exactly as the existing single-key path does. Rows are pinned (KEEP_EVERYTHING_PINNED), so gathering VARCHAR keys is safe. The external join path is unchanged from the single-key case.",
+      "Not built or run by the reviewer. The author did not test NULL first keys or a spilling join, so those cases rest on code reading."
+    ],
+    "required_changes": []
+  }
+}

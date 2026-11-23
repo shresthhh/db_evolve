@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/join_hashtable.cpp: the change only adds __builtin_prefetch hints at four places: the probe loop (ProbeForPointersInternal), the build-row compare (GetRowPointersInternal), the build insert loop (InsertHashesLoop) and chain following (ScanStructure::AdvancePointers). A prefetch never faults or changes program state, so results cannot change.",
+      "Addresses are always in bounds. The probe and insert prefetches mask the offset with ht.bitmask, and the lookahead is guarded by i+16 < count. The row-pointer prefetches only use pointers that were just loaded and checked as valid or non-null.",
+      "The gate is general: capacity*sizeof(ht_entry_t) > 4MB. It depends on hash table size, not on any table, column, literal or dataset property, and it scales with data size.",
+      "The small-table path stays the same. The template parameter PREFETCH=false compiles away the probe-loop check, and the other gates are booleans set once outside the loops.",
+      "Minor: the AdvancePointers prefetch has no size gate, but it costs one instruction per followed pointer and only runs on chains. That is acceptable.",
+      "No changes to measurement, settings, threads or tests. The diff is small and focused on what the issue describes."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/execution/join_hashtable.cpp: the change only adds __builtin_prefetch hints at four places: the probe loop (ProbeForPointersInternal), the build-row compare (GetRowPointersInternal), the build insert loop (InsertHashesLoop) and chain following (ScanStructure::AdvancePointers). A prefetch never faults or changes program state, so results cannot change.\",\"Addresses are always in bounds. The probe and insert prefetches mask the offset with ht.bitmask, and the lookahead is guarded by i+16 < count. The row-pointer prefetches only use pointers that were just loaded and checked as valid or non-null.\",\"The gate is general: capacity*sizeof(ht_entry_t) > 4MB. It depends on hash table size, not on any table, column, literal or dataset property, and it scales with data size.\",\"The small-table path stays the same. The template parameter PREFETCH=false compiles away the probe-loop check, and the other gates are booleans set once outside the loops.\",\"Minor: the AdvancePointers prefetch has no size gate, but it costs one instruction per followed pointer and only runs on chains. That is acceptable.\",\"No changes to measurement, settings, threads or tests. The diff is small and focused on what the issue describes.\"],\"required_changes\":[]}",
+  "cost_usd": 0.09443399999999999,
+  "seconds": 15.275035619735718,
+  "error": ""
+}

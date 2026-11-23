@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "output": {
+    "status": "ready",
+    "summary": "I merged the q01 and q19 specialised systems. Both patches were already in the working tree with no conflicts, so I made no new source edits. The release build succeeded. Quick bench against the current best: q01 went from 322.1 to 286.2 ms (-11.1%), q19 from 300.3 to 157.6 ms (-47.5%), and the geomean is -31.7%. That was the quick check (2 bindings per template, 4 hot runs each), and both gains are well above its ~5% noise level.",
+    "generality": "The changes come straight from the source runs:\n- **For q01-shaped queries:** perfect-hash-table aggregation with a fused single pass for int64 sum/avg/count_star, the group state copied 4 times to break same-state dependency chains, and avg on int32/int64/decimal using an int64 sum state when column statistics prove it cannot overflow.\n- **For q19-shaped queries:** JoinDependentFilterRule now runs before DistributivityRule, so OR-of-AND join predicates produce per-table filters, and the scan's ConjunctionOr filter takes a linear-time union.\n\nEach change is gated by the same general plan and statistics conditions as in its source run.",
+    "notes": "The two patches touch separate files (aggregation code vs optimizer and scan filter), so they could not interfere, and the bench shows no cross-template slowdown."
+  },
+  "text": "{\"status\":\"ready\",\"summary\":\"I merged the q01 and q19 specialised systems. Both patches were already in the working tree with no conflicts, so I made no new source edits. The release build succeeded. Quick bench against the current best: q01 went from 322.1 to 286.2 ms (-11.1%), q19 from 300.3 to 157.6 ms (-47.5%), and the geomean is -31.7%. That was the quick check (2 bindings per template, 4 hot runs each), and both gains are well above its ~5% noise level.\",\"generality\":\"The changes come straight from the source runs:\\n- **For q01-shaped queries:** perfect-hash-table aggregation with a fused single pass for int64 sum/avg/count_star, the group state copied 4 times to break same-state dependency chains, and avg on int32/int64/decimal using an int64 sum state when column statistics prove it cannot overflow.\\n- **For q19-shaped queries:** JoinDependentFilterRule now runs before DistributivityRule, so OR-of-AND join predicates produce per-table filters, and the scan's ConjunctionOr filter takes a linear-time union.\\n\\nEach change is gated by the same general plan and statistics conditions as in its source run.\",\"notes\":\"The two patches touch separate files (aggregation code vs optimizer and scan filter), so they could not interfere, and the bench shows no cross-template slowdown.\"}",
+  "cost_usd": 0.0831958,
+  "seconds": 33.66126275062561,
+  "error": ""
+}

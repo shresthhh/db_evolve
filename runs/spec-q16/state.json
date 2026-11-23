@@ -1,0 +1,103 @@
+{
+  "run_id": "spec-q16",
+  "created": "2026-11-20T14:50:28-05:00",
+  "base_sha": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "best_sha": "084cba35c5dc243f7353ec8dcacb699f227beeda",
+  "generation": 2,
+  "round": 0,
+  "experiments": 6,
+  "train_ratio_vs_base": 0.8424702978420423,
+  "cost_usd": 11.621396400000002,
+  "releases": {
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "v1": "084cba35c5dc243f7353ec8dcacb699f227beeda"
+  },
+  "config": {
+    "project": {
+      "work_dir": "work",
+      "runs_dir": "runs",
+      "results_dir": "results"
+    },
+    "engine": {
+      "name": "duckdb",
+      "repo": "https://github.com/duckdb/duckdb",
+      "base_ref": "v1.5.6",
+      "version_override": "v1.5.6",
+      "build_jobs": 8,
+      "extensions": [
+        "tpch"
+      ],
+      "editable_paths": [
+        "src/",
+        "extension/parquet/",
+        "extension/core_functions/"
+      ],
+      "forbidden_paths": [
+        "test/",
+        "benchmark/",
+        "tools/",
+        "scripts/",
+        "extension/tpch/",
+        "extension/tpcds/",
+        ".github/"
+      ],
+      "max_diff_lines": 4000,
+      "branch": "dbe/spec/q16",
+      "tag_prefix": "dbe/spec/q16"
+    },
+    "workload": {
+      "name": "tpch",
+      "seed": 20261116,
+      "train_templates": 14,
+      "val_templates": 3,
+      "test_templates": 5,
+      "instances_per_template": 4,
+      "heldout_bindings": 2,
+      "focus": "q16"
+    },
+    "datasets": {
+      "main": {
+        "scale_factor": 10.0
+      },
+      "shadow": {
+        "scale_factor": 1.0
+      }
+    },
+    "bench": {
+      "threads": 8,
+      "warmup_runs": 1,
+      "timed_runs": 3,
+      "statement_timeout_s": 300,
+      "ab_order": "ABBA",
+      "retime_order": "BAAB"
+    },
+    "bar": {
+      "rule": "templates",
+      "min_template_gain": 0.05,
+      "max_geomean_regression": 0.0,
+      "min_gain": 0.02,
+      "noise_multiplier": 1.5,
+      "max_template_regression": 0.05,
+      "abs_slack_ms": 5.0,
+      "val_tolerance": 0.02
+    },
+    "agents": {
+      "backend": "claude-cli",
+      "model": "claude-opus-5-5",
+      "planner_budget_usd": 4.0,
+      "implementer_budget_usd": 15.0,
+      "reviewer_budget_usd": 3.0,
+      "max_total_usd": 0,
+      "timeout_s": 5400,
+      "max_fix_attempts": 2
+    },
+    "loop": {
+      "generations": 3,
+      "rounds_per_generation": 6,
+      "experiments_per_round": 1
+    },
+    "report": {
+      "passes": 4
+    }
+  }
+}

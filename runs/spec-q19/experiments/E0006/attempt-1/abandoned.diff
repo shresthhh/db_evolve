@@ -1,0 +1,52 @@
+diff --git a/src/storage/table/row_group.cpp b/src/storage/table/row_group.cpp
+index 1981972..984cdf2 100644
+--- a/src/storage/table/row_group.cpp
++++ b/src/storage/table/row_group.cpp
+@@ -10,6 +10,8 @@
+ #include "duckdb/execution/adaptive_filter.hpp"
+ #include "duckdb/execution/expression_executor.hpp"
+ #include "duckdb/planner/table_filter.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
++#include "duckdb/planner/filter/selectivity_optional_filter.hpp"
+ #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+ #include "duckdb/storage/metadata/metadata_reader.hpp"
+ #include "duckdb/storage/statistics/base_statistics.hpp"
+@@ -610,6 +612,29 @@ FilterPropagateResult RowGroup::CheckRowIdFilter(const TableFilter &filter, idx_
+ 	return filter.CheckStatistics(dummy_stats);
+ }
+ 
++//! Returns true if the filter can never remove rows by itself, i.e. it is a plain (zonemap-only) optional filter or
++//! a conjunction AND made up exclusively of such filters. Selectivity optional filters do remove rows.
++static bool IsZonemapOnlyFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::OPTIONAL_FILTER:
++		return !dynamic_cast<const SelectivityOptionalFilter *>(&filter);
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conj = filter.Cast<ConjunctionAndFilter>();
++		if (conj.child_filters.empty()) {
++			return false;
++		}
++		for (auto &child : conj.child_filters) {
++			if (!IsZonemapOnlyFilter(*child)) {
++				return false;
++			}
++		}
++		return true;
++	}
++	default:
++		return false;
++	}
++}
++
+ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
+ 	auto &filter_list = filters.GetFilterList();
+ 	// new row group - label all filters as up for grabs again
+@@ -623,7 +648,7 @@ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
+ 		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+ 			return false;
+ 		}
+-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
++		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER || IsZonemapOnlyFilter(filter)) {
+ 			// these are only for row group checking, set as always true so we don't check it
+ 			filters.SetFilterAlwaysTrue(i);
+ 		} else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {

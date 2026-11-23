@@ -1,0 +1,27 @@
+{
+  "id": "E0002",
+  "title": "Cut per-row VARCHAR-key overhead in radix hash aggregate (sink/repartition/combine)",
+  "started": "2026-11-20T15:04:44-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "5de6a78fdcd1803f28cc69754ab5c08d796cfd71",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q16 -0.6%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 2.3663372000000003,
+  "summary": "I measured the aggregate first, using temporary per-phase timers that have since been removed. Figures are CPU ms summed over 8 threads, from a warm q16 run.\n\n**Before the change:**\n- distinct-table sink AddChunk: ~253\n- Abandon: ~37\u201341. With a fixed-width key (hash(p_type)) it is ~2.\n- MaybeRepartition: ~97\u2013146. With a fixed-width key it is ~58.\n- distinct source Finalize/Combine: ~110\u2013126\n- Scan: ~18\n- main-HT sink, fed by the distinct scan: ~176\u2013190\n- main finalize: ~30\n\nCandidate (a) was the dominant VARCHAR-specific cost. The join feeds the aggregate small chunks of about 300 rows. So with 3 or more radix bits, new_entry_count / partitions <= 4 holds, and the new groups go into the unpartitioned staging collection. Every Abandon and every radix-bit growth then repartitions that data. For heap layouts this means copying heap data and recomputing pointers. Candidate (c) costs about the same as in the fixed-width reference, so it is not VARCHAR-specific.\n\n**Change:** one condition in `GroupedAggregateHashTable::FindOrCreateGroups` (`src/execution/aggregate_hashtable.cpp`), plus a comment. New groups are staged in `unpartitioned_data` only when `layout_ptr->AllConstant()`. Otherwise they are appended straight into `partitioned_data`, which is the normal path for chunks with many new groups. The unpartitioned collection then stays empty, so `Abandon`, `AcquirePartitionedData` and `Resize` handle it as a no-op.\n\n**After the change (same timers):** Abandon 37 \u2192 2, MaybeRepartition 97 \u2192 56, AddChunk 253 \u2192 221. That is about 110 ms CPU less in the distinct sink, which puts the VARCHAR-key sink roughly level with the fixed-width-key version.\n\n**Wall time (`dbe-tool bench q16`, seven runs):** -5.3%, -2.2%, +2.0%, -3.5%, -17.2%, -14.6%, -6.3%. The median is about -5%, right at the bar. The machine was very noisy: the reference build ranged from 179 to 253 ms, while this build stayed between 175 and 210 ms. All runs returned correct results. This is short of the 10\u201330% the issue expected.",
+  "notes": "- **Gotcha:** wrapping q16 in `SELECT count(*) FROM (...)` lets the optimizer drop the count(DISTINCT) aggregate. Use `max(supplier_cnt)` to measure the real plan.\n- **Timer trick:** `dbe-tool sql` shows stdout, so `Printer::RawPrint(STREAM_STDOUT)` from a gstate destructor works for quick timers. Run a trailing tiny GROUP BY in the same call to flush the cumulative counters.\n- **What remains in the q16 aggregate is per-row work common to both key types:**\n  - The main-HT sink from the distinct scan costs about 150 ns/row: 1.18M rows into 28k groups. A sink capacity of 32768 is below the 28k-group resize threshold, so the main HT may keep abandoning, but the earlier note says early HT growth only gave -3%.\n  - The distinct finalize combine is about 120 ms CPU.\n  - Repartitioning while radix bits grow 3\u21925\u21927 is about 56 ms CPU.\n- **Possible follow-up:** compact the hash-join output before the aggregate. The aggregate sees about 300-row chunks, which inflates per-chunk overhead in partitioned append and HT bookkeeping.",
+  "train_ratio": 0.9935354305751081,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 0.9935354305751081
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-20T15:19:45-05:00"
+}
