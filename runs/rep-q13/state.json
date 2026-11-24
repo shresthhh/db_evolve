@@ -3,13 +3,14 @@
   "created": "2026-11-23T17:34:58-05:00",
   "base_sha": "069cc9f9b5be802405797faecc284961b07c70ef",
   "best_sha": "6eb234ec7c02002c890caaa9350dd138404e58ed",
-  "generation": 1,
-  "round": 4,
-  "experiments": 3,
+  "generation": 2,
+  "round": 0,
+  "experiments": 6,
   "train_ratio_vs_base": 0.5703512923351455,
-  "cost_usd": 3.4718562,
+  "cost_usd": 9.3697402,
   "releases": {
-    "v0": "069cc9f9b5be802405797faecc284961b07c70ef"
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "v1": "6eb234ec7c02002c890caaa9350dd138404e58ed"
   },
   "config": {
     "project": {

@@ -1,10 +1,10 @@
 # Profile of the current best build
 
-Visible templates, hot runs, 8 threads. Geomean 511.3 ms, total 511 ms.
+Visible templates, hot runs, 8 threads. Geomean 469.6 ms, total 470 ms.
 
 | Template | Time (ms) | Share of total |
 | --- | ---: | ---: |
-| q13 | 511.3 | 100.0% |
+| q13 | 469.6 | 100.0% |
 
 ## Plans with operator timings (slowest templates)
 
@@ -17,7 +17,7 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 ```
 ┌────────────────────────────────────────────────┐
 │┌──────────────────────────────────────────────┐│
-││              Total Time: 0.662s              ││
+││              Total Time: 0.653s              ││
 │└──────────────────────────────────────────────┘│
 └────────────────────────────────────────────────┘
 ┌───────────────────────────┐
@@ -52,7 +52,7 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 │                           │
 │                           │
 │          45 rows          │
-│           0.06s           │
+│           0.08s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         PROJECTION        │
@@ -95,7 +95,7 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 │                           │
 │                           │
 │       1,500,000 rows      │
-│           0.52s           │
+│           0.48s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         PROJECTION        │
@@ -118,7 +118,7 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 │                           │
 │                           │
 │      15,333,290 rows      │
-│           0.02s           │
+│           0.01s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         PROJECTION        │
@@ -130,7 +130,7 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 │                           │
 │                           │
 │      15,333,290 rows      │
-│           0.20s           │
+│           0.17s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         HASH_JOIN         │
@@ -172,11 +172,11 @@ SELECT c_count, count(*) AS custdist FROM ( SELECT c_custkey, count(o_orderkey) 
 │                           ││                           │
 │          Filters:         ││                           │
 │  (o_comment !~~ '%unusual ││                           │
-│        %packages%')       ││           0.01s           │
+│        %packages%')       ││           0.02s           │
 │                           ││                           │
 │                           ││                           │
 │                           ││                           │
 │      14,833,270 rows      ││       1,500,000 rows      │
-│           2.54s           ││          (0.01s)          │
+│           2.47s           ││          (0.02s)          │
 └───────────────────────────┘└───────────────────────────┘
 ```

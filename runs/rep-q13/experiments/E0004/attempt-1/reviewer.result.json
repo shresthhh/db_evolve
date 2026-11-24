@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/storage/table/column_data.cpp: the fast path matches on the shape of the filter, not on names. It requires an ExpressionFilter of the form `~~`, `!~~` or `contains(VARCHAR ref, VARCHAR constant)`, optionally wrapped in NOT, with no collation, a '%'-only pattern and a required literal of at least 2 bytes. It refers to no tables, columns, literals or data sizes. Any pushed substring filter on a VARCHAR column whose strings were decoded back to back can use it.",
+      "Correctness: rows without the needle get a fixed answer (false for LIKE and contains, true for NOT and !~~ when the row is valid). NULL rows are never approved. Rows with a hit are re-checked with the original expression through ColumnSegment::FilterSelection, so false positives are harmless. Hits that span two strings are rejected and the search resumes at hit+1. Inlined strings are checked one by one. Plain `~~` has no escape character (TemplatedLikeOperator with HAS_ESCAPE=false), so treating '\\\\' as a literal byte is correct. ILIKE (`~~*`) and GLOB are not matched.",
+      "SSE2 bounds: the loop condition i+16 <= len-needle_size+1 keeps both loads inside the buffer, i.e. at most i+needle_size+14 <= len-1. The scalar tail falls back to FindStrInStr. The run arrays are bounded by s_count <= scan_count <= STANDARD_VECTOR_SIZE, which is checked.",
+      "Contiguity uses an exact pointer check (ptr == run_base + run_len). The concatenated bytes of a run are therefore exactly the strings in order, and the result is correct even when strings that happen to be adjacent come from different buffers.",
+      "The change touches only the stated file, adds no settings, timing or test changes, and keeps the old path for every case that doesn't qualify. The author reports about 11% gain on q13."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/storage/table/column_data.cpp: the fast path matches on the shape of the filter, not on names. It requires an ExpressionFilter of the form `~~`, `!~~` or `contains(VARCHAR ref, VARCHAR constant)`, optionally wrapped in NOT, with no collation, a '%'-only pattern and a required literal of at least 2 bytes. It refers to no tables, columns, literals or data sizes. Any pushed substring filter on a VARCHAR column whose strings were decoded back to back can use it.\",\"Correctness: rows without the needle get a fixed answer (false for LIKE and contains, true for NOT and !~~ when the row is valid). NULL rows are never approved. Rows with a hit are re-checked with the original expression through ColumnSegment::FilterSelection, so false positives are harmless. Hits that span two strings are rejected and the search resumes at hit+1. Inlined strings are checked one by one. Plain `~~` has no escape character (TemplatedLikeOperator with HAS_ESCAPE=false), so treating '\\\\\\\\' as a literal byte is correct. ILIKE (`~~*`) and GLOB are not matched.\",\"SSE2 bounds: the loop condition i+16 <= len-needle_size+1 keeps both loads inside the buffer, i.e. at most i+needle_size+14 <= len-1. The scalar tail falls back to FindStrInStr. The run arrays are bounded by s_count <= scan_count <= STANDARD_VECTOR_SIZE, which is checked.\",\"Contiguity uses an exact pointer check (ptr == run_base + run_len). The concatenated bytes of a run are therefore exactly the strings in order, and the result is correct even when strings that happen to be adjacent come from different buffers.\",\"The change touches only the stated file, adds no settings, timing or test changes, and keeps the old path for every case that doesn't qualify. The author reports about 11% gain on q13.\"],\"required_changes\":[]}",
+  "cost_usd": 0.2299608,
+  "seconds": 39.25565981864929,
+  "error": ""
+}

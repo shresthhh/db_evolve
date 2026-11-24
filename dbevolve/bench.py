@@ -165,8 +165,9 @@ def decide_templates(train_inc, train_cand, val_inc, val_cand, bar: dict, cal: d
                            f"{100 * reg:.1f}% threshold")
     if not improved:
         best = min(tr.items(), key=lambda kv: kv[1]) if tr else ("-", 1.0)
+        need = template_thresholds(bar, cal, best[0])[0] if tr else bar["min_template_gain"]
         reasons.append(f"no visible template faster beyond its noise (best: {best[0]} "
-                       f"{100 * (best[1] - 1):+.1f}%; needs at least -{100 * bar['min_template_gain']:.0f}%)")
+                       f"{100 * (best[1] - 1):+.1f}%; needs at least -{100 * need:.1f}%)")
     train_ratio = geomean(tr.values())
     if train_ratio > 1 + bar["max_geomean_regression"]:
         reasons.append(f"visible geomean got slower ({100 * (train_ratio - 1):+.1f}%)")

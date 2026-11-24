@@ -1,0 +1,90 @@
+[
+  {
+    "title": "Partition distinct radix HT on group-key hash",
+    "hypothesis": "q16 is 100% of the workload and its HASH_GROUP_BY (count DISTINCT) takes 0.43s of operator time, more than the join (0.17s). DuckDB runs count(DISTINCT x) GROUP BY G in two levels. First a distinct radix HT on (G,x), then each distinct partition is scanned and re-sunk into the main HT on G. The distinct HT is partitioned on hash(G,x), so every distinct partition holds rows from nearly every group. The re-sink into the main HT (measured ~180ms CPU earlier) therefore builds many scattered groups per task, and those must be combined again. If the radix bits of the distinct hash come from hash(G) instead, each distinct partition holds whole groups. The main-HT re-aggregation then becomes partition-local and small. A prior run of this exact mechanism measured q16 193.5->167.9ms and 180.8->158.7ms (-12..-13%).",
+    "plan": "In RadixPartitionedHashTable::Sink (src/execution/radix_partitioned_hashtable.cpp:548), when the table is a distinct table (needs a flag set from PhysicalHashAggregate's ctor / DistinctAggregateData setup in src/execution/operator/aggregate/physical_hash_aggregate.cpp) with a non-empty group set: compute h_full = group_chunk.Hash() over all columns and h_g = hash over only the first |G| columns. Splice the bits in the radix-partition mask range (RadixPartitioning, MAX_RADIX_BITS bits, i.e. bits [36,48) in the current hash layout; verify in radix_partitioning.hpp) from h_g into h_full. Then call the GroupedAggregateHashTable::AddChunk(groups, group_hashes, payload, filter) overload (aggregate_hashtable.cpp:564) with those hashes, not the overload that hashes internally. The hash is stored in the row, so repartition and finalize stay consistent. Gate on estimated_cardinality >= 4096 and skip the TryAddCompressedGroups/dictionary fast path when enabled, because it hashes internally. Check that the main-HT sink in the distinct finalize (physical_hash_aggregate.cpp ~line 656-733) still gives correct results. Optionally give each finalize task a single distinct partition so its main-HT sink is local.",
+    "target_files": [
+      "src/execution/radix_partitioned_hashtable.cpp",
+      "src/include/duckdb/execution/radix_partitioned_hashtable.hpp",
+      "src/execution/operator/aggregate/physical_hash_aggregate.cpp"
+    ],
+    "expected_gain": "q16 -10..-13%",
+    "generality": "Any GROUP BY with count/sum(DISTINCT) and grouping keys, a common analytical shape. No effect on non-distinct aggregates. If there are very few groups (e.g. 1-10), partitions become skewed and parallelism drops. Hence the cardinality gate, plus a possible extra gate when the estimated group count is below the partition count.",
+    "risk": "Medium. Hash consistency must hold everywhere distinct rows are inserted or reinserted, including the dictionary/compressed paths and spill/external repartition. Skewed partitions when there are few groups. The idea was already validated once, so the main risk is implementation correctness.",
+    "status": "accepted",
+    "filed": "g1r1",
+    "experiment": "E0001"
+  },
+  {
+    "title": "Skip unpartitioned staging for heap-layout agg HTs",
+    "hypothesis": "The join feeds the aggregate ~300-row chunks, so FindOrCreateGroupsInternal (aggregate_hashtable.cpp ~line 758) sends new groups to unpartitioned_data staging. Abandon/ClearPointerTable later repartitions them, which copies the VARCHAR heap and recomputes pointers. Measured earlier: Abandon 37->2ms and MaybeRepartition 97->56ms CPU when staging only for AllConstant layouts. Wall time was about -5% (noisy).",
+    "plan": "In GroupedAggregateHashTable::FindOrCreateGroupsInternal, use the unpartitioned staging path only when layout.AllConstant(); otherwise append directly to partitioned_data.",
+    "target_files": [
+      "src/execution/aggregate_hashtable.cpp"
+    ],
+    "expected_gain": "q16 ~-5% (noisy)",
+    "generality": "Aggregates with VARCHAR/nested keys fed by small chunks. Fixed-width layouts are unchanged.",
+    "risk": "Low. Two-line gate. Spill paths need a test with long-string keys.",
+    "status": "open",
+    "filed": "g1r1"
+  },
+  {
+    "title": "Push constant IN-list as scan ExpressionFilter instead of MARK join",
+    "hypothesis": "In q16 the part scan has `p_size IN (8 constants)`. FilterCombiner::TryPushdownInFilter (filter_combiner.cpp:515-586) pushes a non-dense integral IN list only as an OptionalFilter(InFilter), which is zonemap-only, and returns PUSHED_DOWN_PARTIALLY. The full IN expression stays above the scan. InClauseRewriter (in_clause_rewriter.cpp:60, >=6 constants) then turns it into a MARK join against a COLUMN_DATA_SCAN plus FILTER. The profile shows the result: the part scan emits 1,856,009 rows (0.09s), the MARK join takes 0.03s, and FILTER IN(...) takes 0.02s to get down to 296,389 rows. That is all on the hash-join build pipeline, which has to finish before the 8M-row partsupp probe can start. PushdownGet (pushdown_get.cpp:105-128) only tries TryPushdownGenericExpression for NO_PUSHDOWN results, and it explicitly skips COMPARE_IN when CanThrow, so the partially pushed IN never becomes a real scan filter. Evaluating the IN as a scan ExpressionFilter applies the filter inside the scan's selection chain. That removes the 1.86M-row MARK join, the FILTER and the projection traffic, and gives the scan a real filter for cardinality estimation.",
+    "plan": "In src/optimizer/pushdown/pushdown_get.cpp PushdownGet, in the loop at lines 105-128: also handle filters whose result is PUSHED_DOWN_PARTIALLY when the expression is COMPARE_IN, children[0] is a BOUND_COLUMN_REF, every other child is a non-NULL BoundConstantExpression (the same conditions TryPushdownInFilter checks), !expr.IsVolatile() and !expr.CanThrow(). For those, call combiner.TryPushdownGenericExpression(get, expr). If it returns PUSHED_DOWN_FULLY, erase the filter from `filters` and `pushdown_results`, as is already done for NO_PUSHDOWN. The existing OptionalFilter(InFilter) stays for zonemap pruning, and PushFilter ANDs the two on the same column. Keep the generic pushdown gated on get.function.pushdown_expression; TryPushdownGenericExpression already checks it. Verify with EXPLAIN that q16's part scan shows the IN filter, has no MARK join or FILTER above it, and emits about 296k rows. Correctness checks: IN with NULL constant (not pushed), NOT IN (unchanged), IN on VARCHAR, IN with 6, 8 and 100 values, and a parquet scan.",
+    "target_files": [
+      "src/optimizer/pushdown/pushdown_get.cpp"
+    ],
+    "expected_gain": "q16 -4..-8%. It removes about 0.05s CPU of MARK join plus FILTER, shrinks the part-scan output 6x on the HJ build pipeline, and makes the build-side estimate more accurate.",
+    "generality": "Any query with `col IN (>=6 non-dense constants)` directly on a base-table column (TPC-H q16/q19/q22-style IN lists, dashboard filters). The scan evaluates the IN early and skips the MARK join. A very long IN list (thousands of values) is evaluated by ExpressionExecutor as N equality passes, which can be slower than a hash MARK join. Cap it, for example at <=64 constants.",
+    "risk": "Low-medium. The optimizer change is small. Changed cardinality estimates can shift join orders on hidden queries. The scan ExpressionFilter path is already used for other generic expressions, so execution correctness risk is low.",
+    "status": "retired",
+    "filed": "g1r2",
+    "experiment": "E0002"
+  },
+  {
+    "title": "Exact bitmap BF for dense-int join keys on partsupp-style probes",
+    "hypothesis": "The q16 partsupp scan takes 0.28s for 8M rows with a min/max and BF dynamic filter. It emits 1,236,280 rows, but the join keeps 1,185,556, so about 51k are BF false positives. The build keys are dense ints, with 296k of the 2M range selected. In earlier db_evolve runs an exact bitmap BF over [min,max] gave q09 -9..-14% and q21 -15% on lineitem scans. This tree has no exact bitmap: bloom_filter.hpp only has class BloomFilter.",
+    "plan": "Port the exact dense-int bitmap from earlier runs. When the build key is integral and max-min <= 128*count bits, build a bitmap instead of the hashed BF, and probe with (key-min) bit tests in the scan's BLOOM_FILTER evaluation. Files: src/include/duckdb/planner/filter/bloom_filter.hpp, its .cpp, and the join filter pushdown in physical_hash_join.cpp.",
+    "target_files": [
+      "src/include/duckdb/planner/filter/bloom_filter.hpp",
+      "src/planner/filter/bloom_filter.cpp",
+      "src/execution/operator/join/physical_hash_join.cpp"
+    ],
+    "expected_gain": "q16 -3..-6%: no hashing on 8M probes and no FP rows.",
+    "generality": "Joins on dense integer keys (surrogate keys) with a selective build side.",
+    "risk": "Medium. It is a larger diff, and the bitmap size has to be capped.",
+    "status": "open",
+    "filed": "g1r2"
+  },
+  {
+    "title": "Sparse-range perfect hash join that keeps the bloom filter",
+    "hypothesis": "In q16 the HASH_JOIN ps_partkey = p_partkey takes 0.15s CPU to probe 1.236M rows into a 296k-row build. That is about 125ns/row and the second-largest operator after HASH_GROUP_BY (0.31s). The build keys are unique integers with filtered min/max about [2, 2M], so the range is about 2M, roughly 7x the count. PerfectHashJoinExecutor::CanDoPerfectHashJoin (perfect_hash_join_executor.cpp:108) rejects any range over a fixed MAX_BUILD_SIZE of 1048576, so the join falls back to the generic HT: it hashes, probes chains, compares keys and gathers the VARCHAR, uhugeint and utinyint payload row by row. A perfect HJ probe is one range check plus a bitmap test per row, and it emits the build columns as dictionary vectors over a reusable dictionary (ProbePerfectHashTable :269), with no per-row gather. Today, though, choosing a perfect HJ also turns off the BF: CanUseBloomFilter returns false when is_perfect_hashtable (physical_hash_join.cpp:769), and the BF only gets filled in JoinHashTable::InsertHashes during ScheduleFinalize, which the perfect path skips. If we just raised the cap, the partsupp scan would emit all 8M rows instead of 1.24M. So the change must keep the BF when the perfect table is sparse.",
+    "plan": "1) perfect_hash_join_executor.cpp CanDoPerfectHashJoin: keep the 1M cap, and also accept range <= 2^23 when range <= 16 * ht.Count() and range * (sum of rhs_output_columns type widths + 1) <= ~256MB. Record `perfect_join_statistics.is_sparse = range > 2 * ht.Count()` (new field in perfect_hash_join_executor.hpp PerfectHashJoinStats). Also fix the off-by-one in the duplicate check: compare Count() against build_range + 1. 2) physical_hash_join.cpp PhysicalHashJoin::Finalize (~line 1004-1020): when use_perfect_hash && is_sparse, call FinalizeFilters with is_perfect_hashtable=false, so the BF is requested (SetBuildBloomFilter + deferred_bloom_filters). Then fill the BF directly, since ScheduleFinalize is skipped. FullScanHashTable already has `build_vector` (all build keys from ScanKeyColumn). Hash it with VectorOperations::Hash, which is the same hash the HT stores per row and the scan BF probe uses, then call ht.bloom_filter.Initialize(context, ht.Count()) and bloom_filter.InsertHashes in STANDARD_VECTOR_SIZE slices. Finally run the same loop as HashJoinFinalizeEvent::FinishEvent (line 587) to PushBloomFilter for each deferred entry. Do this before returning from Finalize. Expose a small helper on PerfectHashJoinExecutor or JoinHashTable for it. 3) Dense perfect HJs (range <= 2*count) keep today's behaviour of no BF. Verify with EXPLAIN ANALYZE on q16: the join should run as a perfect HJ, the partsupp scan should still show `IN BF` and emit about 1.24M rows, and HASH_JOIN CPU should drop. Correctness tests: duplicate build keys (must fall back), NULL build keys, an empty build side, a negative min, and a build side with VARCHAR payload.",
+    "target_files": [
+      "src/execution/operator/join/perfect_hash_join_executor.cpp",
+      "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp",
+      "src/execution/operator/join/physical_hash_join.cpp"
+    ],
+    "expected_gain": "q16: HASH_JOIN 0.15s down to about 0.03-0.05s CPU, so wall about -6..-10%. The single-threaded build gather and dictionary allocation over a 2M range cost a few ms of serial time.",
+    "generality": "Inner joins on unique surrogate integer keys where the filtered build side covers 1/16 to 1/2 of its key range. This is common for dimension tables filtered by predicates in star and snowflake queries. Joins with a range up to 1M are unchanged. Joins with very small builds over a wide range can get slower because of the dictionary allocation. The density gate of at most 16x and the memory cap bound that.",
+    "risk": "Medium. The new code fills the BF outside the normal finalize path. A missed push only costs speed, but a wrong BF hash would give wrong results, so the BF must use exactly the HT's key hash. Memory per HJ grows to range \u00d7 payload width, which the cap bounds. The off-by-one fix has to be tested with a fully dense build.",
+    "status": "retired",
+    "filed": "g1r3",
+    "experiment": "E0003"
+  },
+  {
+    "title": "Group-aligned main-HT sink in distinct finalize",
+    "hypothesis": "After E0001, each distinct radix partition holds whole groups (its partition bits come from hash(G)). Earlier per-phase timers on q16 put the main-HT sink fed by the distinct scan at about 180ms CPU, the largest agg phase after the distinct sink at about 250ms. That sink rehashes G (including the VARCHAR p_type), then partitions and combines again across 8 thread-local sinks, even though each source partition already maps to disjoint groups. If a HashAggregateDistinctFinalizeTask handles one distinct partition at a time and its main local sink is unpartitioned (radix bits 0) and small, groups are cache-resident and the main Combine/Finalize repartition work shrinks.",
+    "plan": "In physical_hash_aggregate.cpp, HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping (around line 665): when the distinct radix table has partition_prefix_count == groups.size(), check that the main table's hash matches hash(G) bits [36,48). Then call Combine on the local sink after each distinct partition is drained, so each local main HT holds only one partition's groups. Also look at RadixPartitionedHashTable::GetData / the source-partition assignment in radix_partitioned_hashtable.cpp, so that each task takes whole partitions. Add temporary timers first to confirm the main sink still costs about 180ms CPU in this tree.",
+    "target_files": [
+      "src/execution/operator/aggregate/physical_hash_aggregate.cpp",
+      "src/execution/radix_partitioned_hashtable.cpp"
+    ],
+    "expected_gain": "q16 -5..-10% if the main sink is really ~20ms of wall time",
+    "generality": "Any GROUP BY with only DISTINCT aggregates and many (G,x) pairs per group set. Queries with few groups or non-distinct aggregates are unchanged.",
+    "risk": "Medium. Must keep correctness with GROUPING SETS, spill, and mixed distinct/non-distinct aggregates. Measure the phase first.",
+    "status": "open",
+    "filed": "g1r4"
+  }
+]

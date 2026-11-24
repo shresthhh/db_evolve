@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The change is general. It replaces the per-string Allocate/ShrinkHead in FSST decode with one shrinkable arena allocation per batch, capped at a 64KB bound. It applies in FSSTVector::DecompressVector (vector.cpp) and in FSSTStorage::StringScanPartial/Select (fsst.cpp). Nothing in it refers to a table, column, literal or data size.",
+      "Memory safety holds. Each string's bound is compressed_len*8, the same bound DecompressValue already uses, and there are 32 bytes of slack per batch. duckdb_fsst_decompress is given bound-pos as its size, and its fast loop and tail never write past that size. Any overrun past the end of a decoded string only touches space for later strings or the unused tail, which is released after all writes.",
+      "ShrinkHead is called only after every string_t in the batch has been built. Nothing allocates from the arena between AllocateShrinkableBuffer and ShrinkHead, so the head-chunk invariant holds. pos==0 shrinks the whole allocation, which is valid.",
+      "Inlined strings of 12 bytes or less are copied into the string_t by its constructor before their space is reused. Non-inlined strings move pos forward, so each one keeps its own bytes.",
+      "NULL rows (DecompressVector), zero-length strings, and batches that contain only empty or NULL strings still produce string_t(nullptr,0), as before. The decoder is still looked up only when a batch has a non-empty string. In fsst.cpp, the all_values_inlined path and the path with no symbol table are unchanged, and the gating check (duckdb_fsst_decoder) is consistent with the decoder pointer the batch uses (duckdb_fsst_decoder_ptr).",
+      "Each batch uses at most about 64KB more temporary arena memory, and it is released per batch. This is not cost moved elsewhere, and no measurement or settings code is touched."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"The change is general. It replaces the per-string Allocate/ShrinkHead in FSST decode with one shrinkable arena allocation per batch, capped at a 64KB bound. It applies in FSSTVector::DecompressVector (vector.cpp) and in FSSTStorage::StringScanPartial/Select (fsst.cpp). Nothing in it refers to a table, column, literal or data size.\",\"Memory safety holds. Each string's bound is compressed_len*8, the same bound DecompressValue already uses, and there are 32 bytes of slack per batch. duckdb_fsst_decompress is given bound-pos as its size, and its fast loop and tail never write past that size. Any overrun past the end of a decoded string only touches space for later strings or the unused tail, which is released after all writes.\",\"ShrinkHead is called only after every string_t in the batch has been built. Nothing allocates from the arena between AllocateShrinkableBuffer and ShrinkHead, so the head-chunk invariant holds. pos==0 shrinks the whole allocation, which is valid.\",\"Inlined strings of 12 bytes or less are copied into the string_t by its constructor before their space is reused. Non-inlined strings move pos forward, so each one keeps its own bytes.\",\"NULL rows (DecompressVector), zero-length strings, and batches that contain only empty or NULL strings still produce string_t(nullptr,0), as before. The decoder is still looked up only when a batch has a non-empty string. In fsst.cpp, the all_values_inlined path and the path with no symbol table are unchanged, and the gating check (duckdb_fsst_decoder) is consistent with the decoder pointer the batch uses (duckdb_fsst_decoder_ptr).\",\"Each batch uses at most about 64KB more temporary arena memory, and it is released per batch. This is not cost moved elsewhere, and no measurement or settings code is touched.\"],\"required_changes\":[]}",
+  "cost_usd": 0.2683768,
+  "seconds": 48.04256772994995,
+  "error": ""
+}

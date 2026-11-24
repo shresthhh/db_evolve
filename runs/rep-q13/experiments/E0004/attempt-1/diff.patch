@@ -1,0 +1,273 @@
+diff --git a/src/storage/table/column_data.cpp b/src/storage/table/column_data.cpp
+index d32d2d2..b73d011 100644
+--- a/src/storage/table/column_data.cpp
++++ b/src/storage/table/column_data.cpp
+@@ -18,9 +18,258 @@
+ #include "duckdb/common/serializer/serializer.hpp"
+ #include "duckdb/function/variant/variant_shredding.hpp"
+ #include "duckdb/storage/table/geo_column_data.hpp"
++#include "duckdb/storage/table/column_segment.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/table_filter_state.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
++#include "duckdb/planner/expression/bound_operator_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/function/scalar/string_common.hpp"
++#if defined(__SSE2__) && (defined(__GNUC__) || defined(__clang__))
++#include <emmintrin.h>
++#define DUCKDB_SUBSTRING_PREFILTER_SSE2
++#endif
+ 
+ namespace duckdb {
+ 
++namespace {
++
++//! Extracts a literal that must occur (as a byte substring) in every string for which the filter can be true
++//! (or, if negated, for which the filter can be false). Returns false if the filter is not of a supported shape.
++bool GetRequiredSubstring(const TableFilter &filter, string &needle, bool &negated) {
++	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
++		return false;
++	}
++	auto expr = &filter.Cast<ExpressionFilter>().expr;
++	negated = false;
++	if ((*expr)->GetExpressionType() == ExpressionType::OPERATOR_NOT) {
++		auto &op = (*expr)->Cast<BoundOperatorExpression>();
++		if (op.children.size() != 1) {
++			return false;
++		}
++		negated = true;
++		expr = &op.children[0];
++	}
++	if ((*expr)->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return false;
++	}
++	auto &func = (*expr)->Cast<BoundFunctionExpression>();
++	if (func.children.size() != 2 || func.return_type.id() != LogicalTypeId::BOOLEAN) {
++		return false;
++	}
++	auto &input = *func.children[0];
++	auto &pattern = *func.children[1];
++	if (input.GetExpressionClass() != ExpressionClass::BOUND_REF ||
++	    pattern.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return false;
++	}
++	if (input.return_type.id() != LogicalTypeId::VARCHAR || pattern.return_type.id() != LogicalTypeId::VARCHAR ||
++	    !StringType::GetCollation(input.return_type).empty() || !StringType::GetCollation(pattern.return_type).empty()) {
++		return false;
++	}
++	auto &value = pattern.Cast<BoundConstantExpression>().value;
++	if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
++		return false;
++	}
++	auto &str = StringValue::Get(value);
++	auto &name = func.function.name;
++	if (name == "contains") {
++		needle = str;
++	} else if (name == "~~" || name == "!~~") {
++		if (name == "!~~") {
++			negated = !negated;
++		}
++		// only '%' wildcards: every literal segment must occur in a matching string
++		needle.clear();
++		idx_t segment_start = 0;
++		for (idx_t i = 0; i <= str.size(); i++) {
++			if (i < str.size()) {
++				auto ch = str[i];
++				if (ch == '_' || ch == '\0') {
++					return false;
++				}
++				if (ch != '%') {
++					continue;
++				}
++			}
++			if (i - segment_start > needle.size()) {
++				needle = str.substr(segment_start, i - segment_start);
++			}
++			segment_start = i + 1;
++		}
++	} else {
++		return false;
++	}
++	return needle.size() >= 2;
++}
++
++//! Finds the first occurrence of needle (size >= 2) in buf[start, len)
++idx_t FindNeedleInBuffer(const unsigned char *buf, idx_t start, idx_t len, const unsigned char *needle,
++                         idx_t needle_size) {
++	if (len < needle_size || start > len - needle_size) {
++		return DConstants::INVALID_INDEX;
++	}
++	const idx_t last_start = len - needle_size;
++	idx_t i = start;
++#ifdef DUCKDB_SUBSTRING_PREFILTER_SSE2
++	const auto first = _mm_set1_epi8(static_cast<char>(needle[0]));
++	const auto last = _mm_set1_epi8(static_cast<char>(needle[needle_size - 1]));
++	for (; i + 16 <= last_start + 1; i += 16) {
++		auto block_first = _mm_loadu_si128(reinterpret_cast<const __m128i *>(buf + i));
++		auto block_last = _mm_loadu_si128(reinterpret_cast<const __m128i *>(buf + i + needle_size - 1));
++		auto eq = _mm_and_si128(_mm_cmpeq_epi8(block_first, first), _mm_cmpeq_epi8(block_last, last));
++		auto mask = static_cast<uint32_t>(_mm_movemask_epi8(eq));
++		while (mask) {
++			auto bit = static_cast<idx_t>(__builtin_ctz(mask));
++			if (memcmp(buf + i + bit + 1, needle + 1, needle_size - 2) == 0) {
++				return i + bit;
++			}
++			mask &= mask - 1;
++		}
++	}
++#endif
++	if (i > last_start) {
++		return DConstants::INVALID_INDEX;
++	}
++	auto result = FindStrInStr(buf + i, len - i, needle, needle_size);
++	return result == DConstants::INVALID_INDEX ? result : result + i;
++}
++
++//! Marks the rows of a run of strings stored back-to-back in memory that contain the needle, using one search over
++//! the whole run. run_end[r] is the end offset of row r relative to run_base; hits spanning two rows are rejected.
++void SearchStringRun(const unsigned char *run_base, const idx_t *run_end, const sel_t *run_idx, idx_t run_rows,
++                     const unsigned char *needle, idx_t needle_size, bool *has_needle) {
++	idx_t run_len = run_end[run_rows - 1];
++	idx_t search_pos = 0;
++	idx_t row = 0;
++	while (true) {
++		auto hit = FindNeedleInBuffer(run_base, search_pos, run_len, needle, needle_size);
++		if (hit == DConstants::INVALID_INDEX) {
++			break;
++		}
++		while (run_end[row] <= hit) {
++			row++;
++		}
++		D_ASSERT(row < run_rows);
++		if (hit + needle_size <= run_end[row]) {
++			has_needle[run_idx[row]] = true;
++			search_pos = run_end[row];
++			row++;
++			if (row >= run_rows) {
++				break;
++			}
++		} else {
++			// hit spans multiple rows
++			search_pos = hit + 1;
++		}
++	}
++}
++
++//! Fast path for substring-type filters (LIKE / NOT LIKE / contains) over a flat VARCHAR vector: strings that are
++//! stored back-to-back in memory (e.g. decoded consecutively into the vector's string heap) are searched for a
++//! required literal at once, and the full expression is only evaluated on rows that contain the literal.
++//! Returns false (without modifying anything) if not applicable.
++bool TrySubstringPrefilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &s_count,
++                           const TableFilter &filter, TableFilterState &filter_state) {
++	if (result.GetVectorType() != VectorType::FLAT_VECTOR || scan_count == 0 || scan_count > STANDARD_VECTOR_SIZE ||
++	    s_count == 0 || result.GetType().InternalType() != PhysicalType::VARCHAR) {
++		return false;
++	}
++	string needle;
++	bool negated;
++	if (!GetRequiredSubstring(filter, needle, negated)) {
++		return false;
++	}
++	auto needle_ptr = const_uchar_ptr_cast(needle.c_str());
++	auto needle_size = needle.size();
++	auto &result_validity = FlatVector::Validity(result);
++	auto data = FlatVector::GetData<string_t>(result);
++
++	bool has_needle[STANDARD_VECTOR_SIZE];
++	idx_t run_end[STANDARD_VECTOR_SIZE];
++	sel_t run_idx[STANDARD_VECTOR_SIZE];
++	memset(has_needle, 0, sizeof(bool) * scan_count);
++	const unsigned char *run_base = nullptr;
++	idx_t run_len = 0;
++	idx_t run_rows = 0;
++	for (idx_t i = 0; i < s_count; i++) {
++		auto idx = sel.get_index(i);
++		if (!result_validity.RowIsValid(idx)) {
++			continue;
++		}
++		auto &str = data[idx];
++		auto size = str.GetSize();
++		auto ptr = const_uchar_ptr_cast(str.GetData());
++		if (str.IsInlined()) {
++			if (size >= needle_size && FindStrInStr(ptr, size, needle_ptr, needle_size) != DConstants::INVALID_INDEX) {
++				has_needle[idx] = true;
++			}
++			continue;
++		}
++		if (run_rows > 0 && ptr != run_base + run_len) {
++			SearchStringRun(run_base, run_end, run_idx, run_rows, needle_ptr, needle_size, has_needle);
++			run_rows = 0;
++		}
++		if (run_rows == 0) {
++			run_base = ptr;
++			run_len = 0;
++		}
++		run_len += size;
++		run_end[run_rows] = run_len;
++		run_idx[run_rows] = UnsafeNumericCast<sel_t>(idx);
++		run_rows++;
++	}
++	if (run_rows > 0) {
++		SearchStringRun(run_base, run_end, run_idx, run_rows, needle_ptr, needle_size, has_needle);
++	}
++
++	// split the incoming selection into rows decided without the expression and candidates
++	SelectionVector candidates(STANDARD_VECTOR_SIZE);
++	SelectionVector decided(STANDARD_VECTOR_SIZE);
++	idx_t candidate_count = 0;
++	idx_t decided_count = 0;
++	for (idx_t i = 0; i < s_count; i++) {
++		auto idx = sel.get_index(i);
++		if (has_needle[idx]) {
++			candidates.set_index(candidate_count++, idx);
++		} else if (negated && result_validity.RowIsValid(idx)) {
++			decided.set_index(decided_count++, idx);
++		}
++	}
++	if (candidate_count > 0) {
++		UnifiedVectorFormat vdata;
++		result.ToUnifiedFormat(scan_count, vdata);
++		candidate_count = ColumnSegment::FilterSelection(candidates, result, vdata, filter, filter_state, scan_count,
++		                                                 candidate_count);
++	}
++	// merge both (ascending) lists
++	SelectionVector new_sel(STANDARD_VECTOR_SIZE);
++	idx_t c = 0, d = 0, out = 0;
++	while (c < candidate_count && d < decided_count) {
++		auto cidx = candidates.get_index(c);
++		auto didx = decided.get_index(d);
++		if (cidx < didx) {
++			new_sel.set_index(out++, cidx);
++			c++;
++		} else {
++			new_sel.set_index(out++, didx);
++			d++;
++		}
++	}
++	for (; c < candidate_count; c++) {
++		new_sel.set_index(out++, candidates.get_index(c));
++	}
++	for (; d < decided_count; d++) {
++		new_sel.set_index(out++, decided.get_index(d));
++	}
++	sel.Initialize(new_sel);
++	s_count = out;
++	return true;
++}
++
++} // namespace
++
+ ColumnData::ColumnData(BlockManager &block_manager, DataTableInfo &info, idx_t column_index, LogicalType type_p,
+                        ColumnDataType data_type_p, optional_ptr<ColumnData> parent_p)
+     : count(0), block_manager(block_manager), info(info), column_index(column_index), type(std::move(type_p)),
+@@ -349,6 +598,9 @@ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnS
+                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
+                         TableFilterState &filter_state) {
+ 	idx_t scan_count = Scan(transaction, vector_index, state, result);
++	if (TrySubstringPrefilter(result, scan_count, sel, s_count, filter, filter_state)) {
++		return;
++	}
+ 
+ 	UnifiedVectorFormat vdata;
+ 	result.ToUnifiedFormat(scan_count, vdata);

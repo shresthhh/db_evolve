@@ -1,0 +1,89 @@
+diff --git a/src/optimizer/compressed_materialization.cpp b/src/optimizer/compressed_materialization.cpp
+index ac816f9..a65d7d6 100644
+--- a/src/optimizer/compressed_materialization.cpp
++++ b/src/optimizer/compressed_materialization.cpp
+@@ -7,6 +7,8 @@
+ #include "duckdb/optimizer/optimizer.hpp"
+ #include "duckdb/optimizer/topn_optimizer.hpp"
+ #include "duckdb/planner/binder.hpp"
++#include "duckdb/common/string_util.hpp"
++#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+ #include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/expression_iterator.hpp"
+@@ -159,6 +161,75 @@ bool CompressedMaterialization::TryCompressChild(CompressedMaterializationInfo &
+ void CompressedMaterialization::CreateCompressProjection(unique_ptr<LogicalOperator> &child_op,
+                                                          vector<unique_ptr<CompressExpression>> compress_exprs,
+                                                          CompressedMaterializationInfo &info, CMChildInfo &child_info) {
++	// If the child is a projection that decompresses a column we are about to compress again with the same
++	// compressed type and offset, compress(decompress(x, m), m) == x: fold the pair into plain column refs
++	if (child_op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
++		auto &child_proj = child_op->Cast<LogicalProjection>();
++		bool folded_anything = false;
++		for (idx_t col_idx = 0; col_idx < compress_exprs.size() && col_idx < child_info.bindings_before.size();
++		     col_idx++) {
++			auto &compress_expr = compress_exprs[col_idx]->expression;
++			if (compress_expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++				continue;
++			}
++			auto &compress_func = compress_expr->Cast<BoundFunctionExpression>();
++			if (!StringUtil::StartsWith(compress_func.function.name, "__internal_compress_integral_") ||
++			    compress_func.children.size() != 2 ||
++			    compress_func.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
++			    compress_func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++				continue;
++			}
++			const auto &binding = compress_func.children[0]->Cast<BoundColumnRefExpression>().binding;
++			if (binding.table_index != child_proj.table_index || binding.column_index >= child_proj.expressions.size()) {
++				continue;
++			}
++			auto &child_expr = child_proj.expressions[binding.column_index];
++			if (child_expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++				continue;
++			}
++			auto &decompress_func = child_expr->Cast<BoundFunctionExpression>();
++			if (!StringUtil::StartsWith(decompress_func.function.name, "__internal_decompress_integral_") ||
++			    decompress_func.children.size() != 2 ||
++			    decompress_func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++				continue;
++			}
++			const auto &compressed_type = compress_func.return_type;
++			if (decompress_func.children[0]->return_type != compressed_type ||
++			    decompress_func.return_type != compress_func.children[0]->return_type) {
++				continue;
++			}
++			const auto &compress_offset = compress_func.children[1]->Cast<BoundConstantExpression>().value;
++			const auto &decompress_offset = decompress_func.children[1]->Cast<BoundConstantExpression>().value;
++			if (compress_offset.IsNull() || decompress_offset.IsNull() ||
++			    compress_offset.type() != decompress_offset.type() || compress_offset != decompress_offset) {
++				continue;
++			}
++			// The decompressed binding must only be referenced by this compress expression
++			bool referenced_elsewhere = false;
++			for (idx_t other_idx = 0; other_idx < compress_exprs.size(); other_idx++) {
++				if (other_idx == col_idx) {
++					continue;
++				}
++				column_binding_set_t other_bindings;
++				GetReferencedBindings(*compress_exprs[other_idx]->expression, other_bindings);
++				if (other_bindings.find(binding) != other_bindings.end()) {
++					referenced_elsewhere = true;
++					break;
++				}
++			}
++			if (referenced_elsewhere) {
++				continue;
++			}
++			// Fold: the child projection emits the compressed value, the compress projection passes it through
++			child_expr = std::move(decompress_func.children[0]);
++			compress_expr = make_uniq<BoundColumnRefExpression>(compressed_type, binding);
++			folded_anything = true;
++		}
++		if (folded_anything) {
++			child_proj.ResolveOperatorTypes();
++		}
++	}
++
+ 	// Replace child op with a projection
+ 	vector<unique_ptr<Expression>> projections;
+ 	projections.reserve(compress_exprs.size());

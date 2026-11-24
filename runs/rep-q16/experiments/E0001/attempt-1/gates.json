@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The change is general. It applies to any grouped DISTINCT aggregate with an estimated input of at least 4096 rows. It does not refer to any table, column, literal or data distribution.",
+      "The partitioning is correct. `GroupingSet` is an ordered set, and `DistinctAggregateData` (distinct_aggregate_data.cpp:96-102) puts the GROUP BY indices (< group_by_size) before the distinct child indices (>= group_by_size). So the first |grouping_set| columns of the distinct group_chunk are exactly the group keys, including for GROUPING SETS subsets. The `prefix_count < ColumnCount` guard always holds because there is at least one distinct child.",
+      "The hashes stay consistent. Every sink into a given distinct table goes through the same pre-hashed path, because the flag is per table and the compressed path is skipped. Equal (G,x) always gets the same hash. Repartitioning, combine and spill use the hash stored in each row. Only the radix bits [36,48) are replaced, so the salt bits and the low bits used for HT offsets still come from the full hash.",
+      "The distinct-to-main re-sink computes its hashes again through the main table's normal path, where partition_prefix_count is 0, so the main table is unaffected.",
+      "Moving the `sink_count` increment into the pre-hashed `AddChunk` overload keeps the count the same on both existing paths and lets the new path trigger the adaptivity check.",
+      "The change does not alter threads, memory use, settings, tests or timing. The only downsides are skew when there are very few groups and losing the dictionary/constant fast path on the distinct table. Both are acceptable trade-offs, and the issue states them."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "E0006",
+  "title": "Batched per-vector FSST decode with a shared output bound",
+  "started": "2026-11-23T23:24:37-05:00",
+  "base": "6eb234ec7c02002c890caaa9350dd138404e58ed",
+  "candidate": "b6e237001ff9b35db157dd297c6020d36ae8abc9",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q13 -0.8%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.1822086,
+  "summary": "The change builds and makes q13 about 5% faster across three runs (-3.6%, -6.7%, -5.6%; best ms 488/494/473 vs mine 471/461/446); the bench result check passed each time. The first run is inside the ~5% noise band, so the gain is real but close to the bar.\n\nWhat changed: FSST strings are now decoded back to back into one shared arena allocation per batch instead of one allocate/shrink per string.\n- A batch is a run of rows whose size bound (8 \u00d7 compressed length each, plus 32 bytes of slack) stays under 64KB. A single row may go over that bound.\n- Each `duckdb_fsst_decompress` call is given the space left in the shared allocation as its output limit, so the fast 4-code loop stays active up to the end of each string.\n- Strings of 12 bytes or less are copied inline by the string_t constructor, so their space is reused. Longer strings move the write position forward.\n- After all writes in a batch, `ShrinkHead` releases the unused tail once.\n\nWhere it applies:\n1. `FSSTStorage::StringScanPartial` (non-inlined, decoder present) and `FSSTStorage::Select`, in src/storage/compression/fsst.cpp.\n2. `FSSTVector::DecompressVector` in src/common/types/vector.cpp. This is not in the issue's target files. Rows that are NULL or empty still produce an empty string, as before, and the decoder is only looked up when a batch has a non-empty string, as before.\n\nChanging only (1) gave +0.9% (no effect). q13's filter column arrives as an FSST vector and is flattened through `DecompressVector`, so all of the gain comes from (2). No header change was needed, because I call `GetStringAllocator().ShrinkHead()` directly rather than adding the planned `VectorStringBuffer` helper.",
+  "notes": "- Results were only checked through bench's q13 result verification. I could not compare old and new decode output directly, because `dbe-tool sql` runs only my build and the database is read-only. So the md5-of-string_agg check in the plan was not done.\n- For FSST decode work, the hot path in filtered scans is `FSSTVector::DecompressVector`, not `FSSTStorage::Select`: the filter column comes in as an FSST vector and is flattened.\n- A decode-only scan (`SELECT sum(length(o_comment)) FROM orders`) still costs about 1.6s CPU for 15M rows, so decode is still the main cost of the orders scan.\n- Possible follow-up: the filter flattens the whole FSST vector; decoding only the rows the selection needs, or running the substring match on the back-to-back decoded buffer (now contiguous per batch), could save more.",
+  "train_ratio": 0.9923966942774627,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q13": 0.9923966942774627
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-23T23:33:52-05:00"
+}

@@ -1,0 +1,180 @@
+diff --git a/src/common/types/vector.cpp b/src/common/types/vector.cpp
+index 7cf1995..379d21a 100644
+--- a/src/common/types/vector.cpp
++++ b/src/common/types/vector.cpp
+@@ -2372,17 +2372,61 @@ void FSSTVector::DecompressVector(const Vector &src, Vector &dst, idx_t src_offs
+ 	auto ldata = FSSTVector::GetCompressedData<string_t>(src);
+ 	auto tdata = FlatVector::GetData<string_t>(dst);
+ 	auto &str_buffer = StringVector::GetStringBuffer(dst);
+-	for (idx_t i = 0; i < copy_count; i++) {
+-		auto source_idx = sel->get_index(src_offset + i);
+-		auto target_idx = dst_offset + i;
+-		string_t compressed_string = ldata[source_idx];
+-		if (dst_mask.RowIsValid(target_idx) && compressed_string.GetSize() > 0) {
+-			auto decoder = FSSTVector::GetDecoder(src);
+-			tdata[target_idx] = FSSTPrimitives::DecompressValue(decoder, str_buffer, compressed_string.GetData(),
+-			                                                    compressed_string.GetSize());
+-		} else {
+-			tdata[target_idx] = string_t(nullptr, 0);
++	auto &allocator = str_buffer.GetStringAllocator();
++	// Decompress strings back-to-back into shared heap allocations. Passing the remaining space of the shared
++	// allocation as output bound keeps the FSST fast decode loop active up to the end of every string, and replaces
++	// the per-string allocate/shrink with one per batch.
++	static constexpr idx_t MAX_BATCH_BOUND = 65536;
++	// slack so that the fast decode loop (which needs 32 bytes of room) also covers the last string
++	static constexpr idx_t BATCH_SLACK = 32;
++	duckdb_fsst_decoder_t *decoder = nullptr;
++	idx_t i = 0;
++	while (i < copy_count) {
++		// determine the rows of this batch and an upper bound of their decompressed size
++		idx_t bound = BATCH_SLACK;
++		idx_t end = i;
++		for (; end < copy_count; end++) {
++			if (!dst_mask.RowIsValid(dst_offset + end)) {
++				continue;
++			}
++			idx_t str_bound = idx_t(ldata[sel->get_index(src_offset + end)].GetSize()) * 8;
++			if (end > i && bound + str_bound > MAX_BATCH_BOUND) {
++				break;
++			}
++			bound += str_bound;
++		}
++		if (bound == BATCH_SLACK) {
++			// only empty strings
++			for (; i < end; i++) {
++				tdata[dst_offset + i] = string_t(nullptr, 0);
++			}
++			continue;
++		}
++		if (!decoder) {
++			decoder = static_cast<duckdb_fsst_decoder_t *>(FSSTVector::GetDecoder(src));
++		}
++		auto base = str_buffer.AllocateShrinkableBuffer(bound);
++		idx_t pos = 0;
++		for (; i < end; i++) {
++			auto target_idx = dst_offset + i;
++			string_t compressed_string = ldata[sel->get_index(src_offset + i)];
++			if (!dst_mask.RowIsValid(target_idx) || compressed_string.GetSize() == 0) {
++				tdata[target_idx] = string_t(nullptr, 0);
++				continue;
++			}
++			D_ASSERT(pos + idx_t(compressed_string.GetSize()) * 8 <= bound);
++			auto target = base + pos;
++			auto decompressed_size =
++			    duckdb_fsst_decompress(decoder, compressed_string.GetSize(),
++			                           const_data_ptr_cast(compressed_string.GetData()), bound - pos, target);
++			// for inlined strings the constructor copies the data, so the space can be reused
++			tdata[target_idx] = string_t(const_char_ptr_cast(target), UnsafeNumericCast<uint32_t>(decompressed_size));
++			if (decompressed_size > string_t::INLINE_LENGTH) {
++				pos += decompressed_size;
++			}
+ 		}
++		// all writes into this allocation are done: release the unused tail
++		allocator.ShrinkHead(bound - pos);
+ 	}
+ }
+ 
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index df16e5f..7b6755a 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -570,6 +570,66 @@ struct FSSTScanState : public StringScanState {
+ 			return FSSTPrimitives::DecompressValue(duckdb_fsst_decoder_ptr, str_buffer, str_ptr, str_len);
+ 		}
+ 	}
++
++	//! Decompress (non-inlined) strings back-to-back into shared heap allocations. Passing the remaining space of
++	//! the shared allocation as output bound keeps the FSST fast decode loop active up to the end of every string,
++	//! and replaces the per-string allocate/shrink with one per batch.
++	void DecompressStringsBatched(StringDictionaryContainer dict, data_ptr_t baseptr, const bp_delta_offsets_t &offsets,
++	                              const SelectionVector *sel, idx_t count, string_t *result_data,
++	                              VectorStringBuffer &str_buffer) const {
++		// bound the size of a single shared allocation (a single large string may still exceed this)
++		static constexpr idx_t MAX_BATCH_BOUND = 65536;
++		// slack so that the fast decode loop (which needs 32 bytes of room) also covers the last string
++		static constexpr idx_t BATCH_SLACK = 32;
++		const auto decoder = static_cast<duckdb_fsst_decoder_t *>(duckdb_fsst_decoder_ptr);
++		auto &allocator = str_buffer.GetStringAllocator();
++		idx_t i = 0;
++		while (i < count) {
++			// determine the rows of this batch and an upper bound of their decompressed size
++			idx_t bound = BATCH_SLACK;
++			idx_t end = i;
++			for (; end < count; end++) {
++				auto index = sel ? sel->get_index(end) : end;
++				idx_t str_bound = idx_t(bitunpack_buffer[offsets.scan_offset + index]) * 8;
++				if (end > i && bound + str_bound > MAX_BATCH_BOUND) {
++					break;
++				}
++				bound += str_bound;
++			}
++			if (bound == BATCH_SLACK) {
++				// only empty strings
++				for (; i < end; i++) {
++					result_data[i] = string_t(nullptr, 0);
++				}
++				continue;
++			}
++			auto base = str_buffer.AllocateShrinkableBuffer(bound);
++			idx_t pos = 0;
++			for (; i < end; i++) {
++				auto index = sel ? sel->get_index(i) : i;
++				uint32_t str_len = bitunpack_buffer[offsets.scan_offset + index];
++				if (str_len == 0) {
++					result_data[i] = string_t(nullptr, 0);
++					continue;
++				}
++				auto str_ptr = FSSTStorage::FetchStringPointer(
++				    dict, baseptr,
++				    UnsafeNumericCast<int32_t>(delta_decode_buffer[index + offsets.unused_delta_decoded_values]));
++				D_ASSERT(pos + idx_t(str_len) * 8 <= bound);
++				auto target = base + pos;
++				auto decompressed_size = duckdb_fsst_decompress(
++				    decoder, str_len, const_data_ptr_cast(str_ptr), bound - pos, target);
++				D_ASSERT(decompressed_size <= idx_t(str_len) * 8);
++				// for inlined strings the constructor copies the data, so the space can be reused
++				result_data[i] = string_t(const_char_ptr_cast(target), UnsafeNumericCast<uint32_t>(decompressed_size));
++				if (decompressed_size > string_t::INLINE_LENGTH) {
++					pos += decompressed_size;
++				}
++			}
++			// all writes into this allocation are done: release the unused tail
++			allocator.ShrinkHead(bound - pos);
++		}
++	}
+ };
+ 
+ unique_ptr<SegmentScanState> FSSTStorage::StringInitScan(const QueryContext &context, ColumnSegment &segment) {
+@@ -696,8 +756,13 @@ void FSSTStorage::StringScanPartial(ColumnSegment &segment, ColumnScanState &sta
+ 	} else {
+ 		// Just decompress
+ 		auto &str_buffer = StringVector::GetStringBuffer(result);
+-		for (idx_t i = 0; i < scan_count; i++) {
+-			result_data[i + result_offset] = scan_state.DecompressString(dict, baseptr, offsets, i, str_buffer);
++		if (!scan_state.all_values_inlined && scan_state.duckdb_fsst_decoder) {
++			scan_state.DecompressStringsBatched(dict, baseptr, offsets, nullptr, scan_count, result_data + result_offset,
++			                                    str_buffer);
++		} else {
++			for (idx_t i = 0; i < scan_count; i++) {
++				result_data[i + result_offset] = scan_state.DecompressString(dict, baseptr, offsets, i, str_buffer);
++			}
+ 		}
+ 	}
+ 	EndScan(scan_state, offsets, start, scan_count);
+@@ -725,9 +790,13 @@ void FSSTStorage::Select(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 	auto offsets = StartScan(scan_state, base_data, start, vector_count);
+ 	auto result_data = FlatVector::GetData<string_t>(result);
+ 
+-	for (idx_t i = 0; i < sel_count; i++) {
+-		idx_t index = sel.get_index(i);
+-		result_data[i] = scan_state.DecompressString(dict, baseptr, offsets, index, str_buffer);
++	if (!scan_state.all_values_inlined && scan_state.duckdb_fsst_decoder) {
++		scan_state.DecompressStringsBatched(dict, baseptr, offsets, &sel, sel_count, result_data, str_buffer);
++	} else {
++		for (idx_t i = 0; i < sel_count; i++) {
++			idx_t index = sel.get_index(i);
++			result_data[i] = scan_state.DecompressString(dict, baseptr, offsets, index, str_buffer);
++		}
+ 	}
+ 	EndScan(scan_state, offsets, start, vector_count);
+ }

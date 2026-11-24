@@ -1,0 +1,16 @@
+{
+  "id": "E0003",
+  "title": "Sparse-range perfect hash join that keeps the bloom filter",
+  "started": "2026-11-24T00:49:08-05:00",
+  "base": "1033aad43d8ba556e66b355e855fc893dfdf09e9",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.19437,
+  "summary": "I implemented the sparse-range perfect hash join that keeps the bloom filter, and it made q16 much slower.\n\nChanges:\n- CanDoPerfectHashJoin now also accepts a range up to 2^23 when (range+1) \u2264 16\u00d7count and (range+1)\u00d7(sum of payload widths + per-column validity + 1) \u2264 256MB. It sets a new PerfectHashJoinStats::is_sparse = (range+1) > 2\u00d7count and fixes the off-by-one duplicate check (Count() > range+1).\n- PhysicalHashJoin::Finalize calls FinalizeFilters with is_perfect=false for sparse perfect tables. It then fills the bloom filter through a new PerfectHashJoinExecutor::FillBloomFilter, which runs ScanKeyColumn and inserts VectorOperations::Hash in STANDARD_VECTOR_SIZE slices, and pushes the deferred bloom filters directly.\n\nThe build was clean (BUILD OK). EXPLAIN ANALYZE on q16.m0 showed it working as intended: the join ran perfect, the partsupp scan kept `IN BF` and emitted 1,236,280 rows, and HASH_JOIN CPU fell from 0.15s to 0.07s.\n\nBench on q16:\n- Dictionary output: 149.4ms \u2192 232.9ms (+55.8%). HASH_GROUP_BY CPU went from 0.31s to 0.53s.\n- Flattening the build columns of the sparse table in the probe: 142.2ms \u2192 202.4ms (+42.3%).\n- Also resetting the validity mask when all rows are valid: 147.3ms \u2192 205.0ms (+39.2%).\n\nWhy it fails: the profile CPU figures are summed over 8 threads. The join's 0.15s CPU is only about 19ms of wall time out of a 140ms query, so the best saving available was about 10ms. The perfect-table build runs single-threaded inside Finalize. For this query that means allocating and touching about 66MB of 2M-slot dictionaries for the VARCHAR, uhugeint and utinyint payload, gathering into them, and scanning the keys a second time for the bloom filter. Random access over those arrays also has worse cache locality than the compact hash-table row store, and the downstream group-by got slower too. Together these cost far more than the probe saved.",
+  "notes": "- Divide operator CPU in EXPLAIN ANALYZE by the thread count (8 here) before estimating a gain. The issue's expected -6..-10% was impossible, because the whole join is about 19ms of wall time.\n- The bloom filter mechanics are sound and reusable: FinalizeFilters with is_perfect=false, fill through ScanKeyColumn plus VectorOperations::Hash, then push the deferred filters in Finalize.\n- Neither dictionary vectors nor validity masks explained the group-by slowdown. Most of the cost is the serial build and the 2M-slot memory footprint.\n- Follow-up ideas if anyone retries:\n  - Build the perfect table in parallel.\n  - Store compact row indices or pointers instead of full payload copies per slot.\n  - Restrict the sparse path to narrow fixed-width payloads.\n- The off-by-one fix (fully dense builds currently fall back to the regular hash table) could be a separate tiny change, but it has no measured effect on q16.",
+  "finished": "2026-11-24T00:55:18-05:00"
+}

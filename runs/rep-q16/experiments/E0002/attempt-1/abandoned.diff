@@ -1,0 +1,69 @@
+diff --git a/src/optimizer/pushdown/pushdown_get.cpp b/src/optimizer/pushdown/pushdown_get.cpp
+index d5b20cb..82b338e 100644
+--- a/src/optimizer/pushdown/pushdown_get.cpp
++++ b/src/optimizer/pushdown/pushdown_get.cpp
+@@ -1,6 +1,8 @@
+ #include "duckdb/optimizer/filter_pushdown.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_operator_expression.hpp"
+ #include "duckdb/planner/expression/bound_parameter_expression.hpp"
+ #include "duckdb/planner/expression_iterator.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -39,6 +41,28 @@ static void NormalizeColumnRefAliases(unique_ptr<Expression> &expr, const Logica
+ 	    });
+ }
+ 
++//! Whether "expr" is "col IN (c1, ..., cn)" with a short list of non-NULL constants that cannot throw
++static bool IsPushableConstantInList(const Expression &expr) {
++	static constexpr idx_t MAX_IN_LIST_SCAN_FILTER = 64;
++	if (expr.type != ExpressionType::COMPARE_IN || expr.IsVolatile() || expr.CanThrow()) {
++		return false;
++	}
++	auto &in_expr = expr.Cast<BoundOperatorExpression>();
++	if (in_expr.children.size() < 2 || in_expr.children.size() > MAX_IN_LIST_SCAN_FILTER + 1) {
++		return false;
++	}
++	if (in_expr.children[0]->type != ExpressionType::BOUND_COLUMN_REF) {
++		return false;
++	}
++	for (idx_t i = 1; i < in_expr.children.size(); i++) {
++		auto &child = *in_expr.children[i];
++		if (child.type != ExpressionType::VALUE_CONSTANT || child.Cast<BoundConstantExpression>().value.IsNull()) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperator> op) {
+ 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_GET);
+ 	auto &get = op->Cast<LogicalGet>();
+@@ -105,11 +129,25 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
+ 	for (idx_t i = 0; i < filters.size(); ++i) {
+ 		// get the previous pushdown result
+ 		auto pushdown_result = pushdown_results[i];
++		auto &expr = *filters[i]->filter;
++		if (pushdown_result == FilterPushdownResult::PUSHED_DOWN_PARTIALLY) {
++			// a constant IN-list on a column is only pushed as a (zonemap-only) optional filter
++			// evaluate it fully inside the scan instead of leaving it for a MARK join above the scan
++			if (!IsPushableConstantInList(expr)) {
++				continue;
++			}
++			pushdown_result = combiner.TryPushdownGenericExpression(get, expr);
++			if (pushdown_result == FilterPushdownResult::PUSHED_DOWN_FULLY) {
++				filters.erase_at(i);
++				pushdown_results.erase_at(i);
++				i--;
++			}
++			continue;
++		}
+ 		if (pushdown_result != FilterPushdownResult::NO_PUSHDOWN) {
+ 			// this has already been (partially) pushed down - skip
+ 			continue;
+ 		}
+-		auto &expr = *filters[i]->filter;
+ 		if (expr.IsVolatile()) {
+ 			continue;
+ 		}
