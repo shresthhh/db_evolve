@@ -69,7 +69,7 @@ class ClaudeCLI:
             if pause is None or waited > 48 * 3600:
                 break
             log(f"{role}: plan usage limit hit; waiting {pause / 60:.0f} min for the reset, then retrying")
-            time.sleep(pause)
+            sleep_wall(pause)
             waited += pause
             start = time.time()
         (log_dir / f"{role}.raw.json").write_text(stdout or "")
@@ -81,6 +81,14 @@ class ClaudeCLI:
 
 _LIMIT = re.compile(r"hit your [^\n]*?limit", re.I)
 _RESET = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)", re.I)
+
+
+def sleep_wall(seconds: float) -> None:
+    """Sleep until a wall-clock deadline. time.sleep alone stalls while the machine is suspended
+    (WSL's monotonic clock stops), so a wait for a usage reset could run hours past the reset."""
+    deadline = time.time() + seconds
+    while (left := deadline - time.time()) > 0:
+        time.sleep(min(left, 60))
 
 
 def usage_limit_pause(text: str, now: "datetime.datetime | None" = None) -> float | None:
