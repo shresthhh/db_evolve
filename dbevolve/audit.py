@@ -77,7 +77,7 @@ def audit(cfg: Config, run_id: str, frm: str = "v0", to: str | None = None, budg
     rel = run.state["releases"]
     to = to or sorted(rel, key=lambda v: int(v[1:]))[-1]
     engine = Engine(cfg)
-    ledger = {r["id"]: r for r in run.ledger}
+    by_sha = {r["candidate"]: r for r in run.ledger if r.get("candidate")}
     alone = _ablation_alone(cfg, run_id)
     out_dir = cfg.results / f"{run_id}-audit"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,13 +88,13 @@ def audit(cfg: Config, run_id: str, frm: str = "v0", to: str | None = None, budg
     for line in filter(str.strip, lines):
         sha, subject = line.split(" ", 1)
         eid = subject.split(":")[0]
-        cache = out_dir / f"{eid}.json"
+        cache = out_dir / f"{eid}-{sha[:12]}.json"   # ids repeat across runs merged into one
         entry = read_json(cache) or {}
         diff = engine.git("diff", f"{sha}~1", sha, "--", "src", "extension")
         entry.update({"id": eid, "sha": sha, "subject": subject,
                       "files": engine.git("diff", "--name-only", f"{sha}~1", sha).splitlines(),
                       "static": static_signals(diff)})
-        rec = ledger.get(eid, {})
+        rec = by_sha.get(sha, {})
         if rec.get("train_ratio"):
             entry["accepted_gain"] = 1 / rec["train_ratio"]
             entry["accepted_faster"] = {t: round(1 / r, 2) for t, r in sorted(rec.get("train_template_ratios", {}).items())
@@ -115,7 +115,7 @@ def audit(cfg: Config, run_id: str, frm: str = "v0", to: str | None = None, budg
             prompt = render("auditor", engine=cfg["engine"]["name"], workload=cfg["workload"]["name"].upper(),
                             scope=scope_text(cfg))
             log(f"auditing {eid}: {subject[:70]}")
-            res = cli.run("auditor", prompt, slot, AUDIT_SCHEMA, budget, out_dir / "logs" / eid)
+            res = cli.run("auditor", prompt, slot, AUDIT_SCHEMA, budget, out_dir / "logs" / f"{eid}-{sha[:12]}")
             if res.ok:
                 entry["audit"] = res.output
                 entry["audit_cost_usd"] = res.cost_usd
