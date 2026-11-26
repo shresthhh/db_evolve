@@ -271,7 +271,7 @@ def cmd_transfer(args):
     if not ok:
         sys.exit(f"build with the {wl.name} generator failed:\n{out}")
     data.ensure_dataset(cfg, wl, gen_binary, "main")
-    out_dir = cfg.results / f"{run.id}-{wl.name}"
+    out_dir = cfg.results / (args.out or f"{run.id}-{wl.name}")
     rep = report.write(h, releases, out_dir)
     print(report.markdown(rep))
     print(f"written to {out_dir}")
@@ -560,6 +560,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_curve)
     p = sub.add_parser("transfer")
     p.add_argument("--run")
+    p.add_argument("--out", help="results subdirectory (default <run>-<workload>)")
     p.set_defaults(fn=cmd_transfer)
     args = ap.parse_args(argv)
     return args.fn(args) or 0
