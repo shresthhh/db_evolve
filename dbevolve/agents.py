@@ -54,14 +54,15 @@ class ClaudeCLI:
         if writable:
             cmd += ["--permission-mode", "acceptEdits"]
         env = dict(os.environ, DBE_SLOT=str(cwd), DBE_CONFIG=str(self.cfg.path))
-        env.pop("ANTHROPIC_API_KEY", None)   # plan login by default; the key is only a fallback
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+            env.pop(k, None)                 # plan login by default; the key is only a fallback
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / f"{role}.prompt.md").write_text(prompt)
         start = time.time()
         waited = 0.0
         while True:
             api = _on_api()
-            run_env = dict(env, ANTHROPIC_API_KEY=fallback_api_key()) if api else env
+            run_env = dict(env, **fallback_env()) if api else env
             try:
                 p = subprocess.run(cmd, input=prompt, cwd=cwd, env=run_env, text=True, capture_output=True,
                                    timeout=self.a["timeout_s"])
@@ -103,6 +104,21 @@ def fallback_api_key() -> str | None:
     if not key and KEY_FILE.is_file():
         key = KEY_FILE.read_text().strip()
     return key or None
+
+
+BASE_URL_FILE = KEY_FILE.with_name("anthropic_base_url")
+
+
+def fallback_env() -> dict:
+    """Environment for a call on the fallback key. With a gateway base URL ($DBE_FALLBACK_BASE_URL
+    or ~/.config/db_evolve/anthropic_base_url, without the trailing /v1), the key goes as a Bearer
+    token (ANTHROPIC_AUTH_TOKEN), which gateways such as Portkey expect; otherwise as an API key."""
+    key = fallback_api_key()
+    base = os.environ.get("DBE_FALLBACK_BASE_URL", "").strip()
+    if not base and BASE_URL_FILE.is_file():
+        base = BASE_URL_FILE.read_text().strip()
+    base = base.rstrip("/").removesuffix("/v1")
+    return {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key} if base else {"ANTHROPIC_API_KEY": key}
 
 
 def _on_api() -> bool:

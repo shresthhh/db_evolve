@@ -186,3 +186,14 @@ def test_api_key_fallback_only_after_a_usage_limit(monkeypatch, tmp_path):
     assert not agents._on_api()                      # key present, but no limit hit yet
     monkeypatch.setattr(agents, "_api_until", agents.time.time() + 60)
     assert agents._on_api()
+
+
+def test_fallback_env_uses_bearer_token_for_a_gateway(monkeypatch, tmp_path):
+    from dbevolve import agents
+    monkeypatch.setattr(agents, "KEY_FILE", tmp_path / "k")
+    monkeypatch.setattr(agents, "BASE_URL_FILE", tmp_path / "u")
+    monkeypatch.setenv("DBE_FALLBACK_API_KEY", "sk-test")
+    monkeypatch.delenv("DBE_FALLBACK_BASE_URL", raising=False)
+    assert agents.fallback_env() == {"ANTHROPIC_API_KEY": "sk-test"}
+    monkeypatch.setenv("DBE_FALLBACK_BASE_URL", "https://gw.example/v1/")
+    assert agents.fallback_env() == {"ANTHROPIC_BASE_URL": "https://gw.example", "ANTHROPIC_AUTH_TOKEN": "sk-test"}
