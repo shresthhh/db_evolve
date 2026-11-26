@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Run one long pipeline script detached, and bring it back after a reboot.
+#
+#   scripts/pipeline start scripts/run_controls.sh   start it (and remember it as the active one)
+#   scripts/pipeline resume                          restart the active one if it is not running
+#   scripts/pipeline status                          what is active, whether it runs, log tail
+#   scripts/pipeline stop                            stop it and forget it
+#   scripts/pipeline install-cron                    add "@reboot scripts/pipeline resume" to crontab
+#
+# Every step of the pipelines resumes work already done, and an interrupted round is redone
+# automatically, so restarting after a crash is always safe. A pipeline that exits (done or
+# failed) is no longer active, so a reboot does not rerun it.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT=$(pwd)
+ACTIVE=work/pipeline.active
+LOCK=work/.pipeline.lock
+export PATH="$HOME/.local/bin:$PATH"
+mkdir -p work/logs
+
+running() { ! flock -n "$LOCK" true 2>/dev/null; }
+
+launch() {
+  local script=$1 log="work/logs/$(basename "$1" .sh).log"
+  [ -f "$log" ] && cp "$log" "$log.$(date +%Y%m%d-%H%M%S)"
+  setsid nohup flock -n "$LOCK" bash -c \
+    "\"$script\" > \"$log\" 2>&1; code=\$?; echo \"exit=\$code\" >> \"$log\"; rm -f \"$ACTIVE\"" \
+    </dev/null >/dev/null 2>&1 &
+  echo "started $script (log: $log)"
+}
+
+case "${1:-status}" in
+  start)
+    [ -x "${2:-}" ] || { echo "usage: scripts/pipeline start <executable script>"; exit 2; }
+    running && { echo "a pipeline is already running: $(cat $ACTIVE 2>/dev/null)"; exit 1; }
+    echo "$2" > "$ACTIVE"; launch "$2" ;;
+  resume)
+    [ -f "$ACTIVE" ] || { echo "no active pipeline"; exit 0; }
+    running && { echo "already running: $(cat $ACTIVE)"; exit 0; }
+    launch "$(cat $ACTIVE)" ;;
+  stop)
+    rm -f "$ACTIVE"
+    pkill -f "flock -n $LOCK" ; pkill -f "dbevolve.cli" ; echo "stopped" ;;
+  status)
+    if [ -f "$ACTIVE" ]; then
+      s=$(cat $ACTIVE); echo "active: $s ($(running && echo running || echo 'not running'))"
+      tail -5 "work/logs/$(basename "$s" .sh).log" 2>/dev/null
+    else echo "no active pipeline"; fi ;;
+  install-cron)
+    line="@reboot $ROOT/scripts/pipeline resume >> $ROOT/work/logs/pipeline-cron.log 2>&1"
+    (crontab -l 2>/dev/null | grep -vF "scripts/pipeline resume"; echo "$line") | crontab -
+    crontab -l | grep -F "scripts/pipeline" ;;
+  *) sed -n 2,12p "$0"; exit 2 ;;
+esac

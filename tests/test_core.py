@@ -197,3 +197,23 @@ def test_fallback_env_uses_bearer_token_for_a_gateway(monkeypatch, tmp_path):
     assert agents.fallback_env() == {"ANTHROPIC_API_KEY": "sk-test"}
     monkeypatch.setenv("DBE_FALLBACK_BASE_URL", "https://gw.example/v1/")
     assert agents.fallback_env() == {"ANTHROPIC_BASE_URL": "https://gw.example", "ANTHROPIC_AUTH_TOKEN": "sk-test"}
+
+
+def test_interrupted_round_is_set_aside_and_redone(tmp_path):
+    from dbevolve import loop
+    from dbevolve.util import write_json
+    d = tmp_path / "r"
+    (d / "rounds" / "g2r05").mkdir(parents=True)
+    for e in ("E0007", "E0008"):
+        (d / "experiments" / e).mkdir(parents=True)
+    (d / "ledger.jsonl").write_text('{"id": "E0007"}\n')
+    write_json(d / "state.json", {"generation": 2, "round": 5, "experiments": 8, "in_round": True})
+    run = loop.Run.__new__(loop.Run)
+    run.dir, run.id, run.state_path = d, "r", d / "state.json"
+    run.state = {"generation": 2, "round": 5, "experiments": 8, "in_round": True}
+    lp = loop.Loop.__new__(loop.Loop)
+    lp.run = run
+    lp.undo_interrupted_round()
+    assert run.state["round"] == 4 and run.state["experiments"] == 7 and not run.state["in_round"]
+    assert (d / "experiments" / "E0007").exists() and not (d / "experiments" / "E0008").exists()
+    assert not (d / "rounds" / "g2r05").exists() and len(list((d / "interrupted").glob("*/E0008"))) == 1

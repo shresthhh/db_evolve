@@ -8,6 +8,7 @@ from __future__ import annotations
 import glob
 import os
 import shutil
+import time
 from pathlib import Path
 
 from .config import Config
@@ -57,9 +58,29 @@ class Engine:
         return path
 
     def checkout(self, slot: Path, sha: str) -> None:
-        self.git("reset", "--hard", "-q", cwd=slot)
+        try:
+            self.git("reset", "--hard", "-q", cwd=slot)
+        except RuntimeError:
+            self.repair_after_crash(slot, sha)
         self.git("clean", "-fdq", cwd=slot)
         self.git("checkout", "-q", "--detach", sha, cwd=slot)
+
+    def repair_after_crash(self, slot: Path, sha: str) -> None:
+        """A hard reboot can leave empty object files from the last commits (of an experiment that
+        never reached the ledger) and a worktree HEAD pointing at one. Set the empty files aside,
+        point HEAD at a known-good commit and reset."""
+        objects = Path(self.git("rev-parse", "--git-common-dir", cwd=slot)).resolve() / "objects"
+        if not objects.is_absolute():
+            objects = (slot / objects).resolve()
+        aside = self.cfg.work / "logs" / "empty-objects" / time.strftime("%Y%m%d-%H%M%S")
+        empty = [f for f in objects.glob("??/*") if f.is_file() and f.stat().st_size == 0]
+        for f in empty:
+            (aside / f.parent.name).mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(aside / f.parent.name / f.name))
+        log(f"repairing {slot.name} after a crash: {len(empty)} empty git objects set aside in {aside}")
+        self.git("update-ref", "--no-deref", "HEAD", sha, cwd=slot)
+        self.git("reflog", "expire", "--expire-unreachable=now", "--all", cwd=slot, check=False)
+        self.git("reset", "--hard", "-q", cwd=slot)
 
     def commit_all(self, slot: Path, message: str) -> str | None:
         """Commit whatever the agent left in the worktree. Returns the new sha, or None if nothing changed."""

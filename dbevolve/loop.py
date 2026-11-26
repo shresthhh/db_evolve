@@ -8,6 +8,7 @@ A generation ends by tagging the current best as a release (v1, v2, ...).
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 
 from . import agents, bench, gates
@@ -192,13 +193,18 @@ class Loop:
         generations = generations or lp["generations"]
         rounds = rounds or lp["rounds_per_generation"]
         st = self.run.state
+        if st.get("in_round"):
+            self.undo_interrupted_round()
         while st["generation"] <= generations:
             while st["round"] < rounds and self.remaining() >= 0.5:
                 st["round"] += 1
+                st["in_round"] = True
                 self.run.save()
                 log(f"=== generation {st['generation']} round {st['round']}/{rounds} "
                     f"(best {st['best_sha'][:12]}, visible geomean x{1 / st['train_ratio_vs_base']:.3f}) ===")
                 self.round(rounds)
+                st["in_round"] = False
+                self.run.save()
             self.engine.tag_release(st["generation"], st["best_sha"])
             st["releases"][f"v{st['generation']}"] = st["best_sha"]
             log(f"released v{st['generation']} = {st['best_sha'][:12]}")
@@ -209,6 +215,25 @@ class Loop:
             st["generation"] += 1
             st["round"] = 0
             self.run.save()
+
+    def undo_interrupted_round(self) -> None:
+        """The process died mid-round (reboot, kill): set the round's partial files aside and
+        redo it. Experiments that reached the ledger stay; the rest are rerun from scratch."""
+        st = self.run.state
+        done = max((int(r["id"][1:]) for r in self.run.ledger), default=0)
+        stash = self.run.dir / "interrupted" / time.strftime("%Y%m%d-%H%M%S")
+        partial = [self.run.dir / "rounds" / f"g{st['generation']}r{st['round']:02d}"]
+        partial += [d for d in sorted((self.run.dir / "experiments").glob("E*")) if int(d.name[1:]) > done]
+        for d in partial:
+            if d.exists():
+                stash.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(d), str(stash / d.name))
+        log(f"round {st['round']} of generation {st['generation']} was interrupted; redoing it "
+            f"(partial files in {stash.relative_to(self.run.dir)})")
+        st["experiments"] = done
+        st["round"] = max(0, st["round"] - 1)
+        st["in_round"] = False
+        self.run.save()
 
     def round(self, rounds: int) -> None:
         st = self.run.state
