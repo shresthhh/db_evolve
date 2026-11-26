@@ -11,7 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import agents, bench, gates
+from . import agents, bench, foreign, gates
 from .agents import IMPLEMENTER_SCHEMA, PLANNER_SCHEMA, REVIEWER_SCHEMA, TOOL
 from .bench import Harness
 from .config import ROOT, Config
@@ -450,6 +450,12 @@ class Loop:
         if report["smoke"]:
             return fail("generic SQL suite", "Queries on an unrelated schema no longer match the original engine:\n\n"
                         + "\n".join(f"- {s}" for s in report["smoke"][:10]))
+        report["foreign"] = fg = foreign.check(self.cfg, best, cand)
+        if not fg["ok"]:
+            return fail("hidden workload", "On another workload, hidden from you (no details are given):\n\n"
+                        + (f"- {len(fg['failed'])} queries raised errors or gave wrong results\n" if fg["failed"] else "")
+                        + (f"- {len(fg['slower'])} queries became more than "
+                           f"{foreign.settings(self.cfg).get('max_slowdown', 2.0):g}x slower\n" if fg["slower"] else ""))
         self.write_context({"review/diff.patch": diff,
                             "review/issue.md": f"{issue_md}\n\n## Author's summary\n\n{impl['summary']}\n\n"
                                                f"## Author's generality argument\n\n{impl['generality']}\n"})

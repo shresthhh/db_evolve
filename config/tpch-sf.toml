@@ -67,6 +67,11 @@ max_template_regression = 0.05       # no template slower by more than 5 % ...
 abs_slack_ms = 5.0                   # ... or 5 ms, whichever is larger
 val_tolerance = 0.02                 # hidden validation geomean may not get more than 2 % slower
 
+[gates.foreign]                      # hidden gate: TPC-DS must stay correct and not get much slower
+config = "config/tpcds.toml"
+scale_factor = 1.0
+max_slowdown = 2.0                   # no TPC-DS query more than 2x slower than the current best ...
+abs_slack_ms = 20.0                  # ... and by more than 20 ms
 [agents]
 backend = "claude-cli"               # or "mock" (no model calls; exercises the pipeline)
 model = "claude-opus-5-5"
