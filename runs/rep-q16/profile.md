@@ -1,10 +1,10 @@
 # Profile of the current best build
 
-Visible templates, hot runs, 8 threads. Geomean 169.4 ms, total 169 ms.
+Visible templates, hot runs, 8 threads. Geomean 183.2 ms, total 183 ms.
 
 | Template | Time (ms) | Share of total |
 | --- | ---: | ---: |
-| q16 | 169.4 | 100.0% |
+| q16 | 183.2 | 100.0% |
 
 ## Plans with operator timings (slowest templates)
 
@@ -17,7 +17,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 ```
 ┌────────────────────────────────────────────────┐
 │┌──────────────────────────────────────────────┐│
-││              Total Time: 0.249s              ││
+││              Total Time: 0.218s              ││
 │└──────────────────────────────────────────────┘│
 └────────────────────────────────────────────────┘
 ┌───────────────────────────┐
@@ -107,7 +107,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           │
 │                           │
 │        27,839 rows        │
-│           0.57s           │
+│           0.50s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         PROJECTION        │
@@ -135,7 +135,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           │
 │                           │
 │       1,184,892 rows      │
-│           0.03s           │
+│           0.02s           │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │         PROJECTION        │
@@ -171,7 +171,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           │                                                                        │
 │                           │                                                                        │
 │       1,185,556 rows      │                                                                        │
-│           0.03s           │                                                                        │
+│           0.02s           │                                                                        │
 └─────────────┬─────────────┘                                                                        │
 ┌─────────────┴─────────────┐                                                          ┌─────────────┴─────────────┐
 │         HASH_JOIN         │                                                          │         TABLE_SCAN        │
@@ -184,7 +184,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           │                                                          │                           │
 │                           │                                                          │        Projections:       │
 │                           ├──────────────┐                                           │         s_suppkey         │
-│           0.26s           │              │                                           │                           │
+│           0.22s           │              │                                           │                           │
 │                           │              │                                           │          Filters:         │
 │                           │              │                                           │  (s_comment ~~ '%Customer │
 │                           │              │                                           │       %Complaints%')      │
@@ -192,7 +192,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           │              │                                           │                           │
 │                           │              │                                           │                           │
 │       1,185,556 rows      │              │                                           │          56 rows          │
-│          (0.26s)          │              │                                           │           0.03s           │
+│          (0.22s)          │              │                                           │           0.02s           │
 └─────────────┬─────────────┘              │                                           └───────────────────────────┘
 ┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 │         TABLE_SCAN        ││         PROJECTION        │
@@ -217,7 +217,7 @@ SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt FROM 
 │                           ││                           │
 │                           ││                           │
 │       1,236,280 rows      ││        296,389 rows       │
-│           0.21s           ││          (0.00s)          │
+│           0.20s           ││          (0.00s)          │
 └───────────────────────────┘└─────────────┬─────────────┘
                              ┌─────────────┴─────────────┐
                              │           FILTER          │

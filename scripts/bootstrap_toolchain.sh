@@ -17,7 +17,7 @@ if [ ! -x "$MAMBA" ]; then
 fi
 
 export MAMBA_ROOT_PREFIX="$TC/mamba-root"
-PKGS=(python=3.12 cxx-compiler c-compiler cmake ninja ccache make matplotlib-base pytest)
+PKGS=(python=3.12 cxx-compiler c-compiler "cmake>=3.24" ninja ccache make matplotlib-base pytest)
 
 if [ ! -x "$ENV/bin/python" ]; then
   echo "[toolchain] creating environment at $ENV"

@@ -25,8 +25,9 @@
     "expected_gain": "q16 ~-5% (noisy)",
     "generality": "Aggregates with VARCHAR/nested keys fed by small chunks. Fixed-width layouts are unchanged.",
     "risk": "Low. Two-line gate. Spill paths need a test with long-string keys.",
-    "status": "open",
-    "filed": "g1r1"
+    "status": "retired",
+    "filed": "g1r1",
+    "experiment": "E0005"
   },
   {
     "title": "Push constant IN-list as scan ExpressionFilter instead of MARK join",
@@ -54,8 +55,9 @@
     "expected_gain": "q16 -3..-6%: no hashing on 8M probes and no FP rows.",
     "generality": "Joins on dense integer keys (surrogate keys) with a selective build side.",
     "risk": "Medium. It is a larger diff, and the bitmap size has to be capped.",
-    "status": "open",
-    "filed": "g1r2"
+    "status": "accepted",
+    "filed": "g1r2",
+    "experiment": "E0006"
   },
   {
     "title": "Sparse-range perfect hash join that keeps the bloom filter",
@@ -84,7 +86,22 @@
     "expected_gain": "q16 -5..-10% if the main sink is really ~20ms of wall time",
     "generality": "Any GROUP BY with only DISTINCT aggregates and many (G,x) pairs per group set. Queries with few groups or non-distinct aggregates are unchanged.",
     "risk": "Medium. Must keep correctness with GROUPING SETS, spill, and mixed distinct/non-distinct aggregates. Measure the phase first.",
+    "status": "retired",
+    "filed": "g1r4",
+    "experiment": "E0004"
+  },
+  {
+    "title": "Count DISTINCT directly from group-aligned distinct partitions",
+    "hypothesis": "E0004's timers: the main-HT sink fed from the distinct scan costs about 104ms CPU, and distinct GetData about 160ms. After E0001, every (G,x) of a given G lands in a single distinct partition, and the finalized partition holds unique (G,x). When every aggregate is a plain count(DISTINCT x) over one shared column, count = the number of non-NULL x per G in that partition, so a cache-resident per-partition counter would replace the 88ns/row main sink.",
+    "plan": "In HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping (physical_hash_aggregate.cpp ~665), detect this shape. Then for each scanned distinct partition, group by G with a small per-task HT sized to the partition, and sink only (G,count) into the main HT using a sum-like combine. That needs care, so it may be better to sink pre-aggregated counts as partial states through the count aggregate's combine.",
+    "target_files": [
+      "src/execution/operator/aggregate/physical_hash_aggregate.cpp",
+      "src/execution/radix_partitioned_hashtable.cpp"
+    ],
+    "expected_gain": "q16 -5..-8% if the 104ms of main-sink CPU mostly disappears",
+    "generality": "GROUP BY plus count(DISTINCT x) queries with many distinct (G,x) pairs.",
+    "risk": "Medium to high: it intrudes on the distinct finalize protocol and has to keep NULL handling and the partition alignment exact.",
     "status": "open",
-    "filed": "g1r4"
+    "filed": "g1r5"
   }
 ]

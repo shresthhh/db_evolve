@@ -2,14 +2,15 @@
   "run_id": "rep-q16",
   "created": "2026-11-23T23:33:52-05:00",
   "base_sha": "069cc9f9b5be802405797faecc284961b07c70ef",
-  "best_sha": "1033aad43d8ba556e66b355e855fc893dfdf09e9",
-  "generation": 1,
-  "round": 4,
-  "experiments": 3,
-  "train_ratio_vs_base": 0.865967336915689,
-  "cost_usd": 4.625504800000001,
+  "best_sha": "0ad9b3c52958fd5c935b6715571bd2712ffc69bd",
+  "generation": 2,
+  "round": 0,
+  "experiments": 6,
+  "train_ratio_vs_base": 0.783740440343329,
+  "cost_usd": 8.563900600000002,
   "releases": {
-    "v0": "069cc9f9b5be802405797faecc284961b07c70ef"
+    "v0": "069cc9f9b5be802405797faecc284961b07c70ef",
+    "v1": "0ad9b3c52958fd5c935b6715571bd2712ffc69bd"
   },
   "config": {
     "project": {
