@@ -10,6 +10,7 @@
     check <commit>           run the mechanical gates on any commit of the engine clone
     report [--run ID]        evaluate all released versions on all splits; tables and plots
     ablate --run ID          time each accepted change alone (on v0) and removed (from the last release)
+    audit --run ID [--from v0 --to v1]   changelog + generality audit of the accepted changes
     transfer --run ID        time the releases on another workload (e.g. --config config/tpcds.toml)
     specialize q09 q13 ...   one run per template that specialises v0 to that template alone
     crosseval --prefix spec  time v0 and every specialised or merged system on all templates
@@ -275,6 +276,13 @@ def cmd_transfer(args):
     rep = report.write(h, releases, out_dir)
     print(report.markdown(rep))
     print(f"written to {out_dir}")
+
+
+def cmd_audit(args):
+    """Changelog and generality audit of the accepted changes between two releases of a run."""
+    from . import audit
+    cfg = config.load(args.config)
+    print(audit.audit(cfg, args.run, args.frm, args.to, agent=not args.no_agent))
 
 
 def spec_config(base, template: str, prefix: str = "spec"):
@@ -558,6 +566,12 @@ def main(argv=None) -> int:
     p.add_argument("--cross", default="spec-cross-merged", help="cross-evaluation that includes the merged systems")
     p.add_argument("--groups", default="spec-cross", help="where `groups` wrote groups.json")
     p.set_defaults(fn=cmd_curve)
+    p = sub.add_parser("audit")
+    p.add_argument("--run", required=True)
+    p.add_argument("--from", dest="frm", default="v0")
+    p.add_argument("--to", help="release (default: the last one)")
+    p.add_argument("--no-agent", action="store_true", help="static facts only, no auditor calls")
+    p.set_defaults(fn=cmd_audit)
     p = sub.add_parser("transfer")
     p.add_argument("--run")
     p.add_argument("--out", help="results subdirectory (default <run>-<workload>)")
