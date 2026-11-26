@@ -155,6 +155,28 @@ were test-only).
   (b) an equal-effort joint-evolution control (48 experiments on all train templates); (c) merge
   the random grouping as the baseline, which matters only once grouping has an effect.
 
+## Phase 2c: generality across scale factors, TPC-DS, and an audit of every change (26 Nov)
+
+Agreed 26 Nov. Runs on the shared server `dbresearch2` (14 cores / 28 threads, 125 GB); its timing
+noise is ±1.2 % train geomean, against ±2.9 % on the laptop, so results compare only within one machine.
+
+1. **Audit first.** `bin/dbe audit --run R` writes `docs/changes/<run>-<from>-<to>.md`. For each
+   accepted change it records files and lines, the conditions and constants added, the gain at
+   acceptance and alone (ablation), and an independent auditor agent's account: the mechanism, the
+   exact trigger quoted from the code, where the constants come from, non-benchmark SQL that takes
+   the path, and a general / heuristic / special-case label with citations. Special cases are
+   reviewed by hand. Then add *reach*: how many of the 121 TPC-H + TPC-DS queries a change touches
+   (EXPLAIN differs, or time beyond noise). A change that only reaches its own template is a branch.
+2. **TPC-DS transfer** (no agents): `scripts/run_tpcds_transfer.sh` times the releases of sf10, the
+   merged k = 1 engine and joint48 on the 99 TPC-DS templates at SF 10, on the server.
+3. **Scale-factor study.** TPC-H at SF 1, 3, 10, 30, 100. Every (template, SF) pair, 110 in all,
+   is a workload item, split 80/20 at random but stratified (4–5 test items per SF, at most 2 per
+   template). Most test items share a template with training items at other SFs, so the test set
+   measures transfer across scale. Then one specialised run per SF, and a 5 × 5 cross-evaluation:
+   does an engine evolved at SF a help at SF b? Needs harness work: (template, SF) items, timing over
+   several datasets, per-SF calibration, reports by SF. Estimate about 128 experiments, 3–5 days and
+   about $250–300 of agent cost; the plan's usage limits fall back to the university API key.
+
 ## Phase 3: stronger evidence (later)
 
 - **Ablations**, following VibeServe and JetStream: single agent without a separate reviewer; no
