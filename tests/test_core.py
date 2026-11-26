@@ -217,3 +217,17 @@ def test_interrupted_round_is_set_aside_and_redone(tmp_path):
     assert run.state["round"] == 4 and run.state["experiments"] == 7 and not run.state["in_round"]
     assert (d / "experiments" / "E0007").exists() and not (d / "experiments" / "E0008").exists()
     assert not (d / "rounds" / "g2r05").exists() and len(list((d / "interrupted").glob("*/E0008"))) == 1
+
+
+def test_scale_factor_items_split_is_stratified():
+    from collections import Counter
+    from dbevolve import config
+    from dbevolve.workload import Workload
+    wl = Workload(config.load(config.ROOT / "config" / "tpch-sf.toml"))
+    assert len(wl.items) == 110 and [len(wl.split[s]) for s in ("train", "val", "test")] == [80, 8, 22]
+    held = wl.split["val"] + wl.split["test"]
+    assert max(Counter(i.split("@")[0] for i in held).values()) <= 2
+    assert max(Counter(i.split("@")[1] for i in wl.split["test"]).values()) <= 5
+    inst = wl.instances("test", 0.0)
+    assert {i.dataset for i in inst} == {"sf1", "sf3", "main", "sf30", "sf100"}
+    assert all(i.id.startswith(i.item) for i in inst)

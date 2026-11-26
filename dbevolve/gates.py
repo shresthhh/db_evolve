@@ -56,8 +56,22 @@ def static_audit(diff_text: str, patterns: list[str]) -> list[str]:
 def correctness(h: Harness, sha: str) -> dict:
     """Returns {"ok": bool, "visible": [failures with detail], "hidden": {category: count}}."""
     visible, hidden = [], {}
-    for dataset in h.cfg["datasets"]:
-        groups = h.wl.gate_instances(h.cfg["datasets"][dataset]["scale_factor"])
+    if h.wl.item_datasets:
+        # scale-factor mode: every item on its own dataset, then each distinct template once on
+        # every dataset that is not an item dataset (the shadow data)
+        passes = [("main", h.wl.gate_instances(0.0))]
+        for d in h.cfg["datasets"]:
+            if d not in h.wl.item_datasets:
+                sf = h.cfg["datasets"][d]["scale_factor"]
+                g = {"train": h.wl.template_instances("train", sf),
+                     "heldout": h.wl.template_instances("train", sf, heldout=True),
+                     "val": h.wl.template_instances("val", sf)}
+                if h.wl.focus:
+                    g["other"] = h.wl.template_instances("test", sf)
+                passes.append((d, g))
+    else:
+        passes = [(d, h.wl.gate_instances(h.cfg["datasets"][d]["scale_factor"])) for d in h.cfg["datasets"]]
+    for dataset, groups in passes:
         for group, instances in groups.items():
             for f in h.check(sha, instances, dataset):
                 if group == "train":

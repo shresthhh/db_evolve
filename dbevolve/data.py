@@ -58,7 +58,9 @@ def ensure_db(cfg: Config, wl: Workload, binary: Path, sha: str, name: str) -> P
     db = db_path(cfg, wl, sha, name)
     meta = db.with_suffix(".json")
     if db.exists() and meta.exists():
+        db.parent.touch()   # recency for prune_dbs
         return db
+    prune_dbs(cfg, keep={sha[:12]})
     src = cfg.datasets / wl.name / tag(cfg, name)
     if not (src / "DONE").exists():
         raise RuntimeError(f"dataset {tag(cfg, name)} has not been generated; run `bin/dbe setup`")
@@ -72,6 +74,26 @@ def ensure_db(cfg: Config, wl: Workload, binary: Path, sha: str, name: str) -> P
         s.run("CHECKPOINT")
     write_json(meta, {"load_seconds": round(time.perf_counter() - start, 3), "bytes": db.stat().st_size})
     return db
+
+
+def prune_dbs(cfg: Config, keep: set[str] = frozenset()) -> None:
+    """Keep the per-binary database files under `bench.db_cache_gb` (default 300 GB) by deleting the
+    least recently used binaries' databases. Each binary reloads its databases if needed again."""
+    cap = cfg["bench"].get("db_cache_gb", 300) * 1e9
+    root = cfg.dbs
+    if not root.exists():
+        return
+    dirs = [(d.stat().st_mtime, d, sum(f.stat().st_size for f in d.iterdir() if f.is_file()))
+            for d in root.iterdir() if d.is_dir()]
+    total = sum(sz for _, _, sz in dirs)
+    for _, d, sz in sorted(dirs):
+        if total <= cap:
+            break
+        if d.name in keep:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        total -= sz
+        log(f"pruned databases of {d.name} ({sz / 1e9:.1f} GB) to stay under {cap / 1e9:.0f} GB")
 
 
 def db_meta(cfg: Config, wl: Workload, sha: str, name: str) -> dict:

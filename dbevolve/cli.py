@@ -58,16 +58,28 @@ def cmd_setup(args):
         data.ensure_dataset(cfg, wl, binary, name)
         data.ensure_db(cfg, wl, binary, base, name)
         sf = data.scale_factor(cfg, name)
+        if wl.item_datasets:   # scale-factor mode: items carry their datasets; shadow gets templates
+            if name in wl.item_datasets:
+                continue
+            insts = [i for s in ("train", "val", "test") for h_ in (False, True) if not (h_ and s != "train")
+                     for i in wl.template_instances(s, sf, heldout=h_)]
+            h.ensure_references(insts, name)
+            log(f"dataset {name}: reference results for {len(insts)} query instances")
+            continue
         insts = [i for g in wl.gate_instances(sf).values() for i in g] + wl.instances("test", sf)
         h.ensure_references(insts, name)
         log(f"dataset {name}: reference results for {len(insts)} query instances")
+    if wl.item_datasets:
+        insts = [i for g in wl.gate_instances(0.0).values() for i in g] + wl.instances("test", 0.0)
+        h.ensure_references(insts, "main")
+        log(f"items: reference results for {len(insts)} query instances over {len(wl.item_datasets)} datasets")
     cmd_split(args)
 
 
 def cmd_split(args):
     cfg, engine, wl, h = _ctx(args)
     for s, ts in wl.split.items():
-        print(f"{s:<6}{len(ts):>3} templates: {' '.join(ts)}")
+        print(f"{s:<6}{len(ts):>3} {'items' if wl.item_datasets else 'templates'}: {' '.join(ts)}")
 
 
 def cmd_baseline(args):

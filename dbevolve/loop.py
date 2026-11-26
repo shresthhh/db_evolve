@@ -181,7 +181,7 @@ class Loop:
         lines += ["", "## Plans with operator timings (slowest templates)", ""]
         with self.h.session(best, "main") as s:
             for t, _ in ranked[:4]:
-                inst = next(i for i in train if i.template == t)
+                inst = next(i for i in train if i.item == t)
                 lines += [f"### {inst.id}", "", "```sql", inst.sql, "```", "", "```", explain_analyze(s, inst.sql), "```", ""]
         text = "\n".join(lines)
         (self.run.dir / "profile.md").write_text(text)

@@ -141,7 +141,7 @@ def main(argv=None) -> int:
     if cmd == "bench":
         wanted = set(args)
         # quick check: two bindings per template keeps a full run to a few minutes at large scale factors
-        insts = [i for i in h.instances("train") if (not wanted or i.template in wanted) and i.index < 2]
+        insts = [i for i in h.instances("train") if (not wanted or i.item in wanted or i.template in wanted) and i.index < 2]
         if not insts:
             print(f"no visible templates match {sorted(wanted)}; visible: {wl.split['train']}")
             return 1

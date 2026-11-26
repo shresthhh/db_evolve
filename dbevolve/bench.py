@@ -28,16 +28,23 @@ class Harness:
         return Session(binary, db, self.b["threads"], timeout=self.b["statement_timeout_s"])
 
     def instances(self, split: str, dataset: str = "main", heldout: bool = False) -> list[Instance]:
+        if self.wl.item_datasets:   # scale-factor mode: every instance carries its own dataset
+            return self.wl.instances(split, 0.0, heldout=heldout)
         return self.wl.instances(split, data.scale_factor(self.cfg, dataset), heldout=heldout)
 
     # --- reference results ---------------------------------------------------
     def _ref_path(self, inst: Instance, dataset: str) -> Path:
-        return self.cfg.refs / self.wl.name / data.tag(self.cfg, dataset) / f"{inst.key}.csv"
+        return self.cfg.refs / self.wl.name / data.tag(self.cfg, inst.dataset or dataset) / f"{inst.key}.csv"
 
     def ensure_references(self, instances: list[Instance], dataset: str) -> None:
         missing = [i for i in instances if not self._ref_path(i, dataset).exists()]
-        if not missing:
-            return
+        by_ds: dict[str, list[Instance]] = {}
+        for i in missing:
+            by_ds.setdefault(i.dataset or dataset, []).append(i)
+        for ds, insts in by_ds.items():
+            self._make_references(insts, ds)
+
+    def _make_references(self, missing: list[Instance], dataset: str) -> None:
         with self.session(self.engine.base_sha(), dataset) as s:
             for inst in missing:
                 _, out = s.run(inst.sql)
@@ -51,7 +58,21 @@ class Harness:
     # --- one pass over a set of instances -----------------------------------
     def run_pass(self, target, instances: list[Instance], dataset: str, timed_runs: int,
                  warmup_runs: int) -> tuple[dict, list]:
-        """Returns ({instance_id: [seconds, ...]}, [failure, ...]). Every run's output is verified."""
+        """Returns ({instance_id: [seconds, ...]}, [failure, ...]). Every run's output is verified.
+        Instances that name their own dataset (scale-factor mode) run on it, one session per dataset."""
+        groups: dict[str, list[Instance]] = {}
+        for inst in instances:
+            groups.setdefault(inst.dataset or dataset, []).append(inst)
+        times: dict[str, list[float]] = {}
+        failures: list[dict] = []
+        for ds, insts in groups.items():
+            t, f = self._run_pass_one(target, insts, ds, timed_runs, warmup_runs)
+            times.update(t)
+            failures.extend(f)
+        return times, failures
+
+    def _run_pass_one(self, target, instances: list[Instance], dataset: str, timed_runs: int,
+                      warmup_runs: int) -> tuple[dict, list]:
         self.ensure_references(instances, dataset)
         times: dict[str, list[float]] = {}
         failures: list[dict] = []
@@ -71,7 +92,7 @@ class Harness:
                             runs.append(elapsed)
                     times[inst.id] = runs
                 except EngineError as e:
-                    failures.append({"instance": inst.id, "template": inst.template, "split": inst.split,
+                    failures.append({"instance": inst.id, "template": inst.item, "split": inst.split,
                                      "kind": inst.kind, "dataset": dataset, "reason": str(e)[:1500]})
                     if s.p.poll() is not None:  # crashed or timed out: start a fresh process
                         s.close()
@@ -111,7 +132,7 @@ def template_times(times: dict[str, list[float]], instances: list[Instance]) -> 
     per: dict[str, list[float]] = {}
     for inst in instances:
         if times.get(inst.id):
-            per.setdefault(inst.template, []).append(median(times[inst.id]))
+            per.setdefault(inst.item, []).append(median(times[inst.id]))
     return {t: sum(v) / len(v) for t, v in sorted(per.items())}
 
 
@@ -216,7 +237,9 @@ def borderline(d: dict, bar: dict) -> bool:
 # --- noise calibration ------------------------------------------------------------
 
 def _cal_path(cfg: Config) -> Path:
-    return cfg.work / f"calibration-{data.tag(cfg, 'main')}.json"
+    ds = cfg["workload"].get("datasets")
+    tag = "items-" + "-".join(data.tag(cfg, d) for d in ds) if ds else data.tag(cfg, "main")
+    return cfg.work / f"calibration-{tag}.json"
 
 
 def calibrate(h: Harness, repeats: int = 3) -> dict:
@@ -252,7 +275,7 @@ def calibrate_templates(h: Harness, templates: list[str], repeats: int = 4) -> d
     """A/A noise for extra templates (e.g. ones that were only ever in the test split), merged into
     the existing calibration without changing its split-level numbers."""
     base = h.engine.base_sha()
-    insts = [i for s in ("train", "val", "test") for i in h.instances(s) if i.template in templates]
+    insts = [i for s in ("train", "val", "test") for i in h.instances(s) if i.item in templates]
     cal = calibration(h.cfg) or {}
     per_t = dict(cal.get("template_noise", {}))
     new = {}
