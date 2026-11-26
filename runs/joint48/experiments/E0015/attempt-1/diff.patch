@@ -1,0 +1,16 @@
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index ba431cc..f2820fe 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -329,7 +329,10 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// a DELIM_GET produces the distinct correlated values of the outer query, which is typically a small
++			// subset of the probe-side key domain: treat it as filtering so a bloom filter can be considered. The
++			// runtime checks (probe larger than build, selectivity-based self-disable) still apply
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}

@@ -1,0 +1,15 @@
+{
+  "title": "Huge pages for large join tables v2: HJ pointer table >=8MB + perfect-HJ slot arrays",
+  "hypothesis": "E0038 (THP-backed HJ pointer table for tables >=32MB) just missed acceptance. q09 came in at -7.0% against a noise threshold of 8.6%; implementer runs gave q09 -8.4/-15/-9.3%, q03 -3..-13% and q08 -8%, with nothing slower once free-time DONTNEED+NOHUGEPAGE was added. At 32MB the threshold left the second big random-access join in q09 on 4KB pages. That is the (ps_partkey,ps_suppkey) HJ: build 435K rows, 1M slots = 8MB pointer table, probed 3.27M times, 0.49s of q09's 2.65s CPU. An 8MB table is beyond the 4KB-page L2 TLB reach (~6MB), so every probe costs a TLB miss plus a page walk. The same applies to perfect-HJ slot_to_row/build_bits arrays sized to the key range (perfect_hash_join_executor.cpp:158/162). q13's RIGHT perfect HJ over 1.5M customers uses a 12MB slot_to_row array, and the sparse perfect HJs in q07/q02 behave the same way. Huge pages for every random-access join table of 8MB or more should push q09 well past its noise and add gains on q03/q08/q13.",
+  "plan": "1) Re-apply E0038 in src/execution/join_hashtable.cpp as described in the ledger. Allocate through BufferAllocator with 2MB slack and align `entries` to 2MB. Call madvise(MADV_HUGEPAGE) before InitializePointerTable, only when /sys/kernel/mm/transparent_hugepage/enabled is [madvise] or [always]. PointerTableUsableSize() handles non-power-of-two padded sizes. On free, in the destructor, Reset() and the grow path, call MADV_DONTNEED then MADV_NOHUGEPAGE; this step is mandatory, or q02 gets 5-9% slower. 2) Lower the threshold from 32MB to 8MB (1M slots). 3) Factor the align+madvise+cleanup logic into a small static helper or RAII struct in join_hashtable.cpp, or a new common header. Use it in PerfectHashJoinExecutor (src/execution/operator/join/perfect_hash_join_executor.cpp:158-162, and slot_found_match at 297/418) when an array is >=8MB, in place of make_unsafe_uniq_array. 4) Measure q09, q16, q03 and q02 alone several times each before the full bench. Watch q16 in particular: its table is 8MB with 296K build rows, and it swung -14..+7% at a 4MB threshold. If q16 is slower beyond its noise, gate on build rows >= 400K instead.",
+  "target_files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/include/duckdb/execution/join_hashtable.hpp"
+  ],
+  "expected_gain": "q09 -9..-14%, q03 -5..-10%, q08 -5..-8%, q13/q07 a few %. Geomean -2..-3%.",
+  "generality": "Any hash join whose build exceeds ~250K rows, or any perfect HJ over a key range of 1M or more. That covers FK joins against fact tables and large dimensions. Small joins are untouched. A query with a mid-size build that runs only once may pay THP fault/compaction cost.",
+  "risk": "Medium-low. Memory is tracked by the same allocator. The main hazard is huge-page state leaking into recycled jemalloc memory, which the free-time cleanup handles. q16 is borderline at the 8MB threshold.",
+  "status": "open",
+  "filed": "g3r7"
+}

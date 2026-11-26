@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/operator/join/physical_hash_join.cpp TrySetExactBloomFilter: the only change is a floor of 2^22 on the existing per-key range cap, so any integer equi-join key whose build-side range is under about 4M values gets an exact bitmap. The 2^22 constant is a memory bound (512KB per filter), not something tied to this workload's data. It applies to any small selective dimension build.",
+      "Correctness relies on the exact-bitmap path that already landed: one bit per value in [min, min+range], a single allocation of (range>>LOG_SECTOR_SIZE)+1 words, and the same handling as before for NULL-equal joins, non-equality first conditions and type mismatches. A sparse range is a memory question, not a correctness one, and memory stays bounded at 512KB.",
+      "Memory cost: a filter that would otherwise be tiny can now take up to 512KB. That is small and bounded, and the build is only one fill per filter. It does not shift work outside the measured query time in any meaningful way."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/execution/operator/join/physical_hash_join.cpp TrySetExactBloomFilter: the only change is a floor of 2^22 on the existing per-key range cap, so any integer equi-join key whose build-side range is under about 4M values gets an exact bitmap. The 2^22 constant is a memory bound (512KB per filter), not something tied to this workload's data. It applies to any small selective dimension build.\",\"Correctness relies on the exact-bitmap path that already landed: one bit per value in [min, min+range], a single allocation of (range>>LOG_SECTOR_SIZE)+1 words, and the same handling as before for NULL-equal joins, non-equality first conditions and type mismatches. A sparse range is a memory question, not a correctness one, and memory stays bounded at 512KB.\",\"Memory cost: a filter that would otherwise be tiny can now take up to 512KB. That is small and bounded, and the build is only one fill per filter. It does not shift work outside the measured query time in any meaningful way.\"],\"required_changes\":[]}",
+  "cost_usd": 0.10872399999999999,
+  "seconds": 21.697484254837036,
+  "error": ""
+}

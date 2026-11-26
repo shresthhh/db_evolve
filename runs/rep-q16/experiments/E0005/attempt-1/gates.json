@@ -1,0 +1,21 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/aggregate_hashtable.cpp:757 adds one condition, layout_ptr->AllConstant(). It only narrows when the existing unpartitioned staging path is taken. Rows that skip staging go to partitioned_data, an append path that was already used for every other case, so both outcomes were already-tested code paths. Flush, Repartition, Count and ReinsertTuples handle an empty or unused unpartitioned_data the same way as before. I found no correctness risk from NULLs, spilling or parallel execution.",
+      "The condition depends on the row layout (fixed-width vs. heap-backed). It does not refer to tables, columns, literals or data sizes, so it is a general change. Its effect is limited to aggregates with VARCHAR or nested group keys.",
+      "Nit: the new line is missing a space in `new_entry_count /RadixPartitioning`. This is a formatting issue only."
+    ],
+    "required_changes": []
+  }
+}

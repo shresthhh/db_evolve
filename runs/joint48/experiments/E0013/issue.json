@@ -1,0 +1,17 @@
+{
+  "title": "Large perfect HA v2: large-mode-only code paths, plan-identical guard for other templates",
+  "hypothesis": "q13 is the largest template (646ms, 16.6%). Its inner HASH_GROUP_BY on c_custkey (1.5M dense groups, 15M input rows) takes 2.40s CPU, the largest single operator in the profile. E0009 (perfect HA up to 22 bits, striped parallel combine, parallel source, lazy slot init, DELIM_SCAN guard) gave a consistent q13 -20..-23% over 3 runs. It was retired because the official bench showed q16 +14% and q18 +7.8%. Neither template should be able to reach the large mode: q16 groups by VARCHARs, q18's outer agg groups by VARCHAR c_name, and its IN-subquery agg on l_orderkey needs about 26 bits, which is more than 22. So the regressions were either noise or overhead that E0009 added to code shared by ALL perfect HAs, such as the refactored Combine (CombineRange/TakeAllocator) and the ScanRange source. Keeping the original code path for every non-large perfect HA, and confirming that the q16/q18 plans are unchanged, removes the second possibility.",
+  "plan": "Re-implement E0009 (see the ledger entry for the details: the plan_aggregate.cpp CanUsePerfectHashAggregate large mode up to 22 bits, with the density guard est_input >= slots/2, the memory guard slots*(state+1)*(threads+1) <= max_memory/8, the DELIM_SCAN subtree guard, and the threshold >= 12 guard; lazy per-slot InitializeStates; striped-lock parallel CombineRange; block-parallel ScanRange source). New requirements: (1) add an `is_large` flag on PhysicalPerfectHashAggregate, set only when total bits > perfect_ht_threshold. When the flag is false, Sink/Combine/Finalize/GetData must run the EXACT original code with no extra branches in hot loops, so dispatch once per operator rather than per row. Lazy init is used only in large mode. (2) Before benchmarking, compare EXPLAIN of every visible template against the current best. Only q13 (and possibly q02) may change operator type; q16/q18 must be byte-identical. Report this. (3) Run the bench for q13, q16, q18 and q17 at least twice each.",
+  "target_files": [
+    "src/execution/physical_plan/plan_aggregate.cpp",
+    "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp",
+    "src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
+  ],
+  "expected_gain": "q13 -20% (about -1.6% geomean); q02 small gain; all other templates unchanged by construction",
+  "generality": "Any GROUP BY on one or a few dense integer keys with 4K..4M groups, which is typical of FK-key aggregation such as per-customer and per-part counts. Queries with badly overestimated agg inputs could regress through memory and page faults; this is mitigated by lazy init, the density/memory guards and the DELIM guard.",
+  "risk": "Medium. The code is known to work from E0009. The main risk is that the official bench again flags q16/q18 noise; the plan-identity check gives the evidence to argue it is noise.",
+  "status": "open",
+  "filed": "g1r13"
+}

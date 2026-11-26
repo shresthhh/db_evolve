@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp FinalizeFilters: the new branch only applies when there is a structural condition: the probe key is an `__internal_compress_integral_*(x, off)` projection recorded by E0006, it is join key 0, CanUseBloomFilter holds, and the exact bitmap gate succeeds. Nothing in it refers to particular queries, tables or constants. It covers any equality join on integer keys where compressed materialization sits between the scan and the join.",
+      "Offset math is correct. Compression only fires when stats bound x to [off, off+range]. Sign- or zero-extending x and off to 64 bits and subtracting with wrapping gives exactly x-off. That equals the zero-extended compressed (unsigned) build key stored in the bitmap. This holds for negative BIGINT keys and for UBIGINT keys. Integral casts on either side of the compress, which the optimizer allows through, keep values, so the widening still matches. The filter's key_type is set to the storage type, so the existing type check in Filter() compares against the scanned vector.",
+      "Hashed filters never go through an offset. PushBloomFilter returns without pushing unless the filter is exact and has no overflow. Filter/FilterValue/CheckStatistics also fall back to pass-through or NO_PRUNING when has_key_offset && !IsExact(). The exact gate runs on the compressed-key min/max before the bitmap is filled, and if it fails the BF is never enabled, so no extra build work.",
+      "TemplatedCheckStatisticsExactOffset treats [min,max] as a possibly wrapping arc of bitmap positions. It prunes only when the arc lies entirely past the bitmap and doesn't wrap; values below the bitmap wrap to large positions, which this check covers. Otherwise it probes each value when the width is at most 2048. NULL handling (can_prune_all, ALWAYS_TRUE as a pre-filter only) matches the existing exact version. I found no over-pruning case.",
+      "Copy() keeps the offset. The change is small and focused, with no measurement, settings or test changes and no shift of cost elsewhere. The SelectivityOptionalFilter wrapper still applies."
+    ],
+    "required_changes": []
+  }
+}

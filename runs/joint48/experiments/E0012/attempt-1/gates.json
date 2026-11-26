@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/storage/table/column_segment.cpp: the new fast path is a general evaluator for AND/OR trees of BETWEEN and comparisons (=, !=, <, <=, >, >=) of the filtered column (BOUND_REF 0, exact type) against non-NULL constants of the same type. Nothing in it is tied to particular tables, columns, literals or data, so it applies to any range or bucket filter on an integer-ordered column.",
+      "NULL semantics are correct. With no NOT and no NULL constants, a NULL input makes every leaf NULL, so the whole AND/OR tree is NULL or FALSE and the row is rejected. ANDing the mask with validity gives exactly that result.",
+      "Type coverage is safe. Floats are excluded, so NaN ordering is not an issue. HUGEINT and DECIMAL(38) are excluded. Each LogicalType maps directly to its physical type, so GetValueUnsafe<T> reads the right union member. The exact type-equality check means no implicit casts are skipped. Constant-on-left comparisons are flipped correctly.",
+      "The scan_count > STANDARD_VECTOR_SIZE case is handled. The fast path only requires approved_tuple_count <= STANDARD_VECTOR_SIZE, it indexes vdata through sel (which spans the full scan_count), and the local buffers are sized to approved_tuple_count. The output follows the same contract as the existing path: a fresh result_sel, then sel.Initialize. Anything unsupported falls through to the unchanged executor path.",
+      "Minor: CanEvaluateDenseMask walks the expression tree again on every vector instead of caching the result in the filter state. This costs little and does not block approval."
+    ],
+    "required_changes": []
+  }
+}

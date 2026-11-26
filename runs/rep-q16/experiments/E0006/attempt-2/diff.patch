@@ -1,0 +1,407 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..1e188c7 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -717,7 +717,7 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataChunkState &chunk_state,
+                                  InsertState &insert_state, bool parallel) {
+ 	// Insert Hashes into the BF
+-	if (bloom_filter.IsInitialized()) {
++	if (bloom_filter.IsInitialized() && !bloom_filter.IsExact()) {
+ 		bloom_filter.InsertHashes(hashes_v, count);
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+@@ -784,11 +784,17 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 	const auto row_locations = iterator.GetRowLocations();
+ 
+ 	InsertState insert_state(*this);
++	const bool exact_bloom_filter = bloom_filter.IsInitialized() && bloom_filter.IsExact();
+ 	do {
+ 		const auto count = iterator.GetCurrentChunkCount();
+ 		for (idx_t i = 0; i < count; i++) {
+ 			hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+ 		}
++		if (exact_bloom_filter) {
++			// the exact filter is keyed on the first key column
++			bloom_filter.InsertKeysFromRows(layout_ptr->GetTypes()[0].InternalType(), row_locations, count,
++			                                layout_ptr->GetOffsets()[0], 0, layout_ptr->ColumnCount());
++		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+ 
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index aed2de0..4daa3d6 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -811,6 +811,53 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeMinMax(JoinFilterGlobalSta
+ 	return final_min_max;
+ }
+ 
++//! Maximum number of bits per build-side row for an exact (one bit per key) bloom filter
++static constexpr idx_t EXACT_BF_MAX_BITS_PER_ROW = 128;
++//! Maximum size of an exact bloom filter (512 MiB, same as the maximum size of the hashed bloom filter)
++static constexpr idx_t EXACT_BF_MAX_BITS = idx_t(1) << 32;
++
++//! If the (single) join key is an integer whose build-side [min, max] range is dense enough, the bloom filter
++//! becomes an exact bitmap over that range: probing is a bit test instead of hashing, without false positives
++static void TrySetExactBloomFilter(JoinHashTable &ht, const Value &min_val, const Value &max_val) {
++	auto &bf = ht.GetBloomFilter();
++	if (bf.IsExact() || bf.IsInitialized() || ht.conditions.size() != 1 || ht.NullValuesAreEqual(0)) {
++		return;
++	}
++	const auto &key_type = ht.conditions[0].right->return_type;
++	if (key_type != ht.conditions[0].left->return_type || min_val.IsNull() || max_val.IsNull() ||
++	    min_val.type() != key_type || max_val.type() != key_type) {
++		return;
++	}
++	uint64_t min_key;
++	uint64_t max_key;
++	// only plain integer logical types: for these the logical value equals the stored physical value
++	// (DECIMAL, DATE, TIMESTAMP, ENUM, ... share the physical storage but their Value accessors cast logically)
++	switch (key_type.id()) {
++	case LogicalTypeId::TINYINT:
++	case LogicalTypeId::SMALLINT:
++	case LogicalTypeId::INTEGER:
++	case LogicalTypeId::BIGINT:
++		min_key = static_cast<uint64_t>(min_val.GetValue<int64_t>());
++		max_key = static_cast<uint64_t>(max_val.GetValue<int64_t>());
++		break;
++	case LogicalTypeId::UTINYINT:
++	case LogicalTypeId::USMALLINT:
++	case LogicalTypeId::UINTEGER:
++	case LogicalTypeId::UBIGINT:
++		min_key = min_val.GetValue<uint64_t>();
++		max_key = max_val.GetValue<uint64_t>();
++		break;
++	default:
++		return;
++	}
++	const uint64_t range = max_key - min_key; // max >= min, so this is the exact (non-negative) difference
++	const auto max_bits = MinValue<idx_t>(EXACT_BF_MAX_BITS, ht.Count() * EXACT_BF_MAX_BITS_PER_ROW);
++	if (range >= max_bits) {
++		return;
++	}
++	bf.SetExactRange(min_key, range + 1);
++}
++
+ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+     ClientContext &context, optional_ptr<JoinHashTable> ht, const PhysicalComparisonJoin &op,
+     unique_ptr<DataChunk> final_min_max, const bool is_perfect_hashtable,
+@@ -901,6 +948,8 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+ 						ht->SetBuildBloomFilter(true);
++						TrySetExactBloomFilter(*ht, final_min_max->data[min_idx].GetValue(0),
++						                       final_min_max->data[max_idx].GetValue(0));
+ 						deferred_bloom_filters->emplace_back(info, filter_col_idx);
+ 					}
+ 				}
+diff --git a/src/include/duckdb/planner/filter/bloom_filter.hpp b/src/include/duckdb/planner/filter/bloom_filter.hpp
+index bff73c0..fc28be8 100644
+--- a/src/include/duckdb/planner/filter/bloom_filter.hpp
++++ b/src/include/duckdb/planner/filter/bloom_filter.hpp
+@@ -32,10 +32,32 @@ public:
+ 		return initialized;
+ 	}
+ 
++	//! Switch to exact mode: one bit per integer key in [min_key, min_key + num_bits). Keys are mapped to uint64
++	//! (signed types sign-extended) so that (key - min_key) with wrap-around gives the bit offset.
++	//! Must be called before Initialize
++	void SetExactRange(uint64_t min_key, idx_t num_bits);
++	bool IsExact() const {
++		return exact;
++	}
++	//! Insert the (non-NULL) integer keys stored at "key_offset" (column "col_idx") in the given rows
++	void InsertKeysFromRows(PhysicalType type, const data_ptr_t row_locations[], idx_t count, idx_t key_offset,
++	                        idx_t col_idx, idx_t column_count) const;
++	inline bool LookupKey(uint64_t key) const {
++		const uint64_t offset = key - exact_min;
++		if (offset >= exact_bits) {
++			return false;
++		}
++		return (bf[offset >> 6] >> (offset & 63)) & 1;
++	}
++
+ private:
+ 	idx_t num_sectors;
+ 	uint64_t bitmask; // num_sectors - 1 -> used to get the sector offset
+ 
++	bool exact = false;
++	uint64_t exact_min = 0;
++	idx_t exact_bits = 0;
++
+ 	bool initialized = false;
+ 	AllocatedData buf_;
+ 	uint64_t *bf;
+@@ -79,6 +101,8 @@ public:
+ 	FilterPropagateResult CheckStatistics(BaseStatistics &stats) const override;
+ 
+ private:
++	idx_t ExactLookup(Vector &keys_v, const SelectionVector &sel, idx_t approved_count,
++	                  BFTableFilterState &state) const;
+ 	static void HashInternal(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
+ 	                         BFTableFilterState &state);
+ 
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 1acaa53..0b72860 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -11,9 +11,91 @@ static constexpr idx_t LOG_SECTOR_SIZE = 6;             // a sector is 64 bits,
+ static constexpr idx_t SHIFT_MASK = 0x3F3F3F3F3F3F3F3F; // 6 bits for 64 positions
+ static constexpr idx_t N_BITS = 4;                      // the number of bits to set per hash
+ 
++void BloomFilter::SetExactRange(uint64_t min_key, idx_t num_bits) {
++	D_ASSERT(!initialized && num_bits > 0);
++	exact = true;
++	exact_min = min_key;
++	exact_bits = num_bits;
++}
++
++template <class T>
++static inline typename std::enable_if<std::is_integral<T>::value, uint64_t>::type ExactKey(T value) {
++	// sign-extend signed types, so that the wrap-around difference to the minimum is the exact offset
++	return std::is_signed<T>::value ? static_cast<uint64_t>(static_cast<int64_t>(value))
++	                                : static_cast<uint64_t>(value);
++}
++
++template <class T>
++static inline typename std::enable_if<!std::is_integral<T>::value, uint64_t>::type ExactKey(T) {
++	throw InternalException("Unsupported type for exact bloom filter");
++}
++
++template <class T>
++static void TemplatedInsertKeysFromRows(uint64_t *bf, uint64_t exact_min, idx_t exact_bits,
++                                        const data_ptr_t row_locations[],
++                                        idx_t count, idx_t key_offset, idx_t col_idx, idx_t column_count) {
++	idx_t entry_idx;
++	idx_t idx_in_entry;
++	TemplatedValidityMask<uint8_t>::GetEntryIndex(col_idx, entry_idx, idx_in_entry);
++	for (idx_t i = 0; i < count; i++) {
++		const auto row = row_locations[i];
++		TemplatedValidityMask<uint8_t> row_mask(row, column_count);
++		if (!TemplatedValidityMask<uint8_t>::RowIsValid(row_mask.GetValidityEntryUnsafe(entry_idx), idx_in_entry)) {
++			continue; // NULL keys never match: exact mode is only used when the filter rejects NULLs
++		}
++		const uint64_t offset = ExactKey(Load<T>(row + key_offset)) - exact_min;
++		if (offset >= exact_bits) {
++			throw InternalException("Exact bloom filter key outside of the build-side min/max range");
++		}
++		std::atomic<uint64_t> &slot = *reinterpret_cast<std::atomic<uint64_t> *>(&bf[offset >> 6]);
++		const uint64_t mask = 1ULL << (offset & 63);
++		if (!(slot.load(std::memory_order_relaxed) & mask)) {
++			slot.fetch_or(mask, std::memory_order_relaxed);
++		}
++	}
++}
++
++void BloomFilter::InsertKeysFromRows(PhysicalType type, const data_ptr_t row_locations[], idx_t count,
++                                     idx_t key_offset, idx_t col_idx, idx_t column_count) const {
++	D_ASSERT(initialized && exact);
++#define EXACT_INSERT(T)                                                                                                \
++	return TemplatedInsertKeysFromRows<T>(bf, exact_min, exact_bits, row_locations, count, key_offset, col_idx,        \
++	                                      column_count)
++	switch (type) {
++	case PhysicalType::INT8:
++		EXACT_INSERT(int8_t);
++	case PhysicalType::INT16:
++		EXACT_INSERT(int16_t);
++	case PhysicalType::INT32:
++		EXACT_INSERT(int32_t);
++	case PhysicalType::INT64:
++		EXACT_INSERT(int64_t);
++	case PhysicalType::UINT8:
++		EXACT_INSERT(uint8_t);
++	case PhysicalType::UINT16:
++		EXACT_INSERT(uint16_t);
++	case PhysicalType::UINT32:
++		EXACT_INSERT(uint32_t);
++	case PhysicalType::UINT64:
++		EXACT_INSERT(uint64_t);
++#undef EXACT_INSERT
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
+ void BloomFilter::Initialize(ClientContext &context_p, idx_t number_of_rows) {
+ 	BufferManager &buffer_manager = BufferManager::GetBufferManager(context_p);
+ 
++	if (exact) {
++		const idx_t num_words = (exact_bits + 63) / 64;
++		buf_ = buffer_manager.GetBufferAllocator().Allocate(64 + num_words * sizeof(uint64_t));
++		bf = reinterpret_cast<uint64_t *>((64ULL + reinterpret_cast<uint64_t>(buf_.get())) & ~63ULL);
++		std::fill_n(bf, num_words, 0);
++		initialized = true;
++		return;
++	}
++
+ 	const idx_t min_bits = std::max<idx_t>(MIN_NUM_BITS, number_of_rows * MIN_NUM_BITS_PER_KEY);
+ 	num_sectors = std::min(NextPowerOfTwo(min_bits) >> LOG_SECTOR_SIZE, MAX_NUM_SECTORS);
+ 	bitmask = num_sectors - 1;
+@@ -93,6 +175,58 @@ void BFTableFilter::HashInternal(Vector &keys_v, const SelectionVector &sel, con
+ 	}
+ }
+ 
++template <class T>
++static idx_t TemplatedExactLookup(const BloomFilter &bf, const UnifiedVectorFormat &format, idx_t count,
++                                  SelectionVector &result_sel) {
++	const auto data = UnifiedVectorFormat::GetData<T>(format);
++	idx_t found_count = 0;
++	if (format.validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			result_sel.set_index(found_count, i);
++			found_count += bf.LookupKey(ExactKey(data[format.sel->get_index(i)]));
++		}
++	} else {
++		for (idx_t i = 0; i < count; i++) {
++			const auto idx = format.sel->get_index(i);
++			result_sel.set_index(found_count, i);
++			// NULLs never pass: exact mode is only used for filters that reject NULLs
++			found_count += format.validity.RowIsValid(idx) && bf.LookupKey(ExactKey(data[idx]));
++		}
++	}
++	return found_count;
++}
++
++idx_t BFTableFilter::ExactLookup(Vector &keys_v, const SelectionVector &sel, const idx_t approved_count,
++                                 BFTableFilterState &state) const {
++	UnifiedVectorFormat format;
++	if (sel.IsSet()) {
++		state.keys_sliced_v.Slice(keys_v, sel, approved_count);
++		state.keys_sliced_v.ToUnifiedFormat(approved_count, format);
++	} else {
++		keys_v.ToUnifiedFormat(approved_count, format);
++	}
++	switch (keys_v.GetType().InternalType()) {
++	case PhysicalType::INT8:
++		return TemplatedExactLookup<int8_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::INT16:
++		return TemplatedExactLookup<int16_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::INT32:
++		return TemplatedExactLookup<int32_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::INT64:
++		return TemplatedExactLookup<int64_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::UINT8:
++		return TemplatedExactLookup<uint8_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::UINT16:
++		return TemplatedExactLookup<uint16_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::UINT32:
++		return TemplatedExactLookup<uint32_t>(filter, format, approved_count, state.bf_sel);
++	case PhysicalType::UINT64:
++		return TemplatedExactLookup<uint64_t>(filter, format, approved_count, state.bf_sel);
++	default:
++		throw InternalException("Unsupported type for exact bloom filter");
++	}
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+@@ -101,16 +235,19 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		state.current_capacity = approved_tuple_count;
+ 	}
+ 
+-	HashInternal(keys_v, sel, approved_tuple_count, state);
+-
+ 	idx_t found_count;
+-	if (state.hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+-		const auto constant_hash = *ConstantVector::GetData<hash_t>(state.hashes_v);
+-		const bool found = this->filter.LookupOne(constant_hash);
+-		found_count = found ? approved_tuple_count : 0;
++	if (filter.IsExact()) {
++		found_count = ExactLookup(keys_v, sel, approved_tuple_count, state);
+ 	} else {
+-		state.hashes_v.Flatten(approved_tuple_count);
+-		found_count = this->filter.LookupHashes(state.hashes_v, state.bf_sel, approved_tuple_count);
++		HashInternal(keys_v, sel, approved_tuple_count, state);
++		if (state.hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
++			const auto constant_hash = *ConstantVector::GetData<hash_t>(state.hashes_v);
++			const bool found = this->filter.LookupOne(constant_hash);
++			found_count = found ? approved_tuple_count : 0;
++		} else {
++			state.hashes_v.Flatten(approved_tuple_count);
++			found_count = this->filter.LookupHashes(state.hashes_v, state.bf_sel, approved_tuple_count);
++		}
+ 	}
+ 
+ 	// all the elements have been found, we don't need to translate anything
+@@ -132,12 +269,47 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 	return approved_tuple_count;
+ }
+ 
++template <class T>
++static inline bool LookupValue(const BloomFilter &bf, const T &value) {
++	return bf.LookupOne(Hash(value));
++}
++
++template <class T>
++static inline bool ExactLookupValue(const BloomFilter &bf, const T &value) {
++	return bf.LookupKey(ExactKey(value));
++}
++
+ bool BFTableFilter::FilterValue(const Value &value) const {
++	if (filter.IsExact()) {
++		if (value.IsNull()) {
++			return false;
++		}
++		switch (value.type().InternalType()) {
++		case PhysicalType::INT8:
++			return ExactLookupValue(filter, value.GetValueUnsafe<int8_t>());
++		case PhysicalType::INT16:
++			return ExactLookupValue(filter, value.GetValueUnsafe<int16_t>());
++		case PhysicalType::INT32:
++			return ExactLookupValue(filter, value.GetValueUnsafe<int32_t>());
++		case PhysicalType::INT64:
++			return ExactLookupValue(filter, value.GetValueUnsafe<int64_t>());
++		case PhysicalType::UINT8:
++			return ExactLookupValue(filter, value.GetValueUnsafe<uint8_t>());
++		case PhysicalType::UINT16:
++			return ExactLookupValue(filter, value.GetValueUnsafe<uint16_t>());
++		case PhysicalType::UINT32:
++			return ExactLookupValue(filter, value.GetValueUnsafe<uint32_t>());
++		case PhysicalType::UINT64:
++			return ExactLookupValue(filter, value.GetValueUnsafe<uint64_t>());
++		default:
++			return true; // cannot decide, let it pass
++		}
++	}
+ 	const auto hash = value.Hash();
+ 	return filter.LookupOne(hash);
+ }
+ 
+-template <class T>
++template <class T, bool EXACT>
+ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, const BaseStatistics &stats) {
+ 	if (!NumericStats::HasMinMax(stats)) {
+ 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+@@ -157,7 +329,7 @@ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, con
+ 	T val = min;
+ 	idx_t hits = 0;
+ 	for (idx_t i = 0; i <= range; i++) {
+-		hits += bf.LookupOne(Hash(val));
++		hits += EXACT ? ExactLookupValue(bf, val) : LookupValue(bf, val);
+ 		val += i < range; // Avoids potential signed integer overflow on the last iteration
+ 	}
+ 
+@@ -170,8 +342,20 @@ static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, con
+ 	return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+ }
+ 
++template <class T>
++static FilterPropagateResult TemplatedCheckStatistics(const BloomFilter &bf, const BaseStatistics &stats) {
++	if (bf.IsExact()) {
++		return TemplatedCheckStatistics<T, true>(bf, stats);
++	}
++	return TemplatedCheckStatistics<T, false>(bf, stats);
++}
++
+ FilterPropagateResult BFTableFilter::CheckStatistics(BaseStatistics &stats) const {
+-	switch (stats.GetType().InternalType()) {
++	const auto stats_type = stats.GetType().InternalType();
++	if (filter.IsExact() && (stats_type == PhysicalType::UINT128 || stats_type == PhysicalType::INT128)) {
++		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
++	}
++	switch (stats_type) {
+ 	case PhysicalType::UINT8:
+ 		return TemplatedCheckStatistics<uint8_t>(filter, stats);
+ 	case PhysicalType::UINT16:

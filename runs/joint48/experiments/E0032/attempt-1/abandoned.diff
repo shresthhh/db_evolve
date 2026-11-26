@@ -1,0 +1,284 @@
+diff --git a/src/storage/table/column_segment.cpp b/src/storage/table/column_segment.cpp
+index 99e2afa..97bb2a0 100644
+--- a/src/storage/table/column_segment.cpp
++++ b/src/storage/table/column_segment.cpp
+@@ -661,58 +661,134 @@ static bool TryDenseMaskFilterSelection(const Expression &expr, const LogicalTyp
+ //===--------------------------------------------------------------------===//
+ // Substring prefilter
+ //===--------------------------------------------------------------------===//
+-//! Returns the first occurrence of needle (needle_len >= 2) in [hay, hay + hay_len), or nullptr
+-static const char *FindSubstring(const char *hay, idx_t hay_len, const char *needle, idx_t needle_len) {
+-	if (hay_len < needle_len) {
+-		return nullptr;
++//! Heuristic rarity of a byte in typical text (higher is rarer), used to pick the candidate bytes of a needle
++static uint8_t ByteRarity(uint8_t c) {
++	static constexpr const char *LOWER_BY_FREQUENCY = "etaoinsrhldcumfpgwybvkxjqz";
++	if (c == ' ') {
++		return 0;
+ 	}
+-	// candidate start positions are [hay, end)
+-	const char *end = hay + (hay_len - needle_len + 1);
+-	const char *pos = hay;
+-	const char first = needle[0];
+-	const char last = needle[needle_len - 1];
+-#ifdef DUCKDB_SUBSTRING_PREFILTER_SSE2
+-	if (end - hay >= 16) {
+-		const __m128i first_v = _mm_set1_epi8(first);
+-		const __m128i last_v = _mm_set1_epi8(last);
+-		while (true) {
+-			bool final_block = false;
+-			if (pos + 16 > end) {
+-				// overlap the final block with positions that were already checked
+-				pos = end - 16;
+-				final_block = true;
++	if (c >= 'a' && c <= 'z') {
++		return uint8_t(1 + (strchr(LOWER_BY_FREQUENCY, c) - LOWER_BY_FREQUENCY));
++	}
++	if (c >= 'A' && c <= 'Z') {
++		return 30;
++	}
++	if (c >= '0' && c <= '9') {
++		return 25;
++	}
++	if (c >= 0x80) {
++		return 20;
++	}
++	return 40;
++}
++
++//! Searches a fixed needle (length >= 1) in byte ranges
++struct SubstringSearcher {
++	explicit SubstringSearcher(const string &needle_p) : needle(needle_p.c_str()), needle_len(needle_p.size()) {
++		D_ASSERT(needle_len >= 1);
++		// candidate test: the two rarest needle positions (the same position for one-byte needles)
++		idx_t best = 0;
++		for (idx_t i = 1; i < needle_len; i++) {
++			if (ByteRarity(uint8_t(needle[i])) > ByteRarity(uint8_t(needle[best]))) {
++				best = i;
+ 			}
+-			auto block_first = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos));
+-			auto block_last = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos + needle_len - 1));
+-			auto mask = static_cast<uint32_t>(_mm_movemask_epi8(
+-			    _mm_and_si128(_mm_cmpeq_epi8(block_first, first_v), _mm_cmpeq_epi8(block_last, last_v))));
+-			while (mask) {
+-				auto offset = __builtin_ctz(mask);
+-				if (memcmp(pos + offset + 1, needle + 1, needle_len - 2) == 0) {
+-					return pos + offset;
+-				}
+-				mask &= mask - 1;
++		}
++		idx_t second = best;
++		for (idx_t i = 0; i < needle_len; i++) {
++			if (i != best && (second == best || ByteRarity(uint8_t(needle[i])) > ByteRarity(uint8_t(needle[second])))) {
++				second = i;
+ 			}
+-			pos += 16;
+-			if (final_block || pos == end) {
+-				return nullptr;
++		}
++		off_a = MinValue(best, second);
++		off_b = MaxValue(best, second);
++		// verification: the first (up to) 8 needle bytes as a masked word
++		uint8_t needle_bytes[8] = {0};
++		uint8_t mask_bytes[8] = {0};
++		auto prefix_len = MinValue<idx_t>(needle_len, 8);
++		for (idx_t i = 0; i < prefix_len; i++) {
++			needle_bytes[i] = uint8_t(needle[i]);
++			mask_bytes[i] = 0xFF;
++		}
++		memcpy(&needle_word, needle_bytes, 8);
++		memcpy(&mask_word, mask_bytes, 8);
++	}
++
++	//! Whether the needle occurs at pos; [pos, pos + needle_len) must lie within [.., hay_end)
++	inline bool MatchesAt(const char *pos, const char *hay_end) const {
++		if (pos + 8 <= hay_end) {
++			uint64_t word;
++			memcpy(&word, pos, 8);
++			if (((word ^ needle_word) & mask_word) != 0) {
++				return false;
+ 			}
++			return needle_len <= 8 || memcmp(pos + 8, needle + 8, needle_len - 8) == 0;
+ 		}
++		return memcmp(pos, needle, needle_len) == 0;
+ 	}
++
++	//! Returns the first occurrence of the needle in [hay, hay + hay_len), or nullptr
++	const char *Find(const char *hay, idx_t hay_len) const {
++		if (hay_len < needle_len) {
++			return nullptr;
++		}
++		const char *hay_end = hay + hay_len;
++		// candidate start positions are [hay, end)
++		const char *end = hay + (hay_len - needle_len + 1);
++		const char *pos = hay;
++		const char char_a = needle[off_a];
++		const char char_b = needle[off_b];
++#ifdef DUCKDB_SUBSTRING_PREFILTER_SSE2
++		if (end - hay >= 16) {
++			const __m128i a_v = _mm_set1_epi8(char_a);
++			const __m128i b_v = _mm_set1_epi8(char_b);
++			while (true) {
++				bool final_block = false;
++				if (pos + 16 > end) {
++					// overlap the final block with positions that were already checked
++					pos = end - 16;
++					final_block = true;
++				}
++				auto block_a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos + off_a));
++				auto block_b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos + off_b));
++				auto mask = static_cast<uint32_t>(
++				    _mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(block_a, a_v), _mm_cmpeq_epi8(block_b, b_v))));
++				while (mask) {
++					auto offset = __builtin_ctz(mask);
++					if (MatchesAt(pos + offset, hay_end)) {
++						return pos + offset;
++					}
++					mask &= mask - 1;
++				}
++				pos += 16;
++				if (final_block || pos == end) {
++					return nullptr;
++				}
++			}
++		}
+ #endif
+-	for (; pos < end; pos++) {
+-		if (pos[0] == first && pos[needle_len - 1] == last && memcmp(pos + 1, needle + 1, needle_len - 2) == 0) {
+-			return pos;
++		for (; pos < end; pos++) {
++			if (pos[off_a] == char_a && pos[off_b] == char_b && MatchesAt(pos, hay_end)) {
++				return pos;
++			}
+ 		}
++		return nullptr;
+ 	}
+-	return nullptr;
+-}
++
++	const char *needle;
++	idx_t needle_len;
++	idx_t off_a;
++	idx_t off_b;
++	uint64_t needle_word;
++	uint64_t mask_word;
++};
+ 
+ //! Checks whether the filter is a substring predicate (LIKE / NOT LIKE / contains, optionally negated) on the column
+ //! with a constant pattern. If so, "needle" is a literal that every string satisfying the inner predicate contains,
+ //! and "negate" is set if the filter passes for (non-NULL) strings that do not satisfy the inner predicate.
+-static bool GetSubstringPrefilter(const Expression &expr, string &needle, bool &negate) {
++//! If "literals" is non-empty, the inner predicate holds exactly when the literals occur in order without overlap.
++static bool GetSubstringPrefilter(const Expression &expr, string &needle, bool &negate, vector<string> &literals) {
+ 	negate = false;
++	literals.clear();
+ 	reference<const Expression> current(expr);
+ 	if (current.get().GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+ 		auto &op = current.get().Cast<BoundOperatorExpression>();
+@@ -740,21 +816,33 @@ static bool GetSubstringPrefilter(const Expression &expr, string &needle, bool &
+ 	auto &name = func.function.name;
+ 	if (name == "contains") {
+ 		needle = pattern;
++		literals.push_back(pattern);
+ 	} else if (name == "~~" || name == "!~~") {
+ 		// these have no escape character: use the longest literal between wildcards
+ 		if (name == "!~~") {
+ 			negate = !negate;
+ 		}
+ 		needle.clear();
++		bool has_underscore = false;
+ 		idx_t start = 0;
+ 		for (idx_t i = 0; i <= pattern.size(); i++) {
+ 			if (i == pattern.size() || pattern[i] == '%' || pattern[i] == '_') {
++				if (i < pattern.size() && pattern[i] == '_') {
++					has_underscore = true;
++				}
+ 				if (i - start > needle.size()) {
+ 					needle = pattern.substr(start, i - start);
+ 				}
++				if (i > start) {
++					literals.push_back(pattern.substr(start, i - start));
++				}
+ 				start = i + 1;
+ 			}
+ 		}
++		// patterns of the form '%lit1%lit2%...%' match exactly when the literals occur in order
++		if (has_underscore || pattern.size() < 2 || pattern.front() != '%' || pattern.back() != '%') {
++			literals.clear();
++		}
+ 	} else {
+ 		return false;
+ 	}
+@@ -772,11 +860,12 @@ static bool TrySubstringPrefilter(const Expression &expr, Vector &vector, Unifie
+ 	}
+ 	string needle;
+ 	bool negate;
+-	if (!GetSubstringPrefilter(expr, needle, negate)) {
++	duckdb::vector<string> literals;
++	if (!GetSubstringPrefilter(expr, needle, negate, literals)) {
+ 		return false;
+ 	}
+-	const auto needle_ptr = needle.c_str();
+ 	const auto needle_len = needle.size();
++	const SubstringSearcher searcher(needle);
+ 	auto data = UnifiedVectorFormat::GetData<string_t>(vdata);
+ 	auto &validity = vdata.validity;
+ 
+@@ -794,7 +883,7 @@ static bool TrySubstringPrefilter(const Expression &expr, Vector &vector, Unifie
+ 		}
+ 		auto &str = data[row];
+ 		if (str.IsInlined()) {
+-			row_state[i++] = FindSubstring(str.GetData(), str.GetSize(), needle_ptr, needle_len) ? ROW_HIT : ROW_MISS;
++			row_state[i++] = searcher.Find(str.GetData(), str.GetSize()) ? ROW_HIT : ROW_MISS;
+ 			continue;
+ 		}
+ 		// extend the run of non-inlined strings that directly follow each other in memory
+@@ -819,7 +908,7 @@ static bool TrySubstringPrefilter(const Expression &expr, Vector &vector, Unifie
+ 		const char *row_end = run_begin + data[vdata.sel->get_index(sel.get_index(k))].GetSize();
+ 		const char *pos = run_begin;
+ 		while (pos < run_end) {
+-			auto found = FindSubstring(pos, idx_t(run_end - pos), needle_ptr, needle_len);
++			auto found = searcher.Find(pos, idx_t(run_end - pos));
+ 			if (!found) {
+ 				break;
+ 			}
+@@ -848,7 +937,38 @@ static bool TrySubstringPrefilter(const Expression &expr, Vector &vector, Unifie
+ 	}
+ 	SelectionVector result_sel(approved_tuple_count);
+ 	idx_t match_count = 0;
+-	if (hit_count > 0) {
++	// the exact paths below compute the filter result (the inner predicate, inverted if negated) for the hits
++	if (hit_count > 0 && literals.size() == 1) {
++		// the hit test is exact: the only literal occurs within the row
++		D_ASSERT(literals[0] == needle);
++		if (!negate) {
++			result_sel.Initialize(hit_sel);
++			match_count = hit_count;
++		}
++	} else if (hit_count > 0 && !literals.empty()) {
++		// the hit test is a necessary condition: match all literals in order
++		duckdb::vector<unique_ptr<SubstringSearcher>> searchers;
++		for (auto &literal : literals) {
++			searchers.push_back(make_uniq<SubstringSearcher>(literal));
++		}
++		for (idx_t j = 0; j < hit_count; j++) {
++			auto idx = hit_sel.get_index(j);
++			auto &str = data[vdata.sel->get_index(idx)];
++			const char *pos = str.GetData();
++			const char *str_end = pos + str.GetSize();
++			bool matched = true;
++			for (auto &literal_searcher : searchers) {
++				auto found = literal_searcher->Find(pos, idx_t(str_end - pos));
++				if (!found) {
++					matched = false;
++					break;
++				}
++				pos = found + literal_searcher->needle_len;
++			}
++			result_sel.set_index(match_count, idx);
++			match_count += matched != negate;
++		}
++	} else if (hit_count > 0) {
+ 		DataChunk chunk;
+ 		chunk.data.emplace_back(vector);
+ 		chunk.SetCardinality(scan_count);

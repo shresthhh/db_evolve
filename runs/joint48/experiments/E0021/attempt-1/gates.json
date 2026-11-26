@@ -1,0 +1,25 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/planner/filter/bloom_filter.cpp: the exact-bitmap probe uses (stored - key_offset) mod 2^64. This matches JoinFilterValueToStorage (stored = key + storage_offset). A key in the build side always maps back to its exact bit, so the filter cannot drop a matching row. Wrap-around can only cause false positives, and the join's own key comparison removes those. HUGEINT storage falls to the default branches (no filtering, FilterValue returns true), so it stays safe.",
+      "TemplatedCheckStatisticsExact: the shifted key range [ExactMin+offset, +range] is checked to round-trip through T and to satisfy key_min <= key_max. Otherwise it returns NO_PRUNING_POSSIBLE. Zone-map pruning is therefore correct when the shifted range wraps or does not fit in T.",
+      "physical_hash_join.cpp FinalizeFilters/PushBloomFilter: the offset path only applies to cond 0 with integral types. TrySetExactBloomFilter gets the raw (uncompressed) min/max, and PushBloomFilter returns without pushing a filter unless the bloom filter is exact. A hashed bloom filter is never probed with compressed values.",
+      "deliminator.cpp: dropping the 'keep the deepest DelimGet join when there is a selection' heuristic changes the plan but not the result. Removing the join uses the existing RemoveJoinWithDelimGet path. The new gate (SEMI delim join, one DelimGet, plain column = column conditions, RHS made only of projections, filters, GETs and INNER/SEMI joins) is a natural class of correlated EXISTS subqueries, not something tuned to the benchmark.",
+      "ConvertNotDistinctToEqual is safe. The gate requires COMPARE_EQUAL conditions, so RemoveJoinWithDelimGet adds IS NOT NULL on the replacement columns. Tracing only goes through single-child projections and filters. SubqueryIsSimple rules out outer joins, so nothing between the trace point and the IS NOT NULL filter can bring NULLs back. With a non-NULL RHS in a SEMI join, NDF and = give the same result, including when the LHS is NULL.",
+      "join_filter_pushdown_optimizer.cpp: allowing join filters for RIGHT_SEMI/RIGHT_ANTI is correct. These joins only output build-side rows, so dropping probe rows that cannot match any build key leaves the output unchanged. NULL handling uses the existing filters_null_values logic.",
+      "Minor: the comment on key_offset in bloom_filter.hpp says the column stores 'key - key_offset' and that the offset is added back. The code (correctly) treats it as stored = key + offset and subtracts. The comment is inverted and should be fixed, but it is not a blocker."
+    ],
+    "required_changes": []
+  }
+}

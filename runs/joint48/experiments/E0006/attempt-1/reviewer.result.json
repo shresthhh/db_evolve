@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "join_filter_pushdown_optimizer.cpp: lets the pushdown pass through `__internal_compress_integral_*(x, const)`. compress_integral.cpp computes `input - min_val`, so storage = probe + offset, and that is what JoinFilterValueToStorage applies, with a HUGEINT overflow check followed by a cast to the storage type. Nested offsets, NULL offsets and UHUGEINT offsets are rejected. Because x - c is monotonic, the shifted min/max stays correct for the non-equality comparisons (<, <=, >, >=) as well.",
+      "Every consumer that could misuse a shifted column is guarded. The bloom filter is skipped when storage_offset is set, and TopN and RowGroupPruner bail out. The IN-list and min/max filters both go through the shared helper. Joins with no hash table (ht == nullptr) only reach the min/max path, which handles the offset.",
+      "physical_hash_join.cpp PushRangeSetFilter: it skips NULL build keys, sorts and dedups the keys, and splits them at the largest gaps. The result is wrapped in OptionalFilter, which row_group.cpp:626 marks always-true after the zonemap check, so it can never drop rows. Building it costs O(n log n) for n <= 64*threshold build rows (3200 by default), which is negligible. It is limited to integral storage types of 64 bits or less.",
+      "The conditions are general (equality join, build-key count tied to the existing dynamic_or_filter_threshold setting), with no query-, table- or literal-specific logic. Settings defaults, timing and tests are untouched.",
+      "Nit: at physical_hash_join.cpp:1006 `ht &&join_condition` is missing a space, and RANGE_SET_MAX_KEYS_PER_RANGE is really a limit on the key count (a multiple of the threshold), not keys per range. Both are cosmetic."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"join_filter_pushdown_optimizer.cpp: lets the pushdown pass through `__internal_compress_integral_*(x, const)`. compress_integral.cpp computes `input - min_val`, so storage = probe + offset, and that is what JoinFilterValueToStorage applies, with a HUGEINT overflow check followed by a cast to the storage type. Nested offsets, NULL offsets and UHUGEINT offsets are rejected. Because x - c is monotonic, the shifted min/max stays correct for the non-equality comparisons (<, <=, >, >=) as well.\",\"Every consumer that could misuse a shifted column is guarded. The bloom filter is skipped when storage_offset is set, and TopN and RowGroupPruner bail out. The IN-list and min/max filters both go through the shared helper. Joins with no hash table (ht == nullptr) only reach the min/max path, which handles the offset.\",\"physical_hash_join.cpp PushRangeSetFilter: it skips NULL build keys, sorts and dedups the keys, and splits them at the largest gaps. The result is wrapped in OptionalFilter, which row_group.cpp:626 marks always-true after the zonemap check, so it can never drop rows. Building it costs O(n log n) for n <= 64*threshold build rows (3200 by default), which is negligible. It is limited to integral storage types of 64 bits or less.\",\"The conditions are general (equality join, build-key count tied to the existing dynamic_or_filter_threshold setting), with no query-, table- or literal-specific logic. Settings defaults, timing and tests are untouched.\",\"Nit: at physical_hash_join.cpp:1006 `ht &&join_condition` is missing a space, and RANGE_SET_MAX_KEYS_PER_RANGE is really a limit on the key count (a multiple of the threshold), not keys per range. Both are cosmetic.\"],\"required_changes\":[]}",
+  "cost_usd": 0.4392818,
+  "seconds": 94.8547010421753,
+  "error": ""
+}

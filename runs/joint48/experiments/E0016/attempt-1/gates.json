@@ -1,0 +1,21 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:333: the change is one line. Before it, a DELIM_GET build side ran IsFiltering on children[0], which is the probe side. That is almost certainly a bug, and it meant DELIM joins rarely got a Bloom filter. Setting the flag to true is a reasonable general heuristic: a DELIM_GET emits the distinct outer keys, so it acts like a filtered build side.",
+      "build_side_has_filter is only read in PhysicalHashJoin::CanUseBloomFilter (physical_hash_join.cpp:888), together with can_use_bf and the probe-larger-than-build check. It decides whether a Bloom filter is worth building. It does not affect correctness. Which join types and conditions are eligible for pushdown is still decided upstream, when probe_info is populated, so no new correctness surface is added.",
+      "Nothing checks for a particular query, table or literal. The change applies to any decorrelated subquery that uses a DELIM join. When the filter is not selective, it is still switched off at runtime by the selectivity filter."
+    ],
+    "required_changes": []
+  }
+}

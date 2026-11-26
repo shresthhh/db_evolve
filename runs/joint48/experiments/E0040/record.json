@@ -1,0 +1,42 @@
+{
+  "id": "E0040",
+  "title": "Coalesce sparse filtered scan chunks before emitting",
+  "started": "2026-11-25T12:27:03-05:00",
+  "base": "9fc9b440036c6bf24760e655d58cf6636c4bd561",
+  "candidate": "d34eabd99f6b4f4e9cb6fad5a319c5eee1bb6b9d",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.9734746000000001,
+  "summary": "The table scan now merges sparse filtered chunks before handing them on, and the visible geomean dropped about 9%. When a filtered scan produces a chunk with fewer than 256 rows (STANDARD_VECTOR_SIZE/8), it keeps scanning the same parallel range and copies the results into one buffer until that buffer reaches 1024 rows. All of it is in src/function/table/table_scan.cpp (DuckTableScanState::TableScanFunc).\n\nHow it works:\n- **When it applies:** only for scans with table filters (pushed predicates or dynamic join filters), and never for CREATE INDEX scans.\n- **New per-thread scan state:** an owned buffer, a scratch chunk, and two flags (`has_pending`, `range_exhausted`).\n- **Stopping:** merging stops when the buffer reaches the target, when the range runs out, or when the next chunk would overflow 2048 rows. An overflowing chunk is held and sent first on the next call. A chunk from a different batch is also held rather than mixed in.\n- **What stays the same:** it never moves on to the next parallel range inside the merge loop, so batch indexes and insertion order are unchanged. The flag `range_exhausted` makes the next call go straight to the next range instead of scanning an exhausted one again.\n- **Projection:** it works in both scan paths, because merging runs after the existing step that drops filter-only columns.\n\nMeasured on full bench (my build vs current best):\n\n| Query | Change |\n|---|---|\n| q09 | -23% |\n| q14 | -18% |\n| q17 | -18% |\n| q08 | -17% |\n| q03 | -12% |\n| q05 | -12% |\n| q07 | -10% |\n| q04 | -7% |\n| q02 | -5% |\n| q13, q16, q18, q19, q22 | within \u00b13% |\n| geomean | -8.9% |\n\nq16 showed +6.6% in that run; rerun alone it was -0.9%. Further isolated reruns: q02 -15.7%, q19 -6.8%, q22 -2.1%. Bench result checks passed on every run. A rowid-order check on a selective lineitem filter also came out correct.\n\nAn earlier version triggered at 512 rows (/4) and ran q22 +3.5% to +12% in three of four runs (-0.5% in the fourth). Its orders scan passes 12.7% of rows through the join filter, about 260 rows per chunk, so it was being merged at a selectivity where copying costs about what it saves. Lowering the trigger to 256 rows fixed q22 and also improved the geomean, from -7.2% to -8.9%.",
+  "notes": "This contradicts the earlier claim in memory.md that compacting sparse scan chunks gives no gain; that claim had no ledger record, and this change clearly gains.\n\nThe trigger level matters. At STANDARD_VECTOR_SIZE/4, q22 got slower, because its orders scan passes 12.7% of rows through the join filter (about 260 rows per chunk) and copying them cost about what it saved. STANDARD_VECTOR_SIZE/8 is safe on the visible queries.\n\nFollow-up ideas:\n1. Apply the same merging to index scans and the local-storage phase.\n2. Merge chunks at other places that produce sparse output, such as hash join output or the FILTER operator, ideally as a generic operator-level step.\n3. The target size (1024) was not tuned; trying 2048 with a pending chunk may help a little more.",
+  "train_ratio": 0.9069570075187646,
+  "val_ratio": 0.9393138600923272,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9227125346408246,
+    "q03": 0.8709377180247253,
+    "q04": 0.958673245644565,
+    "q05": 0.8404760865783506,
+    "q07": 0.9137890044009092,
+    "q08": 0.82172433877473,
+    "q09": 0.9140646431918512,
+    "q13": 0.9902803096483029,
+    "q14": 0.7894164287790014,
+    "q16": 0.9642183142299855,
+    "q17": 0.7880940697884006,
+    "q18": 1.024861793639066,
+    "q19": 0.9455545592262687,
+    "q22": 0.9959687145339362
+  },
+  "improved": [
+    "q08",
+    "q09",
+    "q14"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-25T12:39:57-05:00"
+}

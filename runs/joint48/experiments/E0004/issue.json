@@ -1,0 +1,13 @@
+{
+  "title": "Substring prefilter over contiguous string runs for LIKE/contains scan filters",
+  "hypothesis": "In q13 (648ms, 14.5% of the total) the orders TABLE_SCAN with the filter o_comment NOT LIKE '%unusual%packages%' takes 2.60s of CPU, the largest single operator in the profile. The join and the aggregate above it are now cheap after E0003. The ExpressionFilter is evaluated per row through the generic LIKE matcher. FSST decode with enable_fsst_vectors=false writes the strings back to back into one buffer, so a whole run of rows can be checked for the literal with one SIMD search. A previous run measured q13 -11% with this mechanism.",
+  "plan": "In src/storage/table/column_data.cpp, ColumnData::Filter (line 348): after Scan, if the filter is an EXPRESSION_FILTER whose expression is ~~ / !~~ / contains (or NOT of these) with a constant pattern that uses only '%' wildcards (no '_' or escape), extract the longest literal segment of at least 2 bytes. For a FLAT VARCHAR result, walk the rows and group the non-inlined strings whose data pointer equals the previous string's end into runs. Search each run with an SSE2 first+last-byte candidate scan and memcmp to confirm. Keep the scan block overlapping into the run tail; do not finish the tail with a scalar loop, because the prior run found that removes the gain. Map each hit back to its row (a hit must lie fully inside one string). Rows without the literal are decided directly: false for positive LIKE, true for NOT LIKE. Only candidate rows go through the original ColumnSegment::FilterSelection / expression, with a reduced selection. Inlined (<=12 byte) strings and non-contiguous strings fall back to the per-row path. Do not depend on FSST_VECTOR: it never reaches this path.",
+  "target_files": [
+    "src/storage/table/column_data.cpp"
+  ],
+  "expected_gain": "q13 -10% (prior run -11%). Smaller gains for any other LIKE/contains scan filter (q09 p_name LIKE '%ghost%' on part, a small table).",
+  "generality": "Any substring-style LIKE/contains/NOT LIKE scan filter on VARCHAR columns, which are common in analytics (comments, names). Columns with short inlined strings fall back and so do not slow down. If almost every row matches the literal (no pruning), the extra pass adds a small overhead.",
+  "risk": "Medium. Correctness depends on NOT semantics, NULL handling (NULL rows must still be filtered out) and matches that cross a string boundary. The implementer should check results with dbe-tool sql against an equivalent filter that blocks pushdown (e.g. concat(o_comment,'') NOT LIKE ...).",
+  "status": "open",
+  "filed": "g1r4"
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0045",
+  "title": "Leaner streamed-run store for clustered-key radix agg (q18 subquery)",
+  "started": "2026-11-26T01:12:57-05:00",
+  "base": "4f25ac98692c39c5345178e154a82aa715a2a26f",
+  "candidate": "c9a15ca13231772ca138544b1fb8b150cf2c1c88",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.3346805999999996,
+  "summary": "I measured first, as the issue asked. Temporary steady_clock timers were removed before benching. They showed the cost of the streamed-run path is not mainly in the ColumnDataCollection run store. Warm CPU ms for the HAVING subquery (60M rows, 15M runs, summed over threads):\n- run-head detection: ~230\n- state allocation + per-row address fill: ~215\n- InitializeStates: 62\n- UpdateStates: 105\n- CDC Append: 68\n- source finalize: 88\n- CDC scan: 9\n\nBoth of the top two are branchy loops over runs of ~4 rows, so most key changes mispredict. FindClusteredRuns and FindRunHeads also made two such passes over the same keys. So I fixed run detection rather than building the block store.\n\nChange (src/execution/radix_partitioned_hashtable.cpp only):\n- FindClusteredRuns is now one branch-free pass over the chunk's keys. It writes a candidate head at heads[n] and advances n by (cur != prev). It records the run index of every row in a lazily allocated per-thread run_ids buffer, and accumulates the \"decreasing\" flag without branching. There is a separate template instance with no selection vector for flat keys.\n- first_end and last_start come from the head list, so the non-decreasing check and the split semantics are unchanged.\n- SinkInteriorRuns reuses the chunk's heads (the interior runs are heads[1..n-2]) instead of calling FindRunHeads again; FindRunHeads is removed.\n- The address fill is now a simple loop with no branches: addresses[i] = states + (run_ids[i]-1)*stride.\n- When streaming is used, the run store, the states and MergeRunStores are all unchanged.\n\nMeasured:\n- HAVING micro: 188-194ms \u2192 136-143ms (~-27%).\n- `SELECT DISTINCT` micro: ~140ms \u2192 81-90ms.\n- After the fix, run detection inside SinkInteriorRuns is ~1ms CPU and alloc/address fill is ~93ms.\n- bench q18: -20.1%, -32.1%, -14.6%, -24.7% over four runs. q14 was -10..-15% in three runs and -2.8% in one.\n- Full-bench geomean: -4.2% and -1.1%.\n- Other templates are noise. q16 swung between +10% and -7.5%; its leading group key is a compressed string (UHUGEINT), so it never reaches this code. q02 and q05 were +14.5% and +9% in one run and back to -1.3% and +0.7% on recheck.\n\nCorrectness checks all matched FILTER(WHERE true) variants, which disable streaming, or the expected values:\n- negative INT keys with a second group column\n- UTINYINT keys\n- NULL keys with HAVING\n- descending (unsorted) input, which takes the fallback\n- the HAVING subquery itself\n- two-key group by on a filtered scan\n- string_agg (destructor, so not streamed)\n- count(DISTINCT)",
+  "notes": "- The issue's preferred fix (replacing the CDC run store with fixed blocks) was not done. Measurement showed CDC append plus scan is only ~77ms CPU out of ~770. An earlier session found that the block store alone gave q18 -1.4%.\n- Remaining per-group CPU after this fix: alloc/address fill 93, InitializeStates 72 (an indirect call per state), UpdateStates 112, CDC append 70, FinalizeStates 90 ms. A block store with one InitializeStates per block plus arithmetic row pointers could still save ~100-150ms CPU, maybe -5% on q18, as a follow-up.\n- Another earlier finding: RegisterRunInterval (mutex + std::map per chunk) costs ~69ms CPU; coalescing adjacent intervals could cut it.\n- Timer method: write to a file in the worktree's gitignored tmp/ directory. stderr output makes dbe-tool fail, and reading /tmp is denied. A one-line leftover file, tmp/tmpt.txt, is still there; it is gitignored.\n- q16, q02 and q05 swing \u00b110% between bench runs, so recheck them before trusting a single run.",
+  "train_ratio": 0.9872962599178432,
+  "val_ratio": 0.9899864682311186,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9685786324486015,
+    "q03": 0.9574561071090166,
+    "q04": 0.9836806518208666,
+    "q05": 1.0098181820914305,
+    "q07": 0.9891993387251117,
+    "q08": 1.0124082778429957,
+    "q09": 1.0083916332132201,
+    "q13": 1.007429139930708,
+    "q14": 0.9921630008023175,
+    "q16": 1.0771546550894995,
+    "q17": 1.012425810696161,
+    "q18": 0.780705407182187,
+    "q19": 1.0502349409629175,
+    "q22": 1.0056170230203227
+  },
+  "improved": [
+    "q18"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-26T01:33:52-05:00"
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0026",
+  "title": "Bundle: fused integer hashed-BF probe + exact BF up to 2^27 bits at 1024 bits/key",
+  "started": "2026-11-24T23:07:46-05:00",
+  "base": "3145ec5c2755703a486765dfeac0382578496d96",
+  "candidate": "6ce9e2067c25f16f222d42c0c96cc944ccad0e0a",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q05 -17.4%; needs at least -20.3%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.8997716,
+  "summary": "Two changes. (1) bloom_filter.cpp: in hashed (non-exact) mode, BFTableFilter::Filter now has a fused path for integer keys (INT8..INT64, UINT8..UINT64) in FLAT or DICTIONARY vectors. A new TemplatedLookupHashed<T> reads data[sel[i]], computes duckdb::Hash<T>(v) and calls LookupOne, all in one loop. This is the same hash TightLoopHash/HashOp uses. A NULL row probes HashOp's NULL_HASH constant, mirrored locally as BF_NULL_HASH, so the result matches the old path exactly. The loop replaces slice + VectorOperations::Hash + Flatten + LookupHashes. Every other type, and constant vectors, keep the old path. (2) physical_hash_join.cpp TrySetExactBloomFilter: a new exact-bitmap tier for range < min(2^27, count*1024). The cap stops at 2^27 once count >= 2^17, so the bitmap is at most 16MB. My first version allowed the tier only when count <= 2^17. That missed q05, whose build has about 455k keys over a range of about 60M, and q05 was +1..+12% (noise). With the tier fixed: full bench showed q05 -13.5%, and a rerun gave q05 -17.9%. In the full run q02 +12%, q16 +5.7% and q19 +7.9% looked slower, but on rerun they were -0.7%, -0.8% and -0.6%, so that was noise. Full-bench geomean was +0.1%; the 5-template rerun geomean was -4.6%. I did not run the warm JSON profile check of q05 lineitem scan CPU that the plan asked for; the only evidence is bench wall time. Correctness: I used temp tables with BIGINT keys and NULLs on both sides, sparse keys over a range of about 2e11 (stays hashed), and a dense range of about 1e8 with 200k keys (new exact tier). The plan profile showed the BF on the hashed test. Inner joins with pre-filtered probe rows and IN-subqueries gave the same results as with SET disabled_optimizers='join_filter_pushdown'.",
+  "notes": "The E0025 tier has to be cap = min(2^27, count*1024) for every build size, with the multiplication capped at 2^27, not applied only to builds of at most 2^17 keys. q05's build is about 455k keys. The fused hashed probe on its own showed no measurable visible gain: once the exact tiers apply, no visible BF stays hashed. Its value is for hidden templates with wide integer key ranges, and I did not A/B it in isolation. The bench is noisy at \u00b18-12% on single runs (q02/q16/q19 flipped sign on rerun). If you want more, the next step is a micro A/B of the fused probe on a wide-range join.",
+  "train_ratio": 0.9818180496902719,
+  "val_ratio": 1.0112050226520535,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9752707534312787,
+    "q03": 1.0135697475494823,
+    "q04": 0.9744233633137804,
+    "q05": 0.826190550395177,
+    "q07": 0.9886260896675202,
+    "q08": 1.0653245925926282,
+    "q09": 1.0241059428346035,
+    "q13": 0.9960807941993648,
+    "q14": 0.9801870457212771,
+    "q16": 0.9899526111042897,
+    "q17": 1.0181383183041128,
+    "q18": 0.9988372391488822,
+    "q19": 0.9505024725874415,
+    "q22": 0.9644857570388702
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T23:26:31-05:00"
+}

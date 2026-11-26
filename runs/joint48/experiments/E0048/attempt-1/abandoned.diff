@@ -1,0 +1,283 @@
+diff --git a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+index 946f386..1ce52fe 100644
+--- a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+@@ -184,9 +184,10 @@ SinkResultType PhysicalPerfectHashAggregate::Sink(ExecutionContext &context, Dat
+ 		if (!lstate.stage_target_set) {
+ 			auto &gstate = input.global_state.Cast<PerfectHashAggregateGlobalState>();
+ 			auto arena = make_uniq<ArenaAllocator>(Allocator::Get(context.client));
++			// SetStageTarget may allocate the storage of the global HT: serialize the calls
++			lock_guard<mutex> l(gstate.lock);
+ 			lstate.shared_sink = lstate.ht->SetStageTarget(*gstate.ht, gstate.stripe_locks.get(), *arena);
+ 			if (lstate.shared_sink) {
+-				lock_guard<mutex> l(gstate.lock);
+ 				gstate.sink_allocators.push_back(std::move(arena));
+ 			}
+ 			lstate.stage_target_set = true;
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 5bf1f15..dab9630 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -32,12 +32,9 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 	tuple_size = layout_ptr->GetRowWidth();
+ 
+ 	if (lazy_init) {
+-		// states are initialized when a slot is first set: only the group flags need to be cleared here
++		// states are initialized when a slot is first set: only the group flags need to be cleared
+ 		const idx_t data_size = tuple_size * total_groups;
+-		owned_data = make_unsafe_uniq_array_uninitialized<data_t>(data_size + total_groups * sizeof(bool));
+-		data = owned_data.get();
+-		lazy_group_is_set = reinterpret_cast<bool *>(data + data_size);
+-		memset(lazy_group_is_set, 0, total_groups * sizeof(bool));
++		data = nullptr;
+ 		// tables much larger than the CPU caches: stage rows per stripe of slots before updating the states
+ 		// only fixed-width payloads are staged (their values can be copied without referencing other memory)
+ 		use_staging = total_groups > STAGE_STRIPE_SIZE && data_size + total_groups > STAGE_MIN_TABLE_SIZE;
+@@ -49,6 +46,10 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 		if (use_staging) {
+ 			stage_partitions.resize((total_groups + STAGE_STRIPE_SIZE - 1) / STAGE_STRIPE_SIZE);
+ 			stage_offsets.resize(stage_partitions.size());
++			stage_current.resize(stage_partitions.size());
++		} else {
++			// unstaged tables are always updated directly
++			InitializeLazyStorage();
+ 		}
+ 		return;
+ 	}
+@@ -80,6 +81,18 @@ PerfectAggregateHashTable::~PerfectAggregateHashTable() {
+ 	Destroy();
+ }
+ 
++void PerfectAggregateHashTable::InitializeLazyStorage() {
++	D_ASSERT(lazy_init);
++	if (data) {
++		return;
++	}
++	const idx_t data_size = tuple_size * total_groups;
++	owned_data = make_unsafe_uniq_array_uninitialized<data_t>(data_size + total_groups * sizeof(bool));
++	data = owned_data.get();
++	lazy_group_is_set = reinterpret_cast<bool *>(data + data_size);
++	memset(lazy_group_is_set, 0, total_groups * sizeof(bool));
++}
++
+ template <class T>
+ static void ComputeGroupLocationTemplated(UnifiedVectorFormat &group_data, Value &min, uintptr_t *address_data,
+                                           idx_t current_shift, idx_t count) {
+@@ -254,37 +267,45 @@ void PerfectAggregateHashTable::AddChunkLazy(DataChunk &groups, DataChunk &paylo
+ 	UpdateLazy(*this, address_data, payload, count);
+ }
+ 
++template <idx_t SIZE>
++static void ScatterStagedColumn(UnifiedVectorFormat &source, idx_t count, Vector *const *targets,
++                                const sel_t *positions) {
++	auto source_data = source.data;
++	// the validity of the target rows has been reset to valid: only NULLs need to be written
++	if (source.validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			const auto idx = source.sel->get_index(i);
++			memcpy(FlatVector::GetData(*targets[i]) + positions[i] * SIZE, source_data + idx * SIZE, SIZE);
++		}
++		return;
++	}
++	for (idx_t i = 0; i < count; i++) {
++		const auto idx = source.sel->get_index(i);
++		auto &target = *targets[i];
++		memcpy(FlatVector::GetData(target) + positions[i] * SIZE, source_data + idx * SIZE, SIZE);
++		if (!source.validity.RowIsValid(idx)) {
++			FlatVector::Validity(target).SetInvalid(positions[i]);
++		}
++	}
++}
++
+ void PerfectAggregateHashTable::AddChunkStaged(const uintptr_t *slots, DataChunk &payload, idx_t count) {
+-	// counting sort of the rows by stripe: afterwards stage_offsets[p] is the end of stripe p in the sorted order
++	// count the rows per stripe
+ 	const auto partition_count = stage_partitions.size();
+ 	auto offsets = stage_offsets.data();
+ 	memset(offsets, 0, partition_count * sizeof(idx_t));
+ 	for (idx_t i = 0; i < count; i++) {
+ 		offsets[slots[i] >> STAGE_STRIPE_BITS]++;
+ 	}
+-	idx_t total = 0;
+-	for (idx_t p = 0; p < partition_count; p++) {
+-		auto partition_rows = offsets[p];
+-		offsets[p] = total;
+-		total += partition_rows;
+-	}
+-	sel_t sorted_rows[STANDARD_VECTOR_SIZE];
+-	uintptr_t sorted_slots[STANDARD_VECTOR_SIZE];
+-	for (idx_t i = 0; i < count; i++) {
+-		const auto slot = slots[i];
+-		const auto pos = offsets[slot >> STAGE_STRIPE_BITS]++;
+-		sorted_rows[pos] = UnsafeNumericCast<sel_t>(i);
+-		sorted_slots[pos] = slot;
+-	}
+ 
+-	// append the rows of every stripe to its staged chunk, flushing the stripe if the staged chunks are full
+-	idx_t begin = 0;
++	// make room for the rows of every stripe in its current staged chunk, flushing the stripe if the staged chunks
++	// are full; afterwards stage_offsets[p] is the position of the next row of stripe p in stage_current[p]
++	uintptr_t saved_slots[STANDARD_VECTOR_SIZE];
+ 	for (idx_t p = 0; p < partition_count; p++) {
+-		const auto end = offsets[p];
+-		if (end == begin) {
++		const auto n = offsets[p];
++		if (n == 0) {
+ 			continue;
+ 		}
+-		const auto n = end - begin;
+ 		auto &partition = stage_partitions[p];
+ 		if (partition.buffers.empty()) {
+ 			partition.buffers.push_back(make_uniq<StageBuffer>());
+@@ -302,18 +323,70 @@ void PerfectAggregateHashTable::AddChunkStaged(const uintptr_t *slots, DataChunk
+ 					}
+ 				}
+ 			} else {
++				if (slots != saved_slots) {
++					// flushing overwrites the address vector (which slots may alias): keep a copy of the slots
++					memcpy(saved_slots, slots, count * sizeof(uintptr_t));
++					slots = saved_slots;
++				}
+ 				FlushStagePartition(p);
+ 			}
+ 		}
+ 		auto &buffer = *partition.buffers[partition.used];
+ 		const auto offset = buffer.payload.size();
+-		SelectionVector part_sel(sorted_rows + begin);
+-		for (idx_t c = 0; c < payload.ColumnCount(); c++) {
+-			VectorOperations::Copy(payload.data[c], buffer.payload.data[c], part_sel, n, 0, offset);
+-		}
+-		memcpy(buffer.slots + offset, sorted_slots + begin, n * sizeof(uintptr_t));
++		stage_current[p] = &buffer;
++		offsets[p] = offset;
+ 		buffer.payload.SetCardinality(offset + n);
+-		begin = end;
++		// staged vectors may still have NULLs from rows staged before: reset the rows that will be written
++		for (auto &vec : buffer.payload.data) {
++			auto &mask = FlatVector::Validity(vec);
++			if (!mask.AllValid()) {
++				for (idx_t r = offset; r < offset + n; r++) {
++					mask.SetValid(r);
++				}
++			}
++		}
++	}
++
++	// write every row directly to its position in the staged chunk of its stripe
++	StageBuffer *row_buffers[STANDARD_VECTOR_SIZE];
++	sel_t row_positions[STANDARD_VECTOR_SIZE];
++	auto current = stage_current.data();
++	for (idx_t i = 0; i < count; i++) {
++		const auto slot = slots[i];
++		const auto p = slot >> STAGE_STRIPE_BITS;
++		const auto pos = offsets[p]++;
++		auto buffer = current[p];
++		buffer->slots[pos] = slot;
++		row_buffers[i] = buffer;
++		row_positions[i] = UnsafeNumericCast<sel_t>(pos);
++	}
++	Vector *row_targets[STANDARD_VECTOR_SIZE];
++	for (idx_t c = 0; c < payload.ColumnCount(); c++) {
++		for (idx_t i = 0; i < count; i++) {
++			row_targets[i] = &row_buffers[i]->payload.data[c];
++		}
++		UnifiedVectorFormat source;
++		payload.data[c].ToUnifiedFormat(count, source);
++		// only constant-size payloads are staged
++		switch (GetTypeIdSize(payload.data[c].GetType().InternalType())) {
++		case 1:
++			ScatterStagedColumn<1>(source, count, row_targets, row_positions);
++			break;
++		case 2:
++			ScatterStagedColumn<2>(source, count, row_targets, row_positions);
++			break;
++		case 4:
++			ScatterStagedColumn<4>(source, count, row_targets, row_positions);
++			break;
++		case 8:
++			ScatterStagedColumn<8>(source, count, row_targets, row_positions);
++			break;
++		case 16:
++			ScatterStagedColumn<16>(source, count, row_targets, row_positions);
++			break;
++		default:
++			throw InternalException("Unsupported payload type for staged perfect aggregate hash table");
++		}
+ 	}
+ }
+ 
+@@ -322,6 +395,9 @@ void PerfectAggregateHashTable::FlushStagePartition(idx_t partition_idx) {
+ 	if (partition.buffers.empty() || partition.buffers[0]->payload.size() == 0) {
+ 		return;
+ 	}
++	if (!stage_target) {
++		InitializeLazyStorage();
++	}
+ 	auto &target = stage_target ? *stage_target : *this;
+ 	unique_lock<mutex> guard;
+ 	if (stage_locks) {
+@@ -353,6 +429,8 @@ bool PerfectAggregateHashTable::SetStageTarget(PerfectAggregateHashTable &target
+ 		return false;
+ 	}
+ 	FlushStaged();
++	// the caller serializes SetStageTarget calls, so the storage of target is allocated exactly once
++	target.InitializeLazyStorage();
+ 	stage_target = &target;
+ 	stage_locks = stripe_locks;
+ 	stage_arena = &arena;
+@@ -404,6 +482,11 @@ void PerfectAggregateHashTable::CombineRange(PerfectAggregateHashTable &other, i
+ 	D_ASSERT(total_groups == other.total_groups);
+ 	D_ASSERT(tuple_size == other.tuple_size);
+ 	D_ASSERT(end <= total_groups);
++	if (!other.data) {
++		// the other HT never stored any rows itself
++		return;
++	}
++	D_ASSERT(data);
+ 	auto source_is_set = other.lazy_group_is_set;
+ 	auto target_is_set = lazy_group_is_set;
+ 
+@@ -543,6 +626,11 @@ void PerfectAggregateHashTable::ScanRange(idx_t &scan_position, idx_t end, DataC
+                                           ArenaAllocator &arena) {
+ 	D_ASSERT(lazy_init);
+ 	D_ASSERT(end <= total_groups);
++	if (!data) {
++		// no rows were ever added
++		scan_position = end;
++		return;
++	}
+ 	auto is_set = lazy_group_is_set;
+ 	auto data_pointers = FlatVector::GetData<data_ptr_t>(scan_addresses);
+ 	uint32_t group_values[STANDARD_VECTOR_SIZE];
+@@ -580,7 +668,7 @@ void PerfectAggregateHashTable::Destroy() {
+ 			has_destructor = true;
+ 		}
+ 	}
+-	if (!has_destructor) {
++	if (!has_destructor || !data) {
+ 		return;
+ 	}
+ 	// there are aggregates with destructors: loop over the hash table
+diff --git a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+index e784d49..b0b46e8 100644
+--- a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+@@ -111,6 +111,8 @@ protected:
+ 	idx_t stage_shift = 0;
+ 	vector<StagePartition> stage_partitions;
+ 	vector<idx_t> stage_offsets;
++	//! Staged sink: the buffer receiving the rows of each stripe in the current chunk
++	vector<StageBuffer *> stage_current;
+ 	optional_ptr<PerfectAggregateHashTable> stage_target;
+ 	mutex *stage_locks = nullptr;
+ 	optional_ptr<ArenaAllocator> stage_arena;
+@@ -118,6 +120,9 @@ protected:
+ private:
+ 	//! Destroy the perfect aggregate HT (called automatically by the destructor)
+ 	void Destroy();
++	//! Lazy-init mode: allocate the table data and group flags if not done yet (staged tables defer this, since
++	//! tables that only stage rows for another table never use their own slots)
++	void InitializeLazyStorage();
+ 	void AddChunkStaged(const uintptr_t *slots, DataChunk &payload, idx_t count);
+ 	void FlushStagePartition(idx_t partition_idx);
+ 	//! Lazy-init mode: initialize unset slots of target and update its states at the slot indices for the payload

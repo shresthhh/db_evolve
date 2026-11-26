@@ -1,0 +1,13 @@
+{
+  "title": "Rerun: BF for hash joins whose build side is a DELIM_GET",
+  "hypothesis": "E0015 was retired only because q14 read +8.0% (12 ms) against a 5.1% threshold. q14 (lineitem JOIN part, no subquery) has no DELIM join, so its plan cannot change under this one-line fix. That regression is bench noise; the implementer reported \u00b130% swings on untouched templates in that session. The real effect is consistent: q22's decorrelated NOT EXISTS orders scan drops from 15M to 1.9M rows via o_custkey IN BF(c_custkey), giving -19..-27% over four runs (q22 is 180ms, 4.8% of total), visible geomean -1.4%, hidden validation ok. Root cause: join_filter_pushdown_optimizer.cpp (~line 331) sets build_side_has_filter with IsFiltering(join.children[0]), which tests the probe side, so a DELIM_GET build never enables a BF.",
+  "plan": "Reapply the E0015 diff unchanged. In src/optimizer/join_filter_pushdown_optimizer.cpp, where build_side_has_filter is computed, set it to true when the build child (children[1]) is a LOGICAL_DELIM_GET. Leave the existing IsFiltering logic in place otherwise. The runtime gates in CanUseBloomFilter (COMPARE_EQUAL, not perfect HT, probe est > ht count) and the SelectivityOptionalFilter auto-disable stay as they are. Check q22 results against SET disabled_optimizers='join_filter_pushdown'. Before reporting, run the bench at least twice and include a q14 EXPLAIN that shows its plan has no BF change.",
+  "target_files": [
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "expected_gain": "q22 -20%; visible geomean about -1.4%. Other templates unchanged.",
+  "generality": "Any correlated EXISTS/NOT EXISTS/IN/scalar subquery that gets decorrelated into a DELIM join, where the DELIM_GET distinct key set is much smaller than the probe table (very common in TPC-DS/TPC-H style queries). Worst case: a BF that isn't selective, which the selectivity filter switches off after sampling.",
+  "risk": "Low. One-line change that was already validated (results correct, hidden validation ok). The only risk is that bench noise flags it again.",
+  "status": "open",
+  "filed": "g1r16"
+}

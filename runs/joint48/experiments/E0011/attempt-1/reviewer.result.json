@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_order/cardinality_estimator.cpp CalculateUpdatedDenom: for SEMI joins the denominator multiplier is now max(5, tdom/rhs_card) instead of a fixed 5. This is the textbook semi-join estimate: at most rhs_card distinct keys out of tdom can match. It doesn't depend on any query, table, or constant beyond the existing DEFAULT_SEMI_ANTI_SELECTIVITY.",
+      "When lhs_is_left is false, behaviour is unchanged: the old code used right.denom*5, and lhs now aliases right. ANTI joins keep the old fixed factor, which is correct because a small RHS means an anti join removes fewer rows.",
+      "The new path is guarded against division by zero and degenerate estimates: it checks for a null numerator_relations, denom > 0, tdom > 0 and rhs_card >= 1. Because the change only affects the estimate, it can only change plan choice, never query results. NULLs, types and parallel execution are unaffected.",
+      "The diff is small and focused, and it doesn't touch tests, settings or measurement. The relation_manager change that was planned was correctly left out, since it would have counted the HAVING selectivity twice."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/optimizer/join_order/cardinality_estimator.cpp CalculateUpdatedDenom: for SEMI joins the denominator multiplier is now max(5, tdom/rhs_card) instead of a fixed 5. This is the textbook semi-join estimate: at most rhs_card distinct keys out of tdom can match. It doesn't depend on any query, table, or constant beyond the existing DEFAULT_SEMI_ANTI_SELECTIVITY.\",\"When lhs_is_left is false, behaviour is unchanged: the old code used right.denom*5, and lhs now aliases right. ANTI joins keep the old fixed factor, which is correct because a small RHS means an anti join removes fewer rows.\",\"The new path is guarded against division by zero and degenerate estimates: it checks for a null numerator_relations, denom > 0, tdom > 0 and rhs_card >= 1. Because the change only affects the estimate, it can only change plan choice, never query results. NULLs, types and parallel execution are unaffected.\",\"The diff is small and focused, and it doesn't touch tests, settings or measurement. The relation_manager change that was planned was correctly left out, since it would have counted the HAVING selectivity twice.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1264346,
+  "seconds": 18.621819972991943,
+  "error": ""
+}

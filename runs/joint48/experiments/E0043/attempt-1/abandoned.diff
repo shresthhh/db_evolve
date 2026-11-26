@@ -1,0 +1,144 @@
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index 9767282..b8b86bd 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -765,7 +765,8 @@ struct FSSTScanState : public StringScanState {
+ 	//! states are multiples of 256. States >= 256 * pattern_states are "escape code seen, literal byte pending"
+ 	vector<uint16_t> pattern_table;
+ 	idx_t pattern_states = 0;
+-	//! pattern_accept[state / 256]: whether a string ending in the state passes the filter
++	//! pattern_accept[state / 256]: bit 0 is set if a string ending in the state passes the filter, bit 1 is set if the
++	//! state is absorbing (the outcome can no longer change)
+ 	vector<uint8_t> pattern_accept;
+ 
+ 	void InitializePattern(const TableFilter &filter) {
+@@ -782,7 +783,15 @@ struct FSSTScanState : public StringScanState {
+ 		pattern_accept.assign(2 * state_count, 0);
+ 		auto decoder = static_cast<duckdb_fsst_decoder_t *>(duckdb_fsst_decoder_ptr);
+ 		for (idx_t s = 0; s < state_count; s++) {
+-			pattern_accept[s] = dfa->accept[s];
++			// bit 0: accepting, bit 1: absorbing (every byte leads back to the state, so the result is final)
++			bool absorbing = true;
++			for (idx_t b = 0; b < ALPHABET; b++) {
++				if (dfa->transitions[s * ALPHABET + b] != s) {
++					absorbing = false;
++					break;
++				}
++			}
++			pattern_accept[s] = UnsafeNumericCast<uint8_t>((dfa->accept[s] ? 1 : 0) | (absorbing ? 2 : 0));
+ 			if (decoder) {
+ 				for (idx_t code = 0; code < FSST_ESC; code++) {
+ 					uint8_t symbol[sizeof(uint64_t)];
+@@ -1108,46 +1117,80 @@ void FSSTStorage::Filter(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 	const uint16_t *table = scan_state.pattern_table.data();
+ 	const uint8_t *accept = scan_state.pattern_accept.data();
+ 
+-	SelectionVector new_sel(sel_count);
+-	idx_t approved_count = 0;
+-	idx_t i = 0;
+-	// process four strings at a time to overlap the dependent table lookups
+-	for (; i + 4 <= sel_count; i += 4) {
+-		idx_t rows[4];
+-		const_data_ptr_t strs[4];
+-		uint32_t lens[4];
+-		uint32_t states[4] = {0, 0, 0, 0};
+-		for (idx_t l = 0; l < 4; l++) {
+-			rows[l] = sel.get_index(i + l);
+-			lens[l] = lengths[rows[l]];
+-			strs[l] = get_string(rows[l]);
++	// order the candidates by compressed length (counting sort), so that the strings of a group of GROUP candidates
++	// have (nearly) the same length and their independent DFA chains can be interleaved over the whole string
++	static constexpr idx_t GROUP = 8;
++	static constexpr idx_t LENGTH_BUCKETS = 256;
++	// absorbing states are checked every CHECK_INTERVAL codes
++	static constexpr uint32_t CHECK_INTERVAL = 8;
++	uint8_t passed[STANDARD_VECTOR_SIZE];
++	sel_t order[STANDARD_VECTOR_SIZE];
++	sel_t bucket_start[LENGTH_BUCKETS + 1];
++	memset(bucket_start, 0, sizeof(bucket_start));
++	for (idx_t c = 0; c < sel_count; c++) {
++		bucket_start[MinValue<idx_t>(lengths[sel.get_index(c)], LENGTH_BUCKETS - 1) + 1]++;
++	}
++	for (idx_t b = 1; b <= LENGTH_BUCKETS; b++) {
++		bucket_start[b] += bucket_start[b - 1];
++	}
++	for (idx_t c = 0; c < sel_count; c++) {
++		auto bucket = MinValue<idx_t>(lengths[sel.get_index(c)], LENGTH_BUCKETS - 1);
++		order[bucket_start[bucket]++] = UnsafeNumericCast<sel_t>(c);
++	}
++	idx_t g = 0;
++	for (; g + GROUP <= sel_count; g += GROUP) {
++		const_data_ptr_t strs[GROUP];
++		uint32_t lens[GROUP];
++		uint32_t states[GROUP];
++		for (idx_t l = 0; l < GROUP; l++) {
++			const auto row = sel.get_index(order[g + l]);
++			lens[l] = lengths[row];
++			strs[l] = get_string(row);
++			states[l] = 0;
+ 		}
+-		const uint32_t common = MinValue(MinValue(lens[0], lens[1]), MinValue(lens[2], lens[3]));
+-		for (uint32_t k = 0; k < common; k++) {
+-			states[0] = table[states[0] + strs[0][k]];
+-			states[1] = table[states[1] + strs[1][k]];
+-			states[2] = table[states[2] + strs[2][k]];
+-			states[3] = table[states[3] + strs[3][k]];
++		uint32_t common = lens[0];
++		for (idx_t l = 1; l < GROUP; l++) {
++			common = MinValue(common, lens[l]);
+ 		}
+-		for (idx_t l = 0; l < 4; l++) {
++		uint32_t k = 0;
++		while (k < common) {
++			const uint32_t chunk_end = MinValue(common, k + CHECK_INTERVAL);
++			for (; k < chunk_end; k++) {
++				for (idx_t l = 0; l < GROUP; l++) {
++					states[l] = table[states[l] + strs[l][k]];
++				}
++			}
++			uint8_t all_absorbing = 2;
++			for (idx_t l = 0; l < GROUP; l++) {
++				all_absorbing &= accept[states[l] >> 8];
++			}
++			if (all_absorbing) {
++				break;
++			}
++		}
++		for (idx_t l = 0; l < GROUP; l++) {
+ 			uint32_t s = states[l];
+-			for (uint32_t k = common; k < lens[l]; k++) {
+-				s = table[s + strs[l][k]];
++			for (uint32_t j = k; j < lens[l] && !(accept[s >> 8] & 2); j++) {
++				s = table[s + strs[l][j]];
+ 			}
+-			new_sel.set_index(approved_count, rows[l]);
+-			approved_count += accept[s >> 8];
++			passed[order[g + l]] = accept[s >> 8] & 1;
+ 		}
+ 	}
+-	for (; i < sel_count; i++) {
+-		auto row = sel.get_index(i);
+-		auto len = lengths[row];
+-		auto str = get_string(row);
++	for (; g < sel_count; g++) {
++		const auto row = sel.get_index(order[g]);
++		const auto len = lengths[row];
++		const auto str = get_string(row);
+ 		uint32_t s = 0;
+-		for (uint32_t k = 0; k < len; k++) {
+-			s = table[s + str[k]];
++		for (uint32_t j = 0; j < len && !(accept[s >> 8] & 2); j++) {
++			s = table[s + str[j]];
+ 		}
+-		new_sel.set_index(approved_count, row);
+-		approved_count += accept[s >> 8];
++		passed[order[g]] = accept[s >> 8] & 1;
++	}
++	SelectionVector new_sel(sel_count);
++	idx_t approved_count = 0;
++	for (idx_t c = 0; c < sel_count; c++) {
++		new_sel.set_index(approved_count, sel.get_index(c));
++		approved_count += passed[c];
+ 	}
+ 
+ 	if (state.filter_only) {

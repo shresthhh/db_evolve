@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "relation_statistics_helper.cpp: adds a general, length-aware selectivity heuristic for EXPRESSION_FILTER scan filters that are positive string-match functions (contains, ~~, like_escape, prefix, suffix) with a non-NULL VARCHAR constant pattern. Nothing in it is tied to particular tables, columns, literals or data, and it matches what the issue describes.",
+      "Only cardinality estimates change, so results cannot be wrong. Edge cases: an empty pattern gives L=0 and sel=0.2, which equals the old default. A cardinality of 0 is still reset to 0 by the caller, so the base>=after assertion holds. Negated forms (!~~, NOT LIKE) and non-constant patterns keep falling back to the old behavior.",
+      "Minor point, not blocking: for like_escape, the escape character and the escaped wildcard are still counted toward L (or skipped). The heuristic tolerates this imprecision.",
+      "The new function is small and file-static. There is no dead code and no unrelated change."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"relation_statistics_helper.cpp: adds a general, length-aware selectivity heuristic for EXPRESSION_FILTER scan filters that are positive string-match functions (contains, ~~, like_escape, prefix, suffix) with a non-NULL VARCHAR constant pattern. Nothing in it is tied to particular tables, columns, literals or data, and it matches what the issue describes.\",\"Only cardinality estimates change, so results cannot be wrong. Edge cases: an empty pattern gives L=0 and sel=0.2, which equals the old default. A cardinality of 0 is still reset to 0 by the caller, so the base>=after assertion holds. Negated forms (!~~, NOT LIKE) and non-constant patterns keep falling back to the old behavior.\",\"Minor point, not blocking: for like_escape, the escape character and the escaped wildcard are still counted toward L (or skipped). The heuristic tolerates this imprecision.\",\"The new function is small and file-static. There is no dead code and no unrelated change.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1060324,
+  "seconds": 18.247260570526123,
+  "error": ""
+}

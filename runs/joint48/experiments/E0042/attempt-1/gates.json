@@ -1,0 +1,25 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "fsst.cpp FSSTPatternDFA::TryCreate: the fast path applies to any constant LIKE/NOT LIKE/contains/prefix/starts_with/suffix/ends_with pattern built from literals and '%' on a VARCHAR column read as a plain BOUND_REF. Nothing in it names a table, column or literal. Collated columns get wrapped in a collate expression, so they are not a bare BOUND_REF and fall back. ILIKE, '_', backslash, NULL constants and conjunctions also fall back.",
+      "The DFA construction looks correct. An anchored first part is matched only at position 0, middle parts take their first KMP occurrence, and an anchored last part keeps running KMP so the match must end at the end of the string. Empty parts are dropped. The edge cases come out right: '' matches only the empty string, '%' matches everything, contains('') is true, and a '%' inside contains() is treated as a literal. NOT flips the accept states. There are at most 127 states, so the pending (escape) states still fit in uint16 when stored as state*256.",
+      "Lifting the DFA to FSST codes walks each symbol's bytes (up to 8, little-endian) and handles the escape code 255 with a pending state followed by a literal byte. If a segment has no decoder, every code maps to state 0; this is consistent because such segments only hold empty compressed strings.",
+      "NULL handling. FSST requires a separate validity pass. The only validity compression with a filter callback is constant validity, so mixed or uncompressed validity already falls back at the first gate. A constant all-NULL validity segment drops every NULL row for NOT LIKE (EvaluateWithConstant(NULL) is false). The new CanHaveNull gate only adds a conservative fallback, including for RLE.",
+      "standard_column_data.cpp FilterAcrossSegments: it advances segments the same way ColumnData::ScanVector does (previous_states, InitializeScan, segment_checked, internal_index). It runs only for filter-only columns with no updates, a filter callback on every segment involved, no NULLs, and a validity child that stays inside one segment. FSST Skip is EmptySkip, and StartScan copes with forward jumps, as the normal scan path already relies on.",
+      "The filter-only flag comes from TableScan projection_ids only when CanRemoveFilterColumns() holds and the scan is not building an index. Other scan initializations default to false, which is safe. The constant NULL placeholder for unprojected filter columns is never read downstream.",
+      "No changes to timing, settings defaults, tests or output. I could not run my own tests (there is no build in the slot), so these conclusions come from reading the code."
+    ],
+    "required_changes": []
+  }
+}

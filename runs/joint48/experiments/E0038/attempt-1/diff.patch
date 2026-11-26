@@ -1,0 +1,139 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 5254081..66d0522 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -10,6 +10,12 @@
+ #include "duckdb/main/settings.hpp"
+ #include "duckdb/storage/buffer_manager.hpp"
+ 
++#ifdef __linux__
++#include <cstdio>
++#include <cstring>
++#include <sys/mman.h>
++#endif
++
+ namespace duckdb {
+ 
+ using ValidityBytes = JoinHashTable::ValidityBytes;
+@@ -121,7 +127,10 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
+ 	InitializePartitionMasks();
+ }
+ 
++static void FreePointerTableMemory(AllocatedData &hash_map);
++
+ JoinHashTable::~JoinHashTable() {
++	FreePointerTableMemory(hash_map);
+ }
+ 
+ void JoinHashTable::Merge(JoinHashTable &other) {
+@@ -783,6 +792,74 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
+ 	}
+ }
+ 
++#ifdef __linux__
++//! Large pointer tables are accessed at random slots; backing them with 2MB pages avoids a TLB miss per access
++static constexpr idx_t POINTER_TABLE_HUGE_PAGE_SIZE = 2ULL * 1024 * 1024;
++static constexpr idx_t POINTER_TABLE_HUGE_PAGE_THRESHOLD = 16 * POINTER_TABLE_HUGE_PAGE_SIZE;
++
++//! Whether transparent huge pages are only used for regions advised with MADV_HUGEPAGE
++static bool TransparentHugePagesOnMadvise() {
++	static const bool result = []() {
++		auto file = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
++		if (!file) {
++			return false;
++		}
++		char buffer[128];
++		auto read = fread(buffer, 1, sizeof(buffer) - 1, file);
++		fclose(file);
++		buffer[read] = '\0';
++		return strstr(buffer, "[madvise]") != nullptr;
++	}();
++	return result;
++}
++#endif
++
++//! Frees a pointer table allocated with AllocatePointerTableMemory
++static void FreePointerTableMemory(AllocatedData &hash_map) {
++#ifdef __linux__
++	const auto size = hash_map.GetSize();
++	if (hash_map.get() && !IsPowerOfTwo(size)) {
++		// Release the huge pages and clear the advice so the recycled memory behaves like any other allocation
++		const auto base = reinterpret_cast<uintptr_t>(hash_map.get());
++		const auto aligned = reinterpret_cast<void *>(AlignValue<uintptr_t, POINTER_TABLE_HUGE_PAGE_SIZE>(base));
++		const auto table_size = size - POINTER_TABLE_HUGE_PAGE_SIZE;
++		madvise(aligned, table_size, MADV_DONTNEED);
++		madvise(aligned, table_size, MADV_NOHUGEPAGE);
++	}
++#endif
++	hash_map.Reset();
++}
++
++//! Allocates a pointer table of "size" bytes (a power of two), returns the (possibly aligned) start of the table
++static ht_entry_t *AllocatePointerTableMemory(BufferManager &buffer_manager, AllocatedData &hash_map,
++                                              const idx_t size) {
++#ifdef __linux__
++	if (size >= POINTER_TABLE_HUGE_PAGE_THRESHOLD && TransparentHugePagesOnMadvise()) {
++		// Over-allocate so the table can start on a huge page boundary
++		hash_map = buffer_manager.GetBufferAllocator().Allocate(size + POINTER_TABLE_HUGE_PAGE_SIZE);
++		const auto base = reinterpret_cast<uintptr_t>(hash_map.get());
++		const auto aligned = AlignValue<uintptr_t, POINTER_TABLE_HUGE_PAGE_SIZE>(base);
++		// Advise before the first touch (InitializePointerTable), failure is harmless
++		madvise(reinterpret_cast<void *>(aligned), size, MADV_HUGEPAGE);
++		return reinterpret_cast<ht_entry_t *>(aligned);
++	}
++#endif
++	hash_map = buffer_manager.GetBufferAllocator().Allocate(size);
++	return reinterpret_cast<ht_entry_t *>(hash_map.get());
++}
++
++//! Usable pointer table size in bytes (excludes the alignment slack of over-allocated tables)
++static idx_t PointerTableUsableSize(const AllocatedData &hash_map) {
++	const auto size = hash_map.GetSize();
++#ifdef __linux__
++	if (!IsPowerOfTwo(size)) {
++		D_ASSERT(size > POINTER_TABLE_HUGE_PAGE_SIZE);
++		return size - POINTER_TABLE_HUGE_PAGE_SIZE;
++	}
++#endif
++	return size;
++}
++
+ void JoinHashTable::AllocatePointerTable() {
+ 	capacity = PointerTableCapacity(Count());
+ 	D_ASSERT(IsPowerOfTwo(capacity));
+@@ -798,21 +875,20 @@ void JoinHashTable::AllocatePointerTable() {
+ 
+ 	if (hash_map.get()) {
+ 		// There is already a hash map
+-		auto current_capacity = hash_map.GetSize() / sizeof(ht_entry_t);
++		auto current_capacity = PointerTableUsableSize(hash_map) / sizeof(ht_entry_t);
+ 		if (capacity > current_capacity) {
+ 			// Need more space
+-			hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
+-			entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
++			FreePointerTableMemory(hash_map);
++			entries = AllocatePointerTableMemory(buffer_manager, hash_map, capacity * sizeof(ht_entry_t));
+ 		} else {
+ 			// Just use the current hash map
+ 			capacity = current_capacity;
+ 		}
+ 	} else {
+ 		// Allocate a hash map
+-		hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
+-		entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
++		entries = AllocatePointerTableMemory(buffer_manager, hash_map, capacity * sizeof(ht_entry_t));
+ 	}
+-	D_ASSERT(hash_map.GetSize() == capacity * sizeof(ht_entry_t));
++	D_ASSERT(PointerTableUsableSize(hash_map) == capacity * sizeof(ht_entry_t));
+ 
+ 	bitmask = capacity - 1;
+ 
+@@ -1670,7 +1746,7 @@ void JoinHashTable::Repartition(JoinHashTable &global_ht) {
+ 
+ void JoinHashTable::Reset() {
+ 	data_collection->Reset();
+-	hash_map.Reset();
++	FreePointerTableMemory(hash_map);
+ 	current_partitions.SetAllInvalid(RadixPartitioning::NumberOfPartitions(radix_bits));
+ 	finalized = false;
+ }

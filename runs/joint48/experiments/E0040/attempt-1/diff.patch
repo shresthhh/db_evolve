@@ -1,0 +1,120 @@
+diff --git a/src/function/table/table_scan.cpp b/src/function/table/table_scan.cpp
+index 821434a..03ced48 100644
+--- a/src/function/table/table_scan.cpp
++++ b/src/function/table/table_scan.cpp
+@@ -43,6 +43,15 @@ struct TableScanLocalState : public LocalTableFunctionState {
+ 
+ 	idx_t rows_in_current_row_group = 0;
+ 	idx_t row_groups_scanned = 0;
++
++	//! Owned buffer used to coalesce sparse (heavily filtered) scan chunks
++	DataChunk coalesce_chunk;
++	//! Scratch chunk for scans made while coalescing; may hold a pending chunk that did not fit
++	DataChunk coalesce_scratch;
++	//! Whether coalesce_scratch holds rows that still have to be emitted
++	bool has_pending = false;
++	//! Whether the current parallel range was exhausted while coalescing
++	bool range_exhausted = false;
+ };
+ 
+ struct IndexScanLocalState : public LocalTableFunctionState {
+@@ -317,17 +326,29 @@ public:
+ 		auto &l_state = data_p.local_state->Cast<TableScanLocalState>();
+ 		l_state.scan_state.options.force_fetch_row = ClientConfig::GetConfig(context).force_fetch_row;
+ 
++		if (l_state.has_pending) {
++			// emit the chunk that did not fit into the previous coalesced output
++			l_state.has_pending = false;
++			if (l_state.coalesce_scratch.size() >= COALESCE_MIN_ROWS) {
++				output.Reference(l_state.coalesce_scratch);
++			} else {
++				CoalesceSparse(context, l_state, l_state.coalesce_scratch, output);
++			}
++			return;
++		}
++
+ 		do {
+-			if (bind_data.is_create_index) {
+-				storage.CreateIndexScan(l_state.scan_state, output);
+-			} else if (CanRemoveFilterColumns()) {
+-				l_state.all_columns.Reset();
+-				storage.Scan(tx, l_state.all_columns, l_state.scan_state);
+-				output.ReferenceColumns(l_state.all_columns, projection_ids);
++			if (l_state.range_exhausted) {
++				// the current range was fully consumed while coalescing - move on to the next one
++				l_state.range_exhausted = false;
+ 			} else {
+-				storage.Scan(tx, output, l_state.scan_state);
++				ScanChunk(l_state, output);
+ 			}
+ 			if (output.size() > 0) {
++				if (output.size() < COALESCE_MIN_ROWS && !bind_data.is_create_index &&
++				    !l_state.scan_state.filters.GetFilterList().empty()) {
++					CoalesceSparse(context, l_state, output, output);
++				}
+ 				return;
+ 			}
+ 
+@@ -356,6 +377,62 @@ public:
+ 		} while (true);
+ 	}
+ 
++	//! Chunks with fewer rows than this coming out of a filtered scan are coalesced with subsequent chunks of the
++	//! same parallel range, so downstream operators do not pay their per-chunk overhead on tiny chunks
++	static constexpr idx_t COALESCE_MIN_ROWS = STANDARD_VECTOR_SIZE / 8;
++	static constexpr idx_t COALESCE_TARGET_ROWS = STANDARD_VECTOR_SIZE / 2;
++
++	void ScanChunk(TableScanLocalState &l_state, DataChunk &target) {
++		if (bind_data.is_create_index) {
++			storage.CreateIndexScan(l_state.scan_state, target);
++		} else if (CanRemoveFilterColumns()) {
++			l_state.all_columns.Reset();
++			storage.Scan(tx, l_state.all_columns, l_state.scan_state);
++			target.ReferenceColumns(l_state.all_columns, projection_ids);
++		} else {
++			storage.Scan(tx, target, l_state.scan_state);
++		}
++	}
++
++	static idx_t CurrentBatchIndex(TableScanLocalState &l_state) {
++		if (l_state.scan_state.table_state.row_group) {
++			return l_state.scan_state.table_state.batch_index;
++		}
++		if (l_state.scan_state.local_state.row_group) {
++			return l_state.scan_state.table_state.batch_index + l_state.scan_state.local_state.batch_index;
++		}
++		return 0;
++	}
++
++	//! Copies "first" into an owned buffer and keeps scanning the current parallel range (without advancing to the
++	//! next range) until the buffer holds COALESCE_TARGET_ROWS rows, the range is exhausted, or the next chunk would
++	//! not fit (it is then kept as pending and emitted on the next call). The result is referenced by "output".
++	void CoalesceSparse(ClientContext &context, TableScanLocalState &l_state, DataChunk &first, DataChunk &output) {
++		auto &accum = l_state.coalesce_chunk;
++		auto &scratch = l_state.coalesce_scratch;
++		if (accum.ColumnCount() == 0) {
++			accum.Initialize(context, output.GetTypes());
++			scratch.Initialize(context, output.GetTypes());
++		}
++		accum.Reset();
++		accum.Append(first);
++		const auto batch_index = CurrentBatchIndex(l_state);
++		while (accum.size() < COALESCE_TARGET_ROWS && !context.interrupted) {
++			scratch.Reset();
++			ScanChunk(l_state, scratch);
++			if (scratch.size() == 0) {
++				l_state.range_exhausted = true;
++				break;
++			}
++			if (CurrentBatchIndex(l_state) != batch_index || accum.size() + scratch.size() > STANDARD_VECTOR_SIZE) {
++				l_state.has_pending = true;
++				break;
++			}
++			accum.Append(scratch);
++		}
++		output.Reference(accum);
++	}
++
+ 	double TableScanProgress(ClientContext &context, const FunctionData *bind_data_p) const override {
+ 		// The table is empty or smaller than the standard vector size.
+ 		if (total_rows == 0) {

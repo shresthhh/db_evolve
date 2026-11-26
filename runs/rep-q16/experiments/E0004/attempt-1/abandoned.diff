@@ -1,0 +1,55 @@
+diff --git a/src/execution/operator/aggregate/physical_hash_aggregate.cpp b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+index 246d220..e401c74 100644
+--- a/src/execution/operator/aggregate/physical_hash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+@@ -17,7 +17,15 @@
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ 
++#include <chrono>
++#include "duckdb/common/printer.hpp"
+ namespace duckdb {
++static atomic<int64_t> TMP_T_SRC {0}, TMP_T_SINK {0}, TMP_T_COMB {0};
++static int64_t TmpNow() {
++	return std::chrono::duration_cast<std::chrono::microseconds>(
++	           std::chrono::steady_clock::now().time_since_epoch())
++	    .count();
++}
+ 
+ HashAggregateGroupingData::HashAggregateGroupingData(GroupingSet &grouping_set_p,
+                                                      const GroupedAggregateData &grouped_aggregate_data,
+@@ -642,6 +650,9 @@ idx_t HashAggregateDistinctFinalizeEvent::CreateGlobalSources() {
+ 
+ void HashAggregateDistinctFinalizeEvent::FinishEvent() {
+ 	// Now that everything is added to the main ht, we can actually finalize
++	Printer::Print("TMPTIMER src=" + std::to_string(TMP_T_SRC.exchange(0)) +
++	               "us sink=" + std::to_string(TMP_T_SINK.exchange(0)) +
++	               "us comb=" + std::to_string(TMP_T_COMB.exchange(0)) + "us");
+ 	auto new_event = make_shared_ptr<HashAggregateFinalizeEvent>(context, pipeline.get(), op, gstate);
+ 	this->InsertEvent(std::move(new_event));
+ }
+@@ -738,7 +749,9 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping
+ 			group_chunk.Reset();
+ 			aggregate_input_chunk.Reset();
+ 
++			auto t0 = TmpNow();
+ 			auto res = radix_table->GetData(execution_context, output_chunk, sink, source_input);
++			TMP_T_SRC += TmpNow() - t0;
+ 			if (res == SourceResultType::FINISHED) {
+ 				D_ASSERT(output_chunk.size() == 0);
+ 				break;
+@@ -762,11 +775,15 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping
+ 			aggregate_input_chunk.SetCardinality(output_chunk);
+ 
+ 			// Sink it into the main ht
++			auto t1 = TmpNow();
+ 			grouping_data.table_data.Sink(execution_context, group_chunk, sink_input, aggregate_input_chunk, {agg_idx});
++			TMP_T_SINK += TmpNow() - t1;
+ 		}
+ 		blocked = false;
+ 	}
++	auto t2 = TmpNow();
+ 	grouping_data.table_data.Combine(execution_context, global_sink_state, *local_sink_state);
++	TMP_T_COMB += TmpNow() - t2;
+ 	return TaskExecutionResult::TASK_FINISHED;
+ }

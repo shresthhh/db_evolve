@@ -1,0 +1,13 @@
+{
+  "title": "Rerun: Stop compressing hash-join keys in compressed materialization",
+  "hypothesis": "E0017 was retired at +0.6% visible geomean, but the harness itself listed q09 and q19 as faster beyond noise and nothing as slower beyond noise. The implementer measured q09 at -7..-19% over 5 runs and q03 at -11.6% on the last full run (geomean -4.8%). The mechanism is confirmed in the profile: physical_hash_join.cpp ~1059 builds a BF only when storage_offset.IsNull(). A probe key under a CM compress projection gets an offset, so the orders scan in q09 and the lineitem scan in q03 never get the BF (raw q09 with CM disabled: 542\u2192335ms, orders scan 15M\u21922.94M rows). The bench swings \u00b120% per template on identical code, so the retirement looks like noise. Untouched templates (q19 -17% on an unchanged tree) confirm how noisy it is.",
+  "plan": "Reapply E0017 exactly. In CompressedMaterialization::CompressComparisonJoin (src/optimizer/compressed_materialization/compress_comparison_join.cpp), remove the block that compresses both columns of a single equality condition generically and adds the probe key to probe_compress_bindings. All conditions then go through GetReferencedBindings, so join keys are never compressed. Build-side payload compression and aggregate/order/distinct CM stay unchanged. Check with EXPLAIN that q09's orders scan and q03's lineitem scan show a BF. Run the bench at least twice and report per-template medians.",
+  "target_files": [
+    "src/optimizer/compressed_materialization/compress_comparison_join.cpp"
+  ],
+  "expected_gain": "q09 -10..-15%, q03 -5..-12%, about -1.5..-2% geomean",
+  "generality": "Any hash join whose probe key would have been compressed by CM, which is every single-equality integer join feeding a materializing operator. All of them regain BF pushdown into the probe scan. Joins with a big build side lose a little memory saving from narrower keys. q13 adds an aggregate compress projection above the join (~0.58s CPU), so it could be slightly slower.",
+  "risk": "Low. It removes an optimization and touches no execution code, and it was already verified correct on all templates with hidden validation ok. The main risk is bench noise.",
+  "status": "open",
+  "filed": "g2r2"
+}

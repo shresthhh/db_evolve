@@ -1,0 +1,41 @@
+{
+  "id": "E0025",
+  "title": "Exact BF bitmap up to 2^27 bits when 1024 bits/key allows",
+  "started": "2026-11-24T22:50:13-05:00",
+  "base": "3145ec5c2755703a486765dfeac0382578496d96",
+  "candidate": "1ae5e638b50a6a1dc84c7545fbe474434a7c0445",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q05 -18.2%; needs at least -20.3%)",
+    "visible geomean got slower (+0.5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.31631239999999994,
+  "summary": "I added a middle tier to TrySetExactBloomFilter in physical_hash_join.cpp. A join filter can now use the exact bitmap when the key range is below min(2^27 bits, which is 16MB, and count\u00d71024 bits). The existing 128 bits/key rule, the 2^22 small-range floor and the 2^32 max guard are unchanged. The multiplication only happens when count \u2264 2^17, so it can't overflow; above that the 2^27 cap applies directly. I also updated the comment about memory. Exact-bitmap building, probing and the CM offset path already handle ranges up to 2^32, so nothing else changed. Build OK and result checks passed. Bench against best across 3 runs: q05 -9.1%, -18.3%, -20.5%. q04 went -14.8%, +14.2%, +1.0%, and q09 went +11.0%, +1.7%, +2.0%; both swing both ways, so I read them as noise. The first full-suite run had a geomean of -1.8%, with q03 -6% and q16 -5% there. I did not profile q05, so I haven't confirmed directly that its lineitem filter is now exact or that scan CPU fell to about 0.48s. The consistent q05 gain fits the hypothesis.",
+  "notes": "The only gain I saw consistently is q05. q04 and q09 swung between -15% and +14% across reruns, which is bench noise. Worth checking in the full timing run that q09 does not regress. Follow-up idea: a sparse two-level or blocked exact bitmap for ranges above 2^27.",
+  "train_ratio": 1.004593136917503,
+  "val_ratio": 0.9938274068428444,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0500571059030381,
+    "q03": 1.0262056566666136,
+    "q04": 1.0261255125015918,
+    "q05": 0.8182394671390811,
+    "q07": 1.021603829401172,
+    "q08": 1.0448549243648757,
+    "q09": 1.0196533828155379,
+    "q13": 1.0040346020734716,
+    "q14": 1.0166738206334842,
+    "q16": 1.0237516449164927,
+    "q17": 0.9864351083077347,
+    "q18": 1.0074153477299899,
+    "q19": 1.0479145560487728,
+    "q22": 0.9949830992965004
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T23:05:14-05:00"
+}

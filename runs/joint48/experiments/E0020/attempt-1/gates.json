@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "General mechanism: an exact-bitmap BF is now pushed to probe scans whose join key column was compressed by CM as (value - offset). No query, table, literal or data-size specific conditions.",
+      "bloom_filter.cpp TemplatedLookupExact/FilterValue: the probe subtracts key_offset modulo 2^64 from the sign/zero-extended storage value. Because storage = key + offset (join_filter_pushdown.hpp:30, JoinFilterValueToStorage), every true member maps exactly to its HT key, so there are no false negatives. Wraparound only yields false positives, which the join discards. Holds for negative offsets and for signed/unsigned storage.",
+      "TemplatedCheckStatisticsExact shifts the filter's key range into T and returns NO_PRUNING_POSSIBLE when the shifted range does not round-trip or wraps, so zonemap pruning stays sound. The small-range enumeration also subtracts the offset.",
+      "physical_hash_join.cpp: the new branch builds the exact range from the raw (pre-offset) HT min/max and defers the push only if IsExact(). PushBloomFilter refuses a non-exact filter or a non-computable offset whenever an offset column is present, so a hashed BF is never pushed through an offset. Several probe targets on one join each get their own offset (0 when there is none).",
+      "Copy and Serialize/Deserialize carry key_offset (property 203 with a default, so older serialized filters still read). Equals always returns false, as it did before. ToExpression returns constant true, as before. The diff is small and stays on the stated idea."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/function/table/table_scan.cpp: the merge applies to any table scan that has table filters and returns a chunk with fewer than STANDARD_VECTOR_SIZE/8 rows. It fills a buffer up to STANDARD_VECTOR_SIZE/2 rows. These limits are general and scale with the vector size, and nothing in the code refers to particular tables, columns or queries. This is the same idea as compacting small chunks in standard vectorized engines.",
+      "Batch index and order: batch_index changes only inside RowGroupCollection::NextParallelScan (row_group_collection.cpp:327). CollectionScanState::Scan and DataTable::Scan never advance to another parallel range. Since CoalesceSparse never calls NextParallelScan, every row it merges, plus any pending chunk, carries the same batch index that TableScanGetPartitionData reports. Order-preserving and batch-based sinks therefore stay correct.",
+      "Range end: a 0-row result from ScanChunk means the range is used up, which matches the original loop's meaning. The `range_exhausted` flag then skips one scan call so the next call moves straight to NextParallelScan. `has_pending` and `range_exhausted` are never both set.",
+      "Buffer lifetimes: in the path that drops filter-only columns, the output and scratch chunks point into all_columns. accum.Append copies their data before ScanChunk resets all_columns. A pending scratch chunk stays valid across calls, because nothing touches all_columns until the next ScanChunk, and that runs only after the pending rows have been copied or emitted.",
+      "Vector types: DataChunk::Append goes through VectorOperations::Copy, which decompresses FSST vectors (vector_copy.cpp:110) and flattens dictionary and constant vectors. NULL validity is copied as well. Other types, NULLs and rowid columns are handled the same way.",
+      "Minor: the CurrentBatchIndex comparison inside the loop can never fire, because the batch cannot change inside one range. It is a harmless defensive check.",
+      "Cost is not moved elsewhere: the only new work is copying rows that already passed the filter in sparse chunks. Per-thread memory grows by two vector-sized chunks. Thread counts, settings and timing are untouched."
+    ],
+    "required_changes": []
+  }
+}

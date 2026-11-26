@@ -1,0 +1,54 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index 5224726..8a396a2 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -385,7 +385,7 @@ SinkCombineResultType PhysicalHashJoin::Combine(ExecutionContext &context, Opera
+ // Finalize
+ //===--------------------------------------------------------------------===//
+ 
+-static constexpr idx_t PARALLEL_CONSTRUCT_THRESHOLD = 1048576;
++static constexpr idx_t PARALLEL_CONSTRUCT_THRESHOLD = 65536;
+ static constexpr double SKEW_SINGLE_THREADED_THRESHOLD = 0.33;
+ 
+ //! If the data is very skewed (many of the exact same key), our finalize will become slow,
+@@ -399,7 +399,7 @@ static bool KeysAreSkewed(const HashJoinGlobalSinkState &sink) {
+ }
+ 
+ //! If we have only one thread, always finalize single-threaded. Otherwise, we finalize in parallel if we
+-//! have more than 1M rows or if we want to verify parallelism.
++//! have more than 64K rows or if we want to verify parallelism.
+ static bool FinalizeSingleThreaded(const HashJoinGlobalSinkState &sink, const bool consider_skew) {
+ 	// if only one thread, finalize single-threaded
+ 	const auto num_threads = NumericCast<idx_t>(sink.num_threads);
+@@ -412,7 +412,7 @@ static bool FinalizeSingleThreaded(const HashJoinGlobalSinkState &sink, const bo
+ 		return false;
+ 	}
+ 
+-	// finalize single-threaded if we have less than 1M rows
++	// finalize single-threaded if we have less than 64K rows
+ 	const auto &ht = *sink.hash_table;
+ 	const bool ht_is_small = ht.Count() < PARALLEL_CONSTRUCT_THRESHOLD;
+ 
+@@ -574,7 +574,13 @@ public:
+ 			    make_uniq<HashJoinFinalizeTask>(shared_from_this(), context, sink, 0U, chunk_count, false, sink.op));
+ 		} else {
+ 			// Parallel finalize
+-			const idx_t chunks_per_task = context.config.verify_parallelism ? 1 : CHUNKS_PER_TASK;
++			// aim for ~4 tasks per thread, bounded so medium builds still spread over all threads
++			const auto num_threads = NumericCast<idx_t>(sink.num_threads);
++			const idx_t chunks_per_task =
++			    context.config.verify_parallelism
++			        ? 1
++			        : MaxValue<idx_t>(MinValue<idx_t>(chunk_count / (4 * num_threads), CHUNKS_PER_TASK),
++			                          MIN_CHUNKS_PER_TASK);
+ 			for (idx_t chunk_idx = 0; chunk_idx < chunk_count; chunk_idx += chunks_per_task) {
+ 				auto chunk_idx_to = MinValue<idx_t>(chunk_idx + chunks_per_task, chunk_count);
+ 				finalize_tasks.push_back(make_uniq<HashJoinFinalizeTask>(shared_from_this(), context, sink, chunk_idx,
+@@ -593,6 +599,7 @@ public:
+ 	}
+ 
+ 	static constexpr idx_t CHUNKS_PER_TASK = 64;
++	static constexpr idx_t MIN_CHUNKS_PER_TASK = 4;
+ };
+ 
+ class PerfectHashJoinBuildTask : public ExecutorTask {

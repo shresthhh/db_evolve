@@ -1,0 +1,49 @@
+{
+  "id": "E0018",
+  "title": "Rerun: Stop compressing hash-join keys in compressed materialization",
+  "started": "2026-11-24T11:52:29-05:00",
+  "base": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "candidate": "f87263f84b54b3e0527dde986b24e9bff1d47faf",
+  "outcome": "retired",
+  "reasons": [
+    "q14 slower by 11.6% (18 ms), beyond its 5.1% threshold",
+    "q16 slower by 11.2% (19 ms), beyond its 7.9% threshold",
+    "q18 slower by 5.3% (28 ms), beyond its 5.0% threshold",
+    "no visible template faster beyond its noise (best: q09 -5.2%; needs at least -8.6%)",
+    "visible geomean got slower (+3.0%)",
+    "hidden validation templates got slower than their noise allows"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.3343562,
+  "summary": "Reapplied E0017. In CompressedMaterialization::CompressComparisonJoin I removed the block that compressed both columns of a single equality condition the same way and put the probe key into probe_compress_bindings. Every condition now goes through GetReferencedBindings, and every probe-side binding is marked as referenced, so join keys are never compressed. Build-side payload compression and aggregate/order/distinct CM are unchanged. EXPLAIN ANALYZE of q09.m0 shows the orders scan now gets `o_orderkey IN BF(l_orderkey)` and reads 2.94M rows (it read 15M before). Full bench, run 1: q09 -14.8%, q04 -10.7%, q03 -6.2%, q05 -5.4%, geomean -1.2%; q02 +8%, q19 +6.6%, q18 +6.1% and q08 +6.1% were slower. Run 2: q02 -20.8%, q14 -14.7%, q09 -13.4%, q04 -12.9%, q03 -12.4%, q07 -10.1%, q13 -6.2%, geomean -5.2%; q18 +15.2%, q19 +13.4% and q22 +5.4% were slower. Separate runs of q18/q19 only: q18 -5.3% and +0.6%, q19 -2.4% and +1.5%.",
+  "notes": "The bench is very noisy: q02 measured +8% in one run and -21% in the next on identical code. q18 was slower in both full runs (+6% and +15%), but in two separate q18/q19 runs it was -5.3% and +0.6%, so it is probably noise. Still, q18 is the template most likely to look like a regression in the harness, because its large lineitem/orders build side loses the narrower keys. If q18 does regress for real, a follow-up could keep key compression when the probe side can't receive join filters, or teach BF pushdown to work through the compress offset (an earlier memory notes exact BF through a CM offset already exists for some paths).",
+  "train_ratio": 1.0300609028340475,
+  "val_ratio": 1.0394703389167603,
+  "val_ok": false,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9963603745551887,
+    "q03": 1.002030440595645,
+    "q04": 0.9706187306972038,
+    "q05": 0.9985056444441079,
+    "q07": 1.037946329509599,
+    "q08": 0.9846289256831893,
+    "q09": 0.9478905921809894,
+    "q13": 1.0650028803368685,
+    "q14": 1.1162736299466824,
+    "q16": 1.1123613732086115,
+    "q17": 1.0524785258278164,
+    "q18": 1.0525638569991007,
+    "q19": 1.0574639556529983,
+    "q22": 1.0425185101855854
+  },
+  "improved": [],
+  "regressed": [
+    "q14",
+    "q16",
+    "q18"
+  ],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T12:12:47-05:00"
+}

@@ -1,0 +1,41 @@
+{
+  "id": "E0019",
+  "title": "Deliminate selective-LHS SEMI delim joins with simple RHS + join filters for RIGHT_SEMI/RIGHT_ANTI",
+  "started": "2026-11-24T20:31:16-05:00",
+  "base": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "candidate": "e7d04266ab438c8b263c4a9ebd43205c1cf592c8",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q04 -9.8%; needs at least -20.7%)",
+    "visible geomean got slower (+0.0%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.5617652,
+  "summary": "q04 got 8.7%, 13.0% and 16.5% faster across three bench runs (about 237\u2192216, 252\u2192219 and 239\u2192199 ms). Everything else was within noise: q09 was +8.4% in the first full run but +2.4% on rerun, and q16 went from +5.3% to +0.2%. The full-bench geomean was -0.6%. The tree builds, and the change is ready to judge.\n\nWhat changed:\n(1) deliminator.cpp: a new static helper, SelectionIsReplaceableByJoinFilter, lets Optimize remove the DelimGet join even when the outer side has a filter. It applies only when all of these hold:\n- the delim join is SEMI;\n- there is exactly one DelimGet and one join with it;\n- that join is INNER or SEMI, with only `=` conditions between plain column refs;\n- the subquery side contains only projections, filters, table scans, DelimGets and INNER/SEMI comparison joins.\nIn that case the delim join becomes a plain SEMI join.\n(2) Extra step not in the plan: the remaining join kept `IS NOT DISTINCT FROM`, and join filter pushdown skips that comparison, so nothing was pushed at first. Deliminating already adds `IS NOT NULL` on the column that replaces the DelimGet column. So on this path I switch a condition to `=` when its right side is a column ref that is, or passes through projections to, one of those non-null columns. For a SEMI join, `=` and `IS NOT DISTINCT FROM` give the same rows when the right side can't be NULL.\n(3) join_filter_pushdown_optimizer.cpp: removed RIGHT_SEMI and RIGHT_ANTI from the GenerateJoinFilters bail-out. Both output only build rows, so dropping probe rows that cannot match is safe. I found no other join-type gate in the physical hash join's filter pushdown code.\n\nq04 plan now: a plain RIGHT_SEMI hash join on `o_orderkey = o_orderkey`, and min/max dynamic filters reach the lineitem scan. The Bloom filter does not: compressed materialization compresses the join key, and FinalizeFilters skips the Bloom filter whenever the pushed column has a storage offset or a type cast. So about 37.9M lineitem rows still reach the join instead of the planned ~2.3M. The gain comes from removing the DISTINCT agg and the second join.\n\nCorrectness checks: hand-built VALUES tables with NULLs on both sides for EXISTS, NOT EXISTS, IN and a multi-join subquery gave correct results. On the benchmark data I ran six queries:\n- q04-style EXISTS and NOT EXISTS;\n- a q21-style EXISTS with `<>` (keeps the old path);\n- customer/orders EXISTS;\n- EXISTS over a two-table join in the subquery;\n- EXISTS whose correlation key is NULL on some rows.\nAll six counts matched `SET disabled_optimizers='join_filter_pushdown,deliminator'`. bench's result check passed on all visible templates. I did not run the sqllogictests the issue suggested; I only have access to bench, profile and sql.",
+  "notes": "The biggest remaining gain on q04 is getting the Bloom filter through the compressed-materialization projection. Compressed materialization turns the join key into a UINTEGER with an offset, so the Bloom filter is skipped (`has_cast` / `storage_offset` check in physical_hash_join.cpp FinalizeFilters). The memory note on the exact Bloom filter through the offset describes a port: BFTableFilter key offset plus exact-bitmap mode built from the raw compressed min/max. It needs a header change and is a separate idea. It should cut the lineitem probe from 37.9M to about 2.3M rows. Also, without step (2) the deliminated plan had no join filters at all, because delim join conditions are `IS NOT DISTINCT FROM`.",
+  "train_ratio": 1.000043325274673,
+  "val_ratio": 1.0082020362515116,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9534043964330426,
+    "q03": 1.027963562278809,
+    "q04": 0.9022961191477304,
+    "q05": 1.0013808940748676,
+    "q07": 0.9924612669004121,
+    "q08": 0.9978317112568271,
+    "q09": 1.0020140495232386,
+    "q13": 1.0446377757825207,
+    "q14": 1.0153246784234244,
+    "q16": 1.0305999313059913,
+    "q17": 1.0035039952792615,
+    "q18": 1.0408430012926897,
+    "q19": 0.9940185249114765,
+    "q22": 1.0033579321722113
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T20:52:58-05:00"
+}

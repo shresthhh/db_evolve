@@ -1,0 +1,24 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "General mechanism. An exact bitmap is used in place of the hashed Bloom filter when the build keys are 8..64-bit integers and range < min(2^32, 128*build_rows). No query, table or literal is recognised; dense surrogate and foreign keys are a common, natural class.",
+      "Guards look correct. NULLs-equal joins are excluded. Left, right and HT key types must match, and probe-side type mismatches pass everything through. NULL probe keys miss, and FilterValue returns !filters_null_values for NULL. CheckStatistics only returns ALWAYS_FALSE when NULLs cannot pass. An out-of-range insert sets an overflow flag that disables filtering. Signed keys are sign-extended on both the build and probe sides, so negative ranges work. The range is computed in uint64 after a typed min<=max check.",
+      "Parallel fill uses an atomic fetch_or. The filter is pushed only in HashJoinFinalizeEvent::FinishEvent, after all inserts. External (spilling) joins never reach FinalizeFilters, so a partial build cannot happen.",
+      "Probe handles sel correctly. Flat vectors are indexed through sel, and other vector types (sequence, dictionary, constant) are sliced first. The bf_sel indices are candidate positions, which matches the existing sel translation code.",
+      "Minor (maintainability): physical_hash_join.cpp calls TrySetExactBloomFilter(*ht, op, min_val, max_val) after min_val and max_val have been std::move'd into ConstantFilters. It only works because DuckDB's Value and LogicalType move constructors copy id, is_null and the value union. It would be cleaner to call it before the moves or pass copies. This is not a correctness failure for the gated integer types.",
+      "Memory: the bitmap is at most 512MB (2^32 bits). That is bounded by the pointer-table size for the same build count, and it uses the same allocator as the existing BF. This is acceptable."
+    ],
+    "required_changes": []
+  }
+}

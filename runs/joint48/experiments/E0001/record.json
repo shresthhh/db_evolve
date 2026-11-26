@@ -1,0 +1,40 @@
+{
+  "id": "E0001",
+  "title": "Run JoinDependentFilterRule before DistributivityRule",
+  "started": "2026-11-24T03:10:10-05:00",
+  "base": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "candidate": "b34cc9b9af5b5284490535433a0936d506a297a0",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.2639312,
+  "summary": "In src/optimizer/optimizer.cpp I moved the JoinDependentFilterRule registration to just before DistributivityRule. Nothing else changed. Before, DistributivityRule pulled the shared join-key equality out of the root OR first, so JoinDependentFilterRule never saw an OR and derived no per-table filters. With the new order it derives the per-table OR filters, and they get pushed down to the scans. The build is OK and bench results match. Bench, best vs mine: q19 378\u2192204ms (-45.9%), then 353\u2192185ms (-47.6%) on a rerun. Visible geomean -4.6%. No other template moved beyond noise. q04 showed +5.5% and +5.1% on two runs, then -3.6% on a third. q04 has no OR predicate, so the rule cannot touch its plan, which means this is noise. I did not run the optimizer unit tests (test/optimizer/*) or plan-snapshot tests, because only dbe-tool can be run here.",
+  "notes": "This repeats an earlier run's result (q19 -53% then, -46..-48% now). A follow-up could check whether DistributivityRule's factoring should keep the derived filters for nested ORs below an AND root; currently the rule only fires on a root OR.",
+  "train_ratio": 0.9576492913932233,
+  "val_ratio": 1.0095655608589686,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9649646250942242,
+    "q03": 0.9959264413120807,
+    "q04": 0.9878096908288087,
+    "q05": 0.9884926529449423,
+    "q07": 0.9929294907004236,
+    "q08": 1.0269867210538377,
+    "q09": 0.9783877660701262,
+    "q13": 1.0098782810090838,
+    "q14": 1.0027625891802112,
+    "q16": 0.973385155584547,
+    "q17": 1.1082348970948532,
+    "q18": 1.0132075814660322,
+    "q19": 0.5212916369271401,
+    "q22": 1.0100627705755194
+  },
+  "improved": [
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T03:23:55-05:00"
+}

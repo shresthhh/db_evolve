@@ -4,7 +4,7 @@
 [project]
 work_dir = "work"        # clones, builds, data, artifacts (large, regenerable)
 runs_dir = "runs"        # one directory per evolution run (ledger, experiments)
-results_dir = "results"  # release evaluations and plots
+results_dir = "results/sfstudy"  # scale-factor study results apart from the SF 10 ones
 
 [engine]
 name = "duckdb"

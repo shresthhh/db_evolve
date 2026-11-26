@@ -1,0 +1,151 @@
+diff --git a/src/include/duckdb/storage/block_allocator.hpp b/src/include/duckdb/storage/block_allocator.hpp
+index 0830c2a..8b3abd9 100644
+--- a/src/include/duckdb/storage/block_allocator.hpp
++++ b/src/include/duckdb/storage/block_allocator.hpp
+@@ -21,6 +21,7 @@ class AttachedDatabase;
+ class DatabaseInstance;
+ class BlockAllocatorThreadLocalState;
+ struct BlockQueue;
++struct FallbackBlockCache;
+ 
+ class BlockAllocator {
+ 	friend class BlockAllocatorThreadLocalState;
+@@ -62,6 +63,12 @@ private:
+ 	void FreeInternal(idx_t extra_memory) const;
+ 	void FreeContiguousBlocks(uint32_t block_id_start, uint32_t block_id_end_including) const;
+ 
++	//! Try to reuse / retain a block-sized allocation of the fallback allocator
++	data_ptr_t TryAllocateFromFallbackCache() const;
++	bool TryFreeToFallbackCache(data_ptr_t pointer) const;
++	//! Return all retained fallback blocks to the fallback allocator
++	void FlushFallbackCache() const;
++
+ private:
+ 	//! Identifier
+ 	const hugeint_t uuid;
+@@ -87,6 +94,8 @@ private:
+ 	unsafe_unique_ptr<BlockQueue> untouched;
+ 	//! Touched by block IDs
+ 	unsafe_unique_ptr<BlockQueue> touched;
++	//! Small bounded cache of freed block-sized allocations of the fallback allocator (used when the pool is not)
++	unsafe_unique_ptr<FallbackBlockCache> fallback_cache;
+ 
+ 	//! Token used to indicate whether current BlockAllocator is alive.
+ 	shared_ptr<atomic<bool>> alive_token;
+diff --git a/src/storage/block_allocator.cpp b/src/storage/block_allocator.cpp
+index b9159da..92d48e8 100644
+--- a/src/storage/block_allocator.cpp
++++ b/src/storage/block_allocator.cpp
+@@ -88,6 +88,17 @@ struct BlockQueue {
+ 	duckdb_moodycamel::ConcurrentQueue<uint32_t> q;
+ };
+ 
++//! Freed block-sized allocations of the fallback allocator, kept for immediate reuse.
++//! Operators that churn through many short-lived blocks (e.g., partitioned hash tables that repeatedly
++//! abandon / repartition their data) otherwise pay for a large-size alloc/free in the general-purpose
++//! allocator on every block, which gets markedly slower once its arenas are shared with many long-lived blocks.
++//! The cache is bounded, only ever holds memory that was just released, and is emptied on flush.
++struct FallbackBlockCache {
++	static constexpr idx_t CAPACITY_BYTES = 64ULL * 1024ULL * 1024ULL;
++	duckdb_moodycamel::ConcurrentQueue<data_ptr_t> q;
++	atomic<idx_t> count {0};
++};
++
+ class BlockAllocatorThreadLocalState {
+ public:
+ 	explicit BlockAllocatorThreadLocalState(const BlockAllocator &block_allocator_p) {
+@@ -220,7 +231,7 @@ BlockAllocator::BlockAllocator(Allocator &allocator_p, const idx_t block_size_p,
+       block_size_div_shift(CountZeros<idx_t>::Trailing(block_size)),
+       virtual_memory_size(AlignValue(virtual_memory_size_p, block_size)), virtual_memory_space(nullptr),
+       physical_memory_size(0), untouched(make_unsafe_uniq<BlockQueue>()), touched(make_unsafe_uniq<BlockQueue>()),
+-      alive_token(make_shared_ptr<atomic<bool>>(true)) {
++      fallback_cache(make_unsafe_uniq<FallbackBlockCache>()), alive_token(make_shared_ptr<atomic<bool>>(true)) {
+ 	D_ASSERT(IsPowerOfTwo(block_size));
+ 	Resize(physical_memory_size_p);
+ }
+@@ -228,6 +239,11 @@ BlockAllocator::BlockAllocator(Allocator &allocator_p, const idx_t block_size_p,
+ BlockAllocator::~BlockAllocator() {
+ 	alive_token->store(false);
+ 	GetBlockAllocatorThreadLocalState(*this).Clear();
++	try {
++		FlushFallbackCache();
++	} catch (...) {
++		// Not allowed to throw in destructor!
++	}
+ 	if (IsActive()) {
+ 		try {
+ 			FreeVirtualMemory(virtual_memory_space, virtual_memory_size);
+@@ -320,8 +336,47 @@ data_ptr_t BlockAllocator::GetPointer(const uint32_t block_id) const {
+ 	return virtual_memory_space.load(std::memory_order_relaxed) + NumericCast<idx_t>(block_id) * block_size;
+ }
+ 
++data_ptr_t BlockAllocator::TryAllocateFromFallbackCache() const {
++	auto &cache = *fallback_cache;
++	if (cache.count.load(std::memory_order_relaxed) == 0) {
++		return nullptr;
++	}
++	data_ptr_t pointer;
++	if (!cache.q.try_dequeue(pointer)) {
++		return nullptr;
++	}
++	--cache.count;
++	return pointer;
++}
++
++bool BlockAllocator::TryFreeToFallbackCache(const data_ptr_t pointer) const {
++	auto &cache = *fallback_cache;
++	const auto capacity = MaxValue<idx_t>(FallbackBlockCache::CAPACITY_BYTES / block_size, 1);
++	if (cache.count.fetch_add(1) >= capacity) {
++		--cache.count;
++		return false;
++	}
++	cache.q.enqueue(pointer);
++	return true;
++}
++
++void BlockAllocator::FlushFallbackCache() const {
++	auto &cache = *fallback_cache;
++	data_ptr_t pointer;
++	while (cache.count.load(std::memory_order_relaxed) != 0 && cache.q.try_dequeue(pointer)) {
++		--cache.count;
++		allocator.FreeData(pointer, block_size);
++	}
++}
++
+ data_ptr_t BlockAllocator::AllocateData(const idx_t size) const {
+ 	if (!IsActive() || !IsEnabled() || size != block_size) {
++		if (size == block_size) {
++			const auto pointer = TryAllocateFromFallbackCache();
++			if (pointer) {
++				return pointer;
++			}
++		}
+ 		return allocator.AllocateData(size);
+ 	}
+ 	return GetBlockAllocatorThreadLocalState(*this).Allocate();
+@@ -329,6 +384,9 @@ data_ptr_t BlockAllocator::AllocateData(const idx_t size) const {
+ 
+ void BlockAllocator::FreeData(const data_ptr_t pointer, const idx_t size) const {
+ 	if (!IsActive() || !IsInPool(pointer)) {
++		if (size == block_size && TryFreeToFallbackCache(pointer)) {
++			return;
++		}
+ 		return allocator.FreeData(pointer, size);
+ 	}
+ 	D_ASSERT(size == block_size);
+@@ -357,6 +415,7 @@ bool BlockAllocator::SupportsFlush() const {
+ }
+ 
+ void BlockAllocator::ThreadFlush(bool allocator_background_threads, idx_t threshold, idx_t thread_count) const {
++	FlushFallbackCache();
+ 	if (IsActive() && IsEnabled()) {
+ 		GetBlockAllocatorThreadLocalState(*this).Clear();
+ 	}
+@@ -366,6 +425,7 @@ void BlockAllocator::ThreadFlush(bool allocator_background_threads, idx_t thresh
+ }
+ 
+ void BlockAllocator::FlushAll(const optional_idx extra_memory) const {
++	FlushFallbackCache();
+ 	if (IsActive() && IsEnabled() && extra_memory.IsValid()) {
+ 		FreeInternal(extra_memory.GetIndex());
+ 	}

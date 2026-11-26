@@ -1,0 +1,395 @@
+diff --git a/src/execution/operator/join/perfect_hash_join_executor.cpp b/src/execution/operator/join/perfect_hash_join_executor.cpp
+index 1531f6f..06052df 100644
+--- a/src/execution/operator/join/perfect_hash_join_executor.cpp
++++ b/src/execution/operator/join/perfect_hash_join_executor.cpp
+@@ -117,8 +117,7 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ 		return false;
+ 	}
+ 	perfect_join_statistics.build_range = NumericCast<idx_t>(build_range);
+-	if (perfect_join_statistics.build_range > MAX_BUILD_SIZE &&
+-	    (!PropagatesBuildSide(op.join_type) || ht.Count() * 2 < perfect_join_statistics.build_range + 1)) {
++	if (perfect_join_statistics.build_range > MAX_BUILD_SIZE && ht.Count() * 2 < perfect_join_statistics.build_range + 1) {
+ 		return false;
+ 	}
+ 
+@@ -134,6 +133,14 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
+ //===--------------------------------------------------------------------===//
+ // Build
+ //===--------------------------------------------------------------------===//
++//! Builds with at least this many rows are built by parallel tasks instead of inside the sink finalize
++static constexpr idx_t PARALLEL_BUILD_MIN_ROWS = 65536;
++//! HT data chunks per parallel key-insert task
++static constexpr idx_t CHUNKS_PER_BUILD_TASK = 16;
++//! Slots per parallel payload-gather task (a multiple of the validity entry size)
++static constexpr idx_t SLOTS_PER_GATHER_TASK = 131072;
++static_assert(SLOTS_PER_GATHER_TASK % ValidityMask::BITS_PER_VALUE == 0, "tasks must not share validity entries");
++
+ bool PerfectHashJoinExecutor::BuildPerfectHashTable(LogicalType &key_type) {
+ 	// First, allocate memory for each build column
+ 	const auto build_size = perfect_join_statistics.build_range + 1;
+@@ -145,10 +152,192 @@ bool PerfectHashJoinExecutor::BuildPerfectHashTable(LogicalType &key_type) {
+ 	bitmap_build_idx.Initialize(build_size);
+ 	bitmap_build_idx.SetAllInvalid(build_size);
+ 
++	if (ht.Count() >= PARALLEL_BUILD_MIN_ROWS) {
++		// Large build: the keys are inserted by parallel tasks (BuildTask), the duplicate check is done in FinishBuild
++		build_bits = make_unsafe_uniq_array<atomic<validity_t>>(ValidityMask::EntryCount(build_size));
++		for (idx_t i = 0; i < ValidityMask::EntryCount(build_size); i++) {
++			build_bits[i].store(0, std::memory_order_relaxed);
++		}
++		slot_to_row = make_unsafe_uniq_array_uninitialized<data_ptr_t>(build_size);
++		parallel_unique_keys = 0;
++		parallel_has_duplicates = false;
++		const auto chunk_count = ht.GetDataCollection().ChunkCount();
++		build_task_count = (chunk_count + CHUNKS_PER_BUILD_TASK - 1) / CHUNKS_PER_BUILD_TASK;
++		return true;
++	}
++
+ 	// Now fill columns with build data
+ 	return FullScanHashTable(key_type);
+ }
+ 
++template <class T>
++static bool InsertPerfectHashKeys(Vector &keys, const idx_t count, const data_ptr_t *rows, const T min_value,
++                                  const T max_value, atomic<validity_t> *bits, data_ptr_t *slot_to_row,
++                                  idx_t &unique_count) {
++	UnifiedVectorFormat vector_data;
++	keys.ToUnifiedFormat(count, vector_data);
++	const auto data = vector_data.GetData<T>();
++	for (idx_t i = 0; i < count; i++) {
++		const auto data_idx = vector_data.sel->get_index(i);
++		if (!vector_data.validity.RowIsValid(data_idx)) {
++			// NULL keys are only kept for joins that propagate the build side, they never match
++			continue;
++		}
++		const auto input_value = data[data_idx];
++		if (input_value < min_value || input_value > max_value) {
++			continue;
++		}
++		const auto slot = UnsafeNumericCast<idx_t>(input_value - min_value);
++		const auto bit = validity_t(1) << (slot % ValidityMask::BITS_PER_VALUE);
++		const auto previous = bits[slot / ValidityMask::BITS_PER_VALUE].fetch_or(bit, std::memory_order_relaxed);
++		if (previous & bit) {
++			return false; // duplicate key
++		}
++		slot_to_row[slot] = rows[i];
++		unique_count++;
++	}
++	return true;
++}
++
++template <class T>
++void PerfectHashJoinExecutor::TemplatedBuildTask(idx_t chunk_idx_from, idx_t chunk_idx_to) {
++	auto &data_collection = ht.GetDataCollection();
++	const auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<T>();
++	const auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<T>();
++	Vector keys(ht.equality_types[0]);
++	const auto &incremental_sel = *FlatVector::IncrementalSelectionVector();
++
++	TupleDataChunkIterator iterator(data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
++	                                chunk_idx_to, false);
++	const auto row_locations = iterator.GetRowLocations();
++	idx_t unique_count = 0;
++	do {
++		const auto count = iterator.GetCurrentChunkCount();
++		auto &row_location_vector = iterator.GetChunkState().row_locations;
++		// Gather only marks NULLs, so reset the validity of the previous chunk first
++		FlatVector::Validity(keys).Reset();
++		data_collection.Gather(row_location_vector, incremental_sel, count, 0, keys, incremental_sel, nullptr);
++		if (!InsertPerfectHashKeys<T>(keys, count, row_locations, min_value, max_value, build_bits.get(),
++		                              slot_to_row.get(), unique_count)) {
++			parallel_has_duplicates = true;
++			return;
++		}
++	} while (!parallel_has_duplicates && iterator.Next());
++	parallel_unique_keys += unique_count;
++}
++
++void PerfectHashJoinExecutor::BuildTask(idx_t task_idx) {
++	const auto chunk_count = ht.GetDataCollection().ChunkCount();
++	const auto chunk_idx_from = task_idx * CHUNKS_PER_BUILD_TASK;
++	const auto chunk_idx_to = MinValue<idx_t>(chunk_idx_from + CHUNKS_PER_BUILD_TASK, chunk_count);
++	if (chunk_idx_from >= chunk_idx_to || parallel_has_duplicates) {
++		return;
++	}
++	switch (ht.equality_types[0].InternalType()) {
++	case PhysicalType::INT8:
++		return TemplatedBuildTask<int8_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::INT16:
++		return TemplatedBuildTask<int16_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::INT32:
++		return TemplatedBuildTask<int32_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::INT64:
++		return TemplatedBuildTask<int64_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::INT128:
++		return TemplatedBuildTask<hugeint_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::UINT8:
++		return TemplatedBuildTask<uint8_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::UINT16:
++		return TemplatedBuildTask<uint16_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::UINT32:
++		return TemplatedBuildTask<uint32_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::UINT64:
++		return TemplatedBuildTask<uint64_t>(chunk_idx_from, chunk_idx_to);
++	case PhysicalType::UINT128:
++		return TemplatedBuildTask<uhugeint_t>(chunk_idx_from, chunk_idx_to);
++	default:
++		throw NotImplementedException("Type not supported for perfect hash join");
++	}
++}
++
++bool PerfectHashJoinExecutor::FinishBuild() {
++	build_task_count = 0;
++	if (parallel_has_duplicates) {
++		build_bits.reset();
++		slot_to_row.reset();
++		return false;
++	}
++	const auto build_size = perfect_join_statistics.build_range + 1;
++	auto bitmap_data = bitmap_build_idx.GetData();
++	for (idx_t i = 0; i < ValidityMask::EntryCount(build_size); i++) {
++		bitmap_data[i] = build_bits[i].load(std::memory_order_relaxed);
++	}
++	build_bits.reset();
++	unique_keys = parallel_unique_keys;
++	if (unique_keys == build_size && !ht.has_null) {
++		perfect_join_statistics.is_build_dense = true;
++		bitmap_build_idx.Reset(build_size); // All valid
++	}
++
++	// The payload is gathered by GatherTask over disjoint slot ranges that are aligned to validity entries, so no two
++	// tasks write the same validity word. Slots without a build key are NULL, gathered NULLs are set by the tasks.
++	const auto column_count = join.rhs_output_columns.col_types.size();
++	for (idx_t i = 0; i < column_count; i++) {
++		auto &col_mask = FlatVector::Validity(perfect_hash_table[i]->data);
++		if (bitmap_build_idx.AllValid()) {
++			col_mask.Initialize(build_size);
++		} else {
++			col_mask.Copy(bitmap_build_idx, build_size);
++		}
++	}
++	gather_task_count = column_count == 0 ? 0 : (build_size + SLOTS_PER_GATHER_TASK - 1) / SLOTS_PER_GATHER_TASK;
++
++	if (PropagatesBuildSide(join.join_type)) {
++		// slot_to_row is kept so the matches found while probing can be written to the HT rows
++		slot_found_match = make_unsafe_uniq_array<uint8_t>(build_size);
++	} else if (gather_task_count == 0) {
++		slot_to_row.reset();
++	}
++	return true;
++}
++
++void PerfectHashJoinExecutor::GatherTask(idx_t task_idx) {
++	auto &data_collection = ht.GetDataCollection();
++	const auto build_size = perfect_join_statistics.build_range + 1;
++	const auto slot_begin = task_idx * SLOTS_PER_GATHER_TASK;
++	const auto slot_end = MinValue<idx_t>(slot_begin + SLOTS_PER_GATHER_TASK, build_size);
++	const auto column_count = join.rhs_output_columns.col_types.size();
++	const bool all_slots_valid = bitmap_build_idx.AllValid();
++
++	Vector addresses(LogicalType::POINTER);
++	auto address_data = FlatVector::GetData<data_ptr_t>(addresses);
++	const auto &incremental_sel = *FlatVector::IncrementalSelectionVector();
++	SelectionVector sel_slots(STANDARD_VECTOR_SIZE);
++	for (idx_t batch_begin = slot_begin; batch_begin < slot_end; batch_begin += STANDARD_VECTOR_SIZE) {
++		const auto batch_end = MinValue<idx_t>(batch_begin + STANDARD_VECTOR_SIZE, slot_end);
++		idx_t count = 0;
++		for (idx_t slot = batch_begin; slot < batch_end; slot++) {
++			if (all_slots_valid || bitmap_build_idx.RowIsValidUnsafe(slot)) {
++				sel_slots.set_index(count, slot);
++				address_data[count++] = slot_to_row[slot];
++			}
++		}
++		if (count == 0) {
++			continue;
++		}
++		for (idx_t i = 0; i < column_count; i++) {
++			auto &vector = perfect_hash_table[i]->data;
++			data_collection.Gather(addresses, incremental_sel, count, ht.output_columns[i], vector, sel_slots, nullptr);
++		}
++	}
++}
++
++void PerfectHashJoinExecutor::FinishGather() {
++	gather_task_count = 0;
++	if (!PropagatesBuildSide(join.join_type)) {
++		slot_to_row.reset();
++	}
++}
++
+ bool PerfectHashJoinExecutor::FullScanHashTable(LogicalType &key_type) {
+ 	auto &data_collection = ht.GetDataCollection();
+ 
+@@ -336,6 +525,18 @@ void PerfectHashJoinExecutor::FlushFoundMatch() {
+ 	}
+ 	D_ASSERT(PropagatesBuildSide(join.join_type));
+ 	const auto found_match = slot_found_match.get();
++	if (slot_to_row) {
++		// parallel build: the slot -> row mapping is kept per slot, matches are only found for slots with a key
++		const auto build_size = perfect_join_statistics.build_range + 1;
++		for (idx_t slot = 0; slot < build_size; slot++) {
++			if (found_match[slot]) {
++				Store<bool>(true, slot_to_row[slot] + ht.tuple_size);
++			}
++		}
++		slot_found_match.reset();
++		slot_to_row.reset();
++		return;
++	}
+ 	const auto addresses = FlatVector::GetData<data_ptr_t>(*build_tuple_addresses);
+ 	for (idx_t i = 0; i < build_key_count; i++) {
+ 		if (found_match[build_slot_sel.get_index(i)]) {
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index 90feade..b84de7d 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -185,6 +185,8 @@ public:
+ 	unique_ptr<JoinHashTable> hash_table;
+ 	//! The perfect hash join executor (if any)
+ 	unique_ptr<PerfectHashJoinExecutor> perfect_join_executor;
++	//! Min/max of the build keys, kept for the join filters while the perfect hash table is built in parallel
++	unique_ptr<DataChunk> perfect_filter_min_max;
+ 	//! Whether or not the hash table has been finalized
+ 	bool finalized;
+ 	//! The number of active local states
+@@ -593,6 +595,77 @@ public:
+ 	static constexpr idx_t CHUNKS_PER_TASK = 64;
+ };
+ 
++class PerfectHashJoinBuildTask : public ExecutorTask {
++public:
++	PerfectHashJoinBuildTask(shared_ptr<Event> event_p, ClientContext &context, PerfectHashJoinExecutor &executor_p,
++	                         idx_t task_idx_p, bool gather_p, const PhysicalOperator &op_p)
++	    : ExecutorTask(context, std::move(event_p), op_p), executor(executor_p), task_idx(task_idx_p),
++	      gather(gather_p) {
++	}
++
++	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
++		if (gather) {
++			executor.GatherTask(task_idx);
++		} else {
++			executor.BuildTask(task_idx);
++		}
++		event->FinishTask();
++		return TaskExecutionResult::TASK_FINISHED;
++	}
++	string TaskType() const override {
++		return "PerfectHashJoinBuildTask";
++	}
++
++private:
++	PerfectHashJoinExecutor &executor;
++	idx_t task_idx;
++	bool gather;
++};
++
++//! Builds the perfect hash table in parallel: first inserts the keys (BUILD), then gathers the payload (GATHER)
++class PerfectHashJoinBuildEvent : public BasePipelineEvent {
++public:
++	PerfectHashJoinBuildEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink, bool gather_p)
++	    : BasePipelineEvent(pipeline_p), sink(sink), gather(gather_p) {
++	}
++
++	HashJoinGlobalSinkState &sink;
++	bool gather;
++
++public:
++	void Schedule() override {
++		auto &context = pipeline->GetClientContext();
++		auto &executor = *sink.perfect_join_executor;
++		const auto task_count = gather ? executor.GatherTaskCount() : executor.BuildTaskCount();
++		vector<shared_ptr<Task>> tasks;
++		for (idx_t task_idx = 0; task_idx < task_count; task_idx++) {
++			tasks.push_back(
++			    make_uniq<PerfectHashJoinBuildTask>(shared_from_this(), context, executor, task_idx, gather, sink.op));
++		}
++		SetTasks(std::move(tasks));
++	}
++
++	void FinishEvent() override {
++		if (gather) {
++			sink.perfect_join_executor->FinishGather();
++			return;
++		}
++		auto &ht = *sink.hash_table;
++		const auto use_perfect_hash = sink.perfect_join_executor->FinishBuild();
++		if (sink.perfect_filter_min_max) {
++			sink.op.filter_pushdown->FinalizeFilters(sink.context, &ht, sink.op, std::move(sink.perfect_filter_min_max),
++			                                         use_perfect_hash, &sink.deferred_bloom_filters);
++		}
++		if (!use_perfect_hash) {
++			// duplicate keys: fall back to the regular hash join
++			sink.perfect_join_executor.reset();
++			sink.ScheduleFinalize(*pipeline, *this);
++		} else if (sink.perfect_join_executor->GatherTaskCount() > 0) {
++			InsertEvent(make_shared_ptr<PerfectHashJoinBuildEvent>(*pipeline, sink, true));
++		}
++	}
++};
++
+ void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event) {
+ 	if (hash_table->Count() == 0) {
+ 		hash_table->finalized = true;
+@@ -1206,6 +1279,15 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
+ 		use_perfect_hash = sink.perfect_join_executor->BuildPerfectHashTable(key_type);
+ 	}
+ 
++	if (use_perfect_hash && sink.perfect_join_executor->BuildTaskCount() > 0) {
++		// Large build: the perfect hash table is built in parallel, the join filters are created once it is known
++		// whether there were duplicate keys (which fall back to the regular hash join)
++		sink.perfect_filter_min_max = std::move(filter_min_max);
++		event.InsertEvent(make_shared_ptr<PerfectHashJoinBuildEvent>(pipeline, sink, false));
++		sink.finalized = true;
++		return SinkFinalizeType::READY;
++	}
++
+ 	if (filter_min_max) {
+ 		filter_pushdown->FinalizeFilters(context, &ht, *this, std::move(filter_min_max), use_perfect_hash,
+ 		                                 &sink.deferred_bloom_filters);
+diff --git a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+index 983dde4..c9dbd3b 100644
+--- a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
++++ b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+@@ -43,6 +43,19 @@ public:
+ 	bool BuildPerfectHashTable(LogicalType &type);
+ 	//! For joins that propagate the build side: mark the matched build rows as found in the HT
+ 	void FlushFoundMatch();
++	//! Large builds are built by parallel tasks: BuildTask inserts the keys of a range of HT chunks, FinishBuild
++	//! returns false if there were duplicate keys, then GatherTask fills the payload of a disjoint range of slots.
++	//! The task counts are 0 if the table was built serially in BuildPerfectHashTable.
++	idx_t BuildTaskCount() const {
++		return build_task_count;
++	}
++	void BuildTask(idx_t task_idx);
++	bool FinishBuild();
++	idx_t GatherTaskCount() const {
++		return gather_task_count;
++	}
++	void GatherTask(idx_t task_idx);
++	void FinishGather();
+ 
+ private:
+ 	void FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec, SelectionVector &probe_sel_vec,
+@@ -57,6 +70,8 @@ private:
+ 	bool TemplatedFillSelectionVectorBuild(Vector &source, SelectionVector &sel_vec, SelectionVector &seq_sel_vec,
+ 	                                       idx_t count);
+ 	bool FullScanHashTable(LogicalType &key_type);
++	template <class T>
++	void TemplatedBuildTask(idx_t chunk_idx_from, idx_t chunk_idx_to);
+ 
+ private:
+ 	const PhysicalHashJoin &join;
+@@ -75,6 +90,13 @@ private:
+ 	SelectionVector build_slot_sel;
+ 	SelectionVector build_tuple_sel;
+ 	idx_t build_key_count = 0;
++	//! For the parallel build: key bitmap (set atomically), the slot -> HT row mapping, and the task state
++	unsafe_unique_array<atomic<validity_t>> build_bits;
++	unsafe_unique_array<data_ptr_t> slot_to_row;
++	atomic<idx_t> parallel_unique_keys {0};
++	atomic<bool> parallel_has_duplicates {false};
++	idx_t build_task_count = 0;
++	idx_t gather_task_count = 0;
+ };
+ 
+ } // namespace duckdb

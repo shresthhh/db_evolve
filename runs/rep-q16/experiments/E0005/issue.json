@@ -1,0 +1,13 @@
+{
+  "title": "Skip unpartitioned staging for heap-layout agg HTs",
+  "hypothesis": "The join feeds the aggregate ~300-row chunks, so FindOrCreateGroupsInternal (aggregate_hashtable.cpp ~line 758) sends new groups to unpartitioned_data staging. Abandon/ClearPointerTable later repartitions them, which copies the VARCHAR heap and recomputes pointers. Measured earlier: Abandon 37->2ms and MaybeRepartition 97->56ms CPU when staging only for AllConstant layouts. Wall time was about -5% (noisy).",
+  "plan": "In GroupedAggregateHashTable::FindOrCreateGroupsInternal, use the unpartitioned staging path only when layout.AllConstant(); otherwise append directly to partitioned_data.",
+  "target_files": [
+    "src/execution/aggregate_hashtable.cpp"
+  ],
+  "expected_gain": "q16 ~-5% (noisy)",
+  "generality": "Aggregates with VARCHAR/nested keys fed by small chunks. Fixed-width layouts are unchanged.",
+  "risk": "Low. Two-line gate. Spill paths need a test with long-string keys.",
+  "status": "open",
+  "filed": "g1r1"
+}

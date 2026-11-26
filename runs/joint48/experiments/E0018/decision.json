@@ -1,0 +1,39 @@
+{
+  "accept": false,
+  "reasons": [
+    "q14 slower by 11.6% (18 ms), beyond its 5.1% threshold",
+    "q16 slower by 11.2% (19 ms), beyond its 7.9% threshold",
+    "q18 slower by 5.3% (28 ms), beyond its 5.0% threshold",
+    "no visible template faster beyond its noise (best: q09 -5.2%; needs at least -8.6%)",
+    "visible geomean got slower (+3.0%)",
+    "hidden validation templates got slower than their noise allows"
+  ],
+  "rule": "templates",
+  "train_ratio": 1.0300609028340475,
+  "val_ratio": 1.0394703389167603,
+  "val_ok": false,
+  "improved": [],
+  "regressed": [
+    "q14",
+    "q16",
+    "q18"
+  ],
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9963603745551887,
+    "q03": 1.002030440595645,
+    "q04": 0.9706187306972038,
+    "q05": 0.9985056444441079,
+    "q07": 1.037946329509599,
+    "q08": 0.9846289256831893,
+    "q09": 0.9478905921809894,
+    "q13": 1.0650028803368685,
+    "q14": 1.1162736299466824,
+    "q16": 1.1123613732086115,
+    "q17": 1.0524785258278164,
+    "q18": 1.0525638569991007,
+    "q19": 1.0574639556529983,
+    "q22": 1.0425185101855854
+  },
+  "passes": 8
+}

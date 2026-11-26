@@ -1,0 +1,23 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index 1052539..90feade 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -892,6 +892,7 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ //! no hashing and no false positives, at a memory cost bounded by (at most) the size of the pointer table
+ static constexpr idx_t EXACT_BF_MAX_BITS_PER_KEY = 128;
+ static constexpr idx_t EXACT_BF_MAX_RANGE = idx_t(1) << 32;
++static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;
+ 
+ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJoin &op, const Value &min_val,
+                                    const Value &max_val) {
+@@ -934,7 +935,9 @@ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJo
+ 	}
+ 	// max >= min, so the difference of two 64-bit values is exact in uint64 arithmetic
+ 	const uint64_t range = max_bits - min_bits;
+-	const auto key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY;
++	auto key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY;
++	// small ranges always qualify regardless of the key count: the bitmap is at most 512KB
++	key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE);
+ 	if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) {
+ 		return;
+ 	}

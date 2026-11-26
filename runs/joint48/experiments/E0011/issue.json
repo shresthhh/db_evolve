@@ -1,0 +1,14 @@
+{
+  "title": "Semi-join RHS-aware estimate + HAVING selectivity",
+  "hypothesis": "q18 IN (SELECT l_orderkey ... GROUP BY HAVING sum>300): the SEMI case in CardinalityEstimator::CalculateUpdatedDenom (cardinality_estimator.cpp:268) uses left.denom*5 and ignores the RHS size, and relation_manager gives the HAVING filter no selectivity. The optimizer therefore over-estimates the orders\u22c8subquery result and keeps customer on the build side. A prior run measured q18 -7..-8% with both changes, and either alone did nothing.",
+  "plan": "cardinality_estimator.cpp CalculateUpdatedDenom SEMI: use selectivity = max(DEFAULT_SEMI_ANTI_SELECTIVITY, tdom/rhs_cardinality). In relation_manager.cpp (near l.495), apply an extra 0.2 to the estimate of an aggregate relation that has a HAVING (filter over aggregate) above it. Verify with EXPLAIN that q18's customer join flips.",
+  "target_files": [
+    "src/optimizer/join_order/cardinality_estimator.cpp",
+    "src/optimizer/join_order/relation_manager.cpp"
+  ],
+  "expected_gain": "q18 -7%",
+  "generality": "IN/EXISTS subqueries with selective RHS (HAVING, filters). Other join orders can change, so check q04/q21/q20-like semi joins.",
+  "risk": "Medium: it changes join orders broadly for semi joins.",
+  "status": "open",
+  "filed": "g1r10"
+}

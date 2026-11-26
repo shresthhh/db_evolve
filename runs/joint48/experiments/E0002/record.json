@@ -1,0 +1,40 @@
+{
+  "id": "E0002",
+  "title": "Length-aware selectivity for contains()/LIKE scan filters v2",
+  "started": "2026-11-24T03:26:00-05:00",
+  "base": "b34cc9b9af5b5284490535433a0936d506a297a0",
+  "candidate": "f824d63b0fe71bfc24ab2e951f163dbd718bf834",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.472634,
+  "summary": "I added a TableFilterType::EXPRESSION_FILTER case to RelationStatisticsHelper::InspectTableFilter in relation_statistics_helper.cpp. It applies when the filter is a positive match function (contains, ~~ (LIKE), like_escape, prefix or suffix) whose first argument is not foldable and whose second argument is a non-NULL VARCHAR constant. Let L be the literal length with %/_ excluded for LIKE, capped at 64. The selectivity is then max(0.2*0.75^L, 0.01) and the estimate is max(1, card*sel). Any other expression filter keeps the old behavior (the flat 0.2 default). The helper is a file-static function, so no header changed. The build is OK. Full bench: q09 went from 1227 to 763ms (-37.8%) and the geomean improved by 3.6%. Every other template was within noise. q04 showed +7.4% in the first run, but it has no LIKE, and a rerun gave -11.6%. A rerun of q09 gave 1200 to 770ms (-35.9%). Results checks passed in bench. I did not run `profile q09.m0`, so the join-order flip is inferred from the timing and not confirmed in a plan.",
+  "notes": "This is the same mechanism as the earlier contains-selectivity run, and the q09 gain reproduced (-36..-38%). An earlier note said lineitem lost its bloom filter after the join-order flip; it still nets a large win. A possible follow-up is an ILIKE / regexp_matches literal-length estimate, but no visible query uses them.",
+  "train_ratio": 0.9607400150815114,
+  "val_ratio": 0.9924663921429161,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.005259102130421,
+    "q03": 0.9930243964757212,
+    "q04": 0.96369758255134,
+    "q05": 1.0137057673408705,
+    "q07": 1.0023194447937063,
+    "q08": 1.0120976127843018,
+    "q09": 0.610111681034225,
+    "q13": 0.950044856569844,
+    "q14": 0.9641710214740004,
+    "q16": 1.0014204568567948,
+    "q17": 1.0054949271573794,
+    "q18": 0.9891822945456663,
+    "q19": 1.0263673706932697,
+    "q22": 1.0099040153519734
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T03:39:10-05:00"
+}

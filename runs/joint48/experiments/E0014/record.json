@@ -1,0 +1,40 @@
+{
+  "id": "E0014",
+  "title": "FSST batched decode + substring prefilter bundle (q13)",
+  "started": "2026-11-24T10:06:25-05:00",
+  "base": "8990731e60d645bb78c228268c43081fdebc84b8",
+  "candidate": "8a8ce6c57e762a480be012364d746e586a51307d",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.6380904000000007,
+  "summary": "Combined two changes for scans of FSST string columns. q13 measured -15.1%, -15.3% and -15.8% across three bench runs, with one outlier at -3.4%; all other templates were within noise.\n\n1) src/storage/compression/fsst.cpp: a new FSSTScanState::DecompressStrings, used by both StringScanPartial (flat decode) and Select.\n- It decodes each vector's strings back to back into shared heap allocations. Each allocation holds up to 64KB of worst-case output (8 bytes per compressed byte), plus 32 bytes of slack.\n- Each string's write bound is the space left in the allocation, which always covers the worst case of the strings still to come.\n- Strings that fit inline (12 bytes or less) are copied into their string_t, so their bytes are not kept in the heap. The allocation is shrunk to the bytes actually used.\n- Decoding no longer goes through duckdb_fsst_decompress. It uses a simple loop that handles one code per iteration: copy the 8-byte symbol, add len[code], and copy the literal byte after an escape. This is safe because the symbol-table import always sets len to 1..8. An escape as the last byte throws a corrupt-file error.\n- The all-values-inlined case keeps the old per-string path.\n\n2) src/storage/table/column_segment.cpp: a substring prefilter for ExpressionFilter.\n- It applies to LIKE (`~~`), NOT LIKE (`!~~`) and contains, optionally wrapped in NOT. The first argument must be the column itself (VARCHAR) and the second a non-NULL VARCHAR constant.\n- The needle is the longest literal between '%'/'_' wildcards, or the whole contains argument, and must be at least 2 bytes.\n- Strings stored back to back in memory are grouped into runs. Each run is searched once with an SSE2 first-byte/last-byte scan (overlapping final block, scalar fallback), and each hit is mapped to its row. Hits that cross a row boundary are rejected.\n- Only rows that contain the needle are passed to the original expression. In the negated case, non-NULL rows without the needle pass directly. NULL rows always fail.\n- A fresh SelectionVector is always built. Anything that does not match these conditions falls back to the existing path.\n\nMeasurements (CPU time from EXPLAIN ANALYZE; hot wall times from repeated runs):\n- Scanning lineitem with `l_comment <> 'x'`: 6.88s \u2192 4.06s CPU; hot wall time is about 278ms now (no hot timing of the old build).\n- The orders NOT LIKE scan costs 2.12s CPU against 1.98s for a trivial `<>` filter on the same column, so the LIKE evaluation itself is now nearly free.\n- Full bench runs: the geomean came out -1.7% and +1.0%. Templates that looked slower once (q08 +7.5%, q16 +9.7%, q22 +6.7%) came back to noise when rerun (q08 -3.6%, q16 +1.2%).\n- The bench showed results correct on every visible template.\n- Extra checks:\n  - sum(hash(col)) on l_comment, o_comment and p_name was identical between the new decode path and the original one (reached with enable_fsst_vectors=true).\n  - NOT LIKE, LIKE, NOT contains, contains and a LIKE pattern with '_' gave the same counts as the same filter on `col||''` (which is not pushed into the scan), on both the orders data and a temp table with NULLs, inlined strings and needles split across rows.",
+  "notes": "- The key finding: FSST scan cost was about 100ns per string almost regardless of length (27-byte strings 115ns/row, 48-byte strings 133ns/row), so it is per-string overhead, not per-byte work. The 4-code fast loop and tail branches of duckdb_fsst_decompress cost more than the decode itself.\n- Follow-up idea: apply the same simple decode loop to FSSTVector::DecompressVector (src/common/types/vector.cpp) and to dict_fsst decompression. Both still call duckdb_fsst_decompress per string.\n- Bench noise on this machine is about \u00b18% per template in a single run. Rerun before trusting a regression.\n- The q13 scan now spends about 1.9s CPU on decode-plus-scan and almost nothing on the LIKE itself. The next q13 target is the perfect hash group-by (about 1.0s CPU) or skipping decode entirely, e.g. by searching compressed codes.",
+  "train_ratio": 0.9761779406423512,
+  "val_ratio": 0.9944859195701657,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.8895753150547354,
+    "q03": 1.019033171273106,
+    "q04": 0.938589000804439,
+    "q05": 0.9927064292148613,
+    "q07": 0.983425564124697,
+    "q08": 1.0072418746603704,
+    "q09": 1.013677999412511,
+    "q13": 0.8833918772395458,
+    "q14": 0.98965886448163,
+    "q16": 0.9828533449275211,
+    "q17": 1.0078125818756458,
+    "q18": 0.9981864937313891,
+    "q19": 0.9958708412129407,
+    "q22": 0.9773297131188707
+  },
+  "improved": [
+    "q02"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T10:30:24-05:00"
+}

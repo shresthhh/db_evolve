@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/join_hashtable.cpp: the gate is a size threshold (pointer table of at least 32MB) plus a check of the host's THP mode. It applies to any large hash join on Linux and does not depend on queries, tables or data.",
+      "The over-allocation goes through the same BufferAllocator, so memory accounting still sees it. The only extra memory is 2MB of slack per large table, which is bounded.",
+      "The bookkeeping holds up. A plain pointer table is always capacity*8 bytes, and capacity is a power of two, so the size is a power of two. A padded table is a power of two plus 2MB, which never is. PointerTableUsableSize tells the two apart correctly, which keeps the reuse branch and the D_ASSERT valid. On the reuse path (capacity <= current), `entries` keeps its aligned address.",
+      "On free, the destructor, Reset and the grow path all call MADV_DONTNEED and then MADV_NOHUGEPAGE on the 2MB-aligned interior range only. That range starts on a page boundary, has a page-multiple size and lies inside the allocation, so no allocator metadata is touched. The memory is being freed anyway, so zeroing it does not affect correctness.",
+      "Hashing, probing and spilling logic are unchanged, and `hash_map` is only used in this file. Timing, settings and tests are untouched, and the temporary on/off switch was removed before landing."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/execution/join_hashtable.cpp: the gate is a size threshold (pointer table of at least 32MB) plus a check of the host's THP mode. It applies to any large hash join on Linux and does not depend on queries, tables or data.\",\"The over-allocation goes through the same BufferAllocator, so memory accounting still sees it. The only extra memory is 2MB of slack per large table, which is bounded.\",\"The bookkeeping holds up. A plain pointer table is always capacity*8 bytes, and capacity is a power of two, so the size is a power of two. A padded table is a power of two plus 2MB, which never is. PointerTableUsableSize tells the two apart correctly, which keeps the reuse branch and the D_ASSERT valid. On the reuse path (capacity <= current), `entries` keeps its aligned address.\",\"On free, the destructor, Reset and the grow path all call MADV_DONTNEED and then MADV_NOHUGEPAGE on the 2MB-aligned interior range only. That range starts on a page boundary, has a page-multiple size and lies inside the allocation, so no allocator metadata is touched. The memory is being freed anyway, so zeroing it does not affect correctness.\",\"Hashing, probing and spilling logic are unchanged, and `hash_map` is only used in this file. Timing, settings and tests are untouched, and the temporary on/off switch was removed before landing.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1609572,
+  "seconds": 32.31987190246582,
+  "error": ""
+}

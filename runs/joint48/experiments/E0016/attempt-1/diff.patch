@@ -1,0 +1,14 @@
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index ba431cc..fcd2225 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -329,7 +329,8 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	if (!pushdown_info->probe_info.empty()) {
+ 		const auto &rhs_child = join.children[1];
+ 		if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+-			pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);
++			// a DELIM_GET emits the distinct join keys of the outer side - usually far fewer than the probe side
++			pushdown_info->build_side_has_filter = true;
+ 		} else {
+ 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
+ 		}

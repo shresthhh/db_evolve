@@ -1,0 +1,15 @@
+{
+  "title": "Join key-set range filter through compress projections",
+  "hypothesis": "q18 (695ms, 15.5%) scans all 59,986,052 lineitem rows for the l_orderkey = o_orderkey join, while only 111 orderkeys survive the HAVING semi join. The join filter pushdown cannot pass through __internal_compress_integral projections, and a single min/max range over random keys prunes nothing. A prior run (offset-aware pushdown plus an OptionalFilter OR of up to threshold ranges split at the largest gaps) measured q18 -13.6%, with lineitem scan rows going 60M\u219217.5M.",
+  "plan": "In src/optimizer/join_filter_pushdown_optimizer.cpp, follow column bindings through compress-integral projections and record the storage offset in JoinFilterPushdownColumn. In src/execution/operator/join/join_filter_pushdown.cpp (and wherever the min/max filters are built in physical_hash_join.cpp), when the build has few distinct keys (threshold < n <= 64*threshold), build an OptionalFilter holding an OR of ranges split at the largest gaps, with the offset added.",
+  "target_files": [
+    "src/optimizer/join_filter_pushdown_optimizer.cpp",
+    "src/execution/operator/join/join_filter_pushdown.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "expected_gain": "q18 -13%",
+  "generality": "Selective joins against large fact tables whose keys are clustered by row group, and pushdown through compressed materialization in general.",
+  "risk": "Medium. Offsets must be applied correctly, but the filters are optional (zonemap only), so a wrong pruning decision is the main risk.",
+  "status": "open",
+  "filed": "g1r4"
+}

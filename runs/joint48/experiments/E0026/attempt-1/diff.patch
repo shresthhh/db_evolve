@@ -1,0 +1,138 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index b84de7d..24b5984 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -966,6 +966,8 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ static constexpr idx_t EXACT_BF_MAX_BITS_PER_KEY = 128;
+ static constexpr idx_t EXACT_BF_MAX_RANGE = idx_t(1) << 32;
+ static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;
++static constexpr idx_t EXACT_BF_MEDIUM_RANGE = idx_t(1) << 27;
++static constexpr idx_t EXACT_BF_MEDIUM_BITS_PER_KEY = 1024;
+ 
+ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJoin &op, const Value &min_val,
+                                    const Value &max_val) {
+@@ -1011,6 +1013,11 @@ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJo
+ 	auto key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY;
+ 	// small ranges always qualify regardless of the key count: the bitmap is at most 512KB
+ 	key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE);
++	// medium ranges (bitmap of at most 16MB) qualify at up to EXACT_BF_MEDIUM_BITS_PER_KEY bits per key
++	const idx_t medium_cap = ht.Count() >= EXACT_BF_MEDIUM_RANGE / EXACT_BF_MEDIUM_BITS_PER_KEY
++	                             ? EXACT_BF_MEDIUM_RANGE
++	                             : ht.Count() * EXACT_BF_MEDIUM_BITS_PER_KEY;
++	key_cap = MaxValue<idx_t>(key_cap, medium_cap);
+ 	if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) {
+ 		return;
+ 	}
+diff --git a/src/planner/filter/bloom_filter.cpp b/src/planner/filter/bloom_filter.cpp
+index 0d32252..28d2df0 100644
+--- a/src/planner/filter/bloom_filter.cpp
++++ b/src/planner/filter/bloom_filter.cpp
+@@ -168,6 +168,84 @@ static bool LookupExactKeys(const BloomFilter &bf, const UnifiedVectorFormat &vd
+ 	}
+ }
+ 
++//! Hashed mode probe on integer keys, fused with hashing: computes exactly the hash VectorOperations::Hash produces
++//! (duckdb::Hash<T> for valid rows, HashOp::NULL_HASH for NULLs) and tests it, in a single pass
++static constexpr hash_t BF_NULL_HASH = 0xbf58476d1ce4e5b9; // must equal HashOp::NULL_HASH in vector_hash.cpp
++
++template <class T>
++static idx_t TemplatedLookupHashed(const BloomFilter &bf, const UnifiedVectorFormat &vdata,
++                                   optional_ptr<const SelectionVector> row_sel, SelectionVector &result_sel,
++                                   const idx_t count) {
++	const auto data = UnifiedVectorFormat::GetData<T>(vdata);
++	idx_t found_count = 0;
++	if (vdata.validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			const auto row = row_sel ? row_sel->get_index(i) : i;
++			const auto idx = vdata.sel->get_index(row);
++			result_sel.set_index(found_count, i);
++			found_count += bf.LookupOne(duckdb::Hash<T>(data[idx]));
++		}
++	} else {
++		const bool null_found = bf.LookupOne(BF_NULL_HASH);
++		for (idx_t i = 0; i < count; i++) {
++			const auto row = row_sel ? row_sel->get_index(i) : i;
++			const auto idx = vdata.sel->get_index(row);
++			result_sel.set_index(found_count, i);
++			found_count += vdata.validity.RowIsValid(idx) ? bf.LookupOne(duckdb::Hash<T>(data[idx])) : null_found;
++		}
++	}
++	return found_count;
++}
++
++static bool LookupHashedKeys(const BloomFilter &bf, const UnifiedVectorFormat &vdata, PhysicalType type,
++                             optional_ptr<const SelectionVector> row_sel, SelectionVector &result_sel,
++                             const idx_t count, idx_t &found_count) {
++	switch (type) {
++	case PhysicalType::INT8:
++		found_count = TemplatedLookupHashed<int8_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::INT16:
++		found_count = TemplatedLookupHashed<int16_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::INT32:
++		found_count = TemplatedLookupHashed<int32_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::INT64:
++		found_count = TemplatedLookupHashed<int64_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::UINT8:
++		found_count = TemplatedLookupHashed<uint8_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::UINT16:
++		found_count = TemplatedLookupHashed<uint16_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::UINT32:
++		found_count = TemplatedLookupHashed<uint32_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	case PhysicalType::UINT64:
++		found_count = TemplatedLookupHashed<uint64_t>(bf, vdata, row_sel, result_sel, count);
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool IsFusedHashType(PhysicalType type) {
++	switch (type) {
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++	case PhysicalType::UINT64:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approved_tuple_count,
+                             BFTableFilterState &state) const {
+ 	if (state.current_capacity < approved_tuple_count) {
+@@ -197,6 +275,23 @@ idx_t BFTableFilter::Filter(Vector &keys_v, SelectionVector &sel, idx_t &approve
+ 		                     approved_tuple_count, found_count, key_offset)) {
+ 			return approved_tuple_count;
+ 		}
++	} else if (IsFusedHashType(keys_v.GetType().InternalType()) &&
++	           (keys_v.GetVectorType() == VectorType::FLAT_VECTOR ||
++	            keys_v.GetVectorType() == VectorType::DICTIONARY_VECTOR)) {
++		// integer keys: hash and probe in one pass
++		UnifiedVectorFormat vdata;
++		optional_ptr<const SelectionVector> row_sel;
++		if (sel.IsSet() && keys_v.GetVectorType() == VectorType::FLAT_VECTOR) {
++			keys_v.ToUnifiedFormat(approved_tuple_count, vdata);
++			row_sel = &sel;
++		} else if (sel.IsSet()) {
++			state.keys_sliced_v.Slice(keys_v, sel, approved_tuple_count);
++			state.keys_sliced_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		} else {
++			keys_v.ToUnifiedFormat(approved_tuple_count, vdata);
++		}
++		LookupHashedKeys(filter, vdata, keys_v.GetType().InternalType(), row_sel, state.bf_sel, approved_tuple_count,
++		                 found_count);
+ 	} else {
+ 		HashInternal(keys_v, sel, approved_tuple_count, state);
+ 		if (state.hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {

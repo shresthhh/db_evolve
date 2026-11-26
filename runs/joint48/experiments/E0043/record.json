@@ -1,0 +1,16 @@
+{
+  "id": "E0043",
+  "title": "FSST DFA filter: lane-refill interleaving + absorbing-state early exit",
+  "started": "2026-11-25T21:47:56-05:00",
+  "base": "4f25ac98692c39c5345178e154a82aa715a2a26f",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.0973648,
+  "summary": "I'm abandoning this: none of the three versions of the change made q13 faster.\n\nWhat I tried in src/storage/compression/fsst.cpp:\n- **Absorbing flag:** InitializePattern now sets bit 1 of pattern_accept when every byte transition of a DFA state returns to that state. This early exit was part of all three versions below.\n- **v1, 8-lane refill:** per-code end and absorbing checks, outcomes written per candidate, then compacted into new_sel in ascending order. q13 bench was +40.7% slower.\n- **v2, rounds:** all lanes advanced by the shortest remaining length, then refilled. q13 was +11.4% slower.\n- **v3, length-sorted groups:** a counting sort of candidates by compressed length, so groups of 8 have nearly equal lengths. The 8 chains run over the common length in a tight loop, with an all-absorbing check every 8 codes and short serial tails. q13 was +6.8% slower. In micro queries v3 matched the original: NOT LIKE '%zq%' about 168ms against about 160ms.\n\nDiagnostic probes (temporary hacks):\n- Skipping the DFA walk entirely gives a floor of about 75ms for the same count query (decode-based `<> 'abc'` takes about 84ms).\n- Touching only the first byte of each string, plus the sort, takes about 100ms.\n- contains(o_comment,'e') with early exit still takes about 150ms.\n\nSo the walk itself costs about 60\u201370ms of wall time. That part of the hypothesis holds. But more independent chains didn't speed it up, so the loop isn't limited by the latency of the dependent lookups as assumed. The machine was noisy: the same query ranged from 150 to 260ms between runs.\n\nAll counts matched between versions on the patterns I ran. I did not run the full correctness check against the `||''` reference.",
+  "notes": "- **Dead end:** don't retry ILP or lane schemes for the FSST code-level DFA loop. The 4-group loop from E0042 is already about as fast as 8-way interleaving. A likely reason is that hyperthreads already hide the lookup latency, but I couldn't confirm that without perf.\n- **Measured costs:** the floor without the walk is about 75ms, touching the string bytes adds about 25ms, and the walk adds about 60ms.\n- **Where a gain might still be:** cutting the number of lookups rather than speeding each one up. One option is a SIMD skip over codes that keep an unanchored DFA in state 0, using a pshufb nibble-bitmap membership test on 16 codes at a time and then the scalar DFA from the first code that leaves state 0. Most o_comment codes never leave state 0 for rare patterns.\n- **Early exit:** absorbing-state early exit only pays off for prefix-anchored patterns or contains of common substrings, and the visible templates don't exercise those here.",
+  "finished": "2026-11-25T21:56:49-05:00"
+}

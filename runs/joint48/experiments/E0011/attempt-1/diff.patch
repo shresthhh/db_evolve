@@ -1,0 +1,32 @@
+diff --git a/src/optimizer/join_order/cardinality_estimator.cpp b/src/optimizer/join_order/cardinality_estimator.cpp
+index f09070c..a0bd6c9 100644
+--- a/src/optimizer/join_order/cardinality_estimator.cpp
++++ b/src/optimizer/join_order/cardinality_estimator.cpp
+@@ -263,12 +263,22 @@ double CardinalityEstimator::CalculateUpdatedDenom(Subgraph2Denominator left, Su
+ 	}
+ 	case JoinType::SEMI:
+ 	case JoinType::ANTI: {
+-		if (JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&
+-		    JoinRelationSet::IsSubset(*right.relations, *filter.filter_info->right_set)) {
+-			new_denom = left.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
+-			return new_denom;
++		bool lhs_is_left = JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&
++		                   JoinRelationSet::IsSubset(*right.relations, *filter.filter_info->right_set);
++		auto &lhs = lhs_is_left ? left : right;
++		auto &rhs = lhs_is_left ? right : left;
++		double selectivity = CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		if (filter.filter_info->join_type == JoinType::SEMI && rhs.numerator_relations && rhs.denom > 0) {
++			// a semi join keeps at most as many distinct key values as the RHS produces:
++			// if the RHS is small relative to the key domain, the semi join is more selective
++			double tdom = filter.has_distinct_count_hll ? static_cast<double>(filter.distinct_count_hll)
++			                                            : static_cast<double>(filter.distinct_count_no_hll);
++			double rhs_cardinality = GetNumerator(*rhs.numerator_relations) / rhs.denom;
++			if (tdom > 0 && rhs_cardinality >= 1) {
++				selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);
++			}
+ 		}
+-		new_denom = right.denom * CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;
++		new_denom = lhs.denom * selectivity;
+ 		return new_denom;
+ 	}
+ 	default:

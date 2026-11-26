@@ -1,0 +1,30 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index b84de7d..8ec4a15 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -962,8 +962,10 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ }
+ 
+ //! A bloom filter on dense integer keys can instead be an exact bitmap with one bit per value in [min, max]:
+-//! no hashing and no false positives, at a memory cost bounded by (at most) the size of the pointer table
++//! no hashing and no false positives, at a memory cost of at most 128 bits per key (or 1024 bits per key, up to 16MB)
+ static constexpr idx_t EXACT_BF_MAX_BITS_PER_KEY = 128;
++static constexpr idx_t EXACT_BF_MID_BITS_PER_KEY = 1024;
++static constexpr idx_t EXACT_BF_MID_RANGE = idx_t(1) << 27;
+ static constexpr idx_t EXACT_BF_MAX_RANGE = idx_t(1) << 32;
+ static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;
+ 
+@@ -1011,6 +1013,13 @@ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJo
+ 	auto key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY;
+ 	// small ranges always qualify regardless of the key count: the bitmap is at most 512KB
+ 	key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE);
++	// mid-size ranges qualify at a sparser density: the bitmap is at most 16MB and 128 bytes per build key,
++	// and a single bit test is much cheaper to probe than a hashed bloom filter
++	if (ht.Count() <= EXACT_BF_MID_RANGE / EXACT_BF_MID_BITS_PER_KEY) {
++		key_cap = MaxValue<idx_t>(key_cap, MinValue<idx_t>(EXACT_BF_MID_RANGE, ht.Count() * EXACT_BF_MID_BITS_PER_KEY));
++	} else {
++		key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_MID_RANGE);
++	}
+ 	if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) {
+ 		return;
+ 	}

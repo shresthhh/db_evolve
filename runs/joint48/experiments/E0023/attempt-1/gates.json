@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/deliminator.cpp: the only code change widens the SelectionIsReplaceableByJoinFilter gate from SEMI to SEMI or ANTI. The other guards stay the same: one DelimGet, one INNER/SEMI join with only colref = colref conditions, and a SubqueryIsSimple RHS. This covers a natural class of queries, correlated NOT EXISTS on plain equality. Nothing in it refers to a particular query, table or literal.",
+      "Removing the join with the DelimGet is already correct for ANTI; it is the same rewrite the upstream code applies when the LHS has no selection. The change only stops the selection from forcing that join to stay.",
+      "NULL handling after the NDF-to-= conversion holds. The RHS column is non-null because RemoveJoinWithDelimGet adds IS NOT NULL, so for a NULL LHS key NDF gives FALSE and = gives NULL. Both mean no match, so ANTI still emits the row. Plain ANTI: the LHS is the probe side, and a NULL probe key emits the row as unmatched. RIGHT_ANTI: the LHS is the build side, and PropagatesBuildSide(RIGHT_ANTI) is true (join_type.cpp:14), so NULL build keys stay in the hash table and are emitted by the unmatched scan.",
+      "Join filter pushdown stays sound. GenerateJoinFilters still skips plain ANTI (join_filter_pushdown_optimizer.cpp:238), so the probe-side LHS is never filtered. Only RIGHT_ANTI, which emits build-side rows only, gets probe-side min/max and BF filters.",
+      "The diff does not touch timing, settings, tests or anything outside the optimizer, and the two comment edits match the new behaviour."
+    ],
+    "required_changes": []
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Length-aware selectivity for contains()/LIKE scan filters v2",
+  "hypothesis": "q09 is the slowest template at about 1284ms. Its p_name LIKE '%x%' becomes contains() and is pushed into the scan as an EXPRESSION_FILTER. RelationStatisticsHelper::InspectTableFilter (relation_statistics_helper.cpp:446) handles only CONJUNCTION_AND and CONSTANT_COMPARISON. Any other filter falls through, so ExtractGetStats at line 147 applies the flat DEFAULT_SELECTIVITY of 0.2. That overestimate gives a bad join order: two hash joins of about 2.6s each on 3.27M rows. A previous run measured q09 -35% with this exact mechanism.",
+  "plan": "In src/optimizer/join_order/relation_statistics_helper.cpp, InspectTableFilter: add a TableFilterType::EXPRESSION_FILTER case. Cast to ExpressionFilter and look at filter.expr. If it is a BoundFunctionExpression named contains, like_escape, ~~ (like) or prefix/suffix, and one argument is a constant VARCHAR (BoundConstantExpression), let L be the literal length with % and _ excluded. Then sel = max(0.2*0.75^L, 0.01) and the result is max(1, cardinality*sel). Also descend into CONJUNCTION_AND as today, and into OPTIONAL_FILTER if it wraps one. The has_equality_filter check at line 146 compares against base_table_cardinality, so a lower estimate naturally overrides the 0.2 default. Check the exact function names with Grep (contains, ~~, like_escape) before coding. Verify the q09 plan flips by running profile q09.m0, and check that the results match.",
+  "target_files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp"
+  ],
+  "expected_gain": "q09 -30% (about -2.5% visible geomean). Other templates with LIKE filters on dimension tables could improve slightly (q16/q13 use NOT LIKE, which this should leave alone).",
+  "generality": "Any query with a substring/LIKE predicate on a table feeding join ordering, which is common in analytics. It could underestimate a short, very common literal. The 0.01 floor and the 0.75^L decay keep 1-2 character literals at 0.11-0.15 selectivity.",
+  "risk": "Medium-low. It changes only estimates, never results. Join orders could flip on hidden queries with LIKE. Negated forms (NOT LIKE) must be excluded.",
+  "status": "open",
+  "filed": "g1r2"
+}

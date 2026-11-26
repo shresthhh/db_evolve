@@ -1,0 +1,227 @@
+diff --git a/src/execution/operator/join/perfect_hash_join_executor.cpp b/src/execution/operator/join/perfect_hash_join_executor.cpp
+index 06052df..f6e99d0 100644
+--- a/src/execution/operator/join/perfect_hash_join_executor.cpp
++++ b/src/execution/operator/join/perfect_hash_join_executor.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
+ 
++#include "duckdb/common/bit_utils.hpp"
+ #include "duckdb/common/operator/subtract.hpp"
+ #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+ 
+@@ -338,6 +339,54 @@ void PerfectHashJoinExecutor::FinishGather() {
+ 	}
+ }
+ 
++bool PerfectHashJoinExecutor::FillExactBloomFilter(ClientContext &context) {
++	auto &bf = ht.GetBloomFilter();
++	if (!bf.IsExact() || bf.IsInitialized() || perfect_join_statistics.build_min.IsNull()) {
++		return false;
++	}
++	// the exact bloom filter takes the keys widened to 64 bits. Its range is the min/max of the build keys, which lies
++	// within the perfect HT's range (that can come from the column statistics). Should a key fall outside of it anyway,
++	// the bloom filter overflows and lets everything pass
++	uint64_t min_bits;
++	switch (perfect_join_statistics.build_min.type().InternalType()) {
++	case PhysicalType::INT8:
++	case PhysicalType::INT16:
++	case PhysicalType::INT32:
++	case PhysicalType::INT64:
++		min_bits = static_cast<uint64_t>(perfect_join_statistics.build_min.GetValue<int64_t>());
++		break;
++	case PhysicalType::UINT8:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT32:
++	case PhysicalType::UINT64:
++		min_bits = perfect_join_statistics.build_min.GetValue<uint64_t>();
++		break;
++	default:
++		return false;
++	}
++	bf.Initialize(context, ht.Count());
++	const auto build_size = perfect_join_statistics.build_range + 1;
++	if (bitmap_build_idx.AllValid()) {
++		for (idx_t slot = 0; slot < build_size; slot++) {
++			bf.InsertExact(min_bits + slot);
++		}
++		return true;
++	}
++	const auto bitmap_data = bitmap_build_idx.GetData();
++	for (idx_t entry_idx = 0; entry_idx < ValidityMask::EntryCount(build_size); entry_idx++) {
++		auto entry = bitmap_data[entry_idx];
++		while (entry) {
++			const auto bit = CountZeros<uint64_t>::Trailing(entry);
++			entry &= entry - 1;
++			const auto slot = entry_idx * ValidityMask::BITS_PER_VALUE + bit;
++			if (slot < build_size) {
++				bf.InsertExact(min_bits + slot);
++			}
++		}
++	}
++	return true;
++}
++
+ bool PerfectHashJoinExecutor::FullScanHashTable(LogicalType &key_type) {
+ 	auto &data_collection = ht.GetDataCollection();
+ 
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index ca515ef..5224726 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -622,6 +622,20 @@ private:
+ 	bool gather;
+ };
+ 
++//! Once the perfect hash table's keys are inserted: fills its exact bloom filter (if any) from the occupied slots and
++//! pushes it to the probe-side scans
++static void PushPerfectHashJoinBloomFilters(ClientContext &context, HashJoinGlobalSinkState &sink) {
++	if (sink.deferred_bloom_filters.empty()) {
++		return;
++	}
++	if (sink.perfect_join_executor->FillExactBloomFilter(context)) {
++		for (auto &entry : sink.deferred_bloom_filters) {
++			sink.op.filter_pushdown->PushBloomFilter(entry.first, *sink.hash_table, sink.op, entry.second);
++		}
++	}
++	sink.deferred_bloom_filters.clear();
++}
++
+ //! Builds the perfect hash table in parallel: first inserts the keys (BUILD), then gathers the payload (GATHER)
+ class PerfectHashJoinBuildEvent : public BasePipelineEvent {
+ public:
+@@ -655,6 +669,9 @@ public:
+ 		if (sink.perfect_filter_min_max) {
+ 			sink.op.filter_pushdown->FinalizeFilters(sink.context, &ht, sink.op, std::move(sink.perfect_filter_min_max),
+ 			                                         use_perfect_hash, &sink.deferred_bloom_filters);
++			if (use_perfect_hash) {
++				PushPerfectHashJoinBloomFilters(sink.context, sink);
++			}
+ 		}
+ 		if (!use_perfect_hash) {
+ 			// duplicate keys: fall back to the regular hash join
+@@ -942,10 +959,8 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// with a perfect hashtable we expect good min/max pruning, so we don't want the bloom filter
+-	if (is_perfect_hashtable) {
+-		return false;
+-	}
++	// with a perfect hashtable the caller only uses an exact bloom filter, and only if the keys are sparse in their
++	// range (dense keys are pruned well enough by min/max)
+ 
+ 	// the Filter API only allows single-column filters so far: the bf is built on the first (equality) join key
+ 	// only, the caller only pushes it for the filter on that key
+@@ -969,8 +984,11 @@ static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;
+ static constexpr idx_t EXACT_BF_MEDIUM_RANGE = idx_t(1) << 27;
+ static constexpr idx_t EXACT_BF_MEDIUM_BITS_PER_KEY = 1024;
+ 
++//! A perfect hash join only gets a bloom filter if at most this fraction of its key range is filled with keys
++static constexpr idx_t PERFECT_HT_BF_MIN_RANGE_PER_KEY = 4;
++
+ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJoin &op, const Value &min_val,
+-                                   const Value &max_val) {
++                                   const Value &max_val, const bool sparse_only = false) {
+ 	auto &bf = ht.GetBloomFilter();
+ 	if (bf.IsExact() || bf.IsInitialized() || ht.NullValuesAreEqual(0) || ht.Count() == 0) {
+ 		return;
+@@ -1021,6 +1039,9 @@ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJo
+ 	if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) {
+ 		return;
+ 	}
++	if (sparse_only && ht.Count() * PERFECT_HT_BF_MIN_RANGE_PER_KEY > range + 1) {
++		return;
++	}
+ 	bf.SetExactRange(min_bits, range);
+ }
+ 
+@@ -1161,7 +1182,14 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
+ 				if (!has_cast && pushdown_column.storage_offset.IsNull() && ht &&join_condition[filter_idx] == 0 && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+-					if (deferred_bloom_filters) {
++					if (deferred_bloom_filters && is_perfect_hashtable) {
++						// a perfect hash table only gets an exact bloom filter, filled from its slots once it is
++						// built (PushPerfectHashJoinBloomFilters)
++						TrySetExactBloomFilter(*ht, op, min_val, max_val, true);
++						if (ht->GetBloomFilter().IsExact()) {
++							deferred_bloom_filters->emplace_back(info, filter_col_idx);
++						}
++					} else if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+ 						ht->SetBuildBloomFilter(true);
+@@ -1175,9 +1203,11 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 					// the probe column stores (key + offset): only an exact bloom filter can be probed with the
+ 					// stored value, by subtracting the offset again (a hashed one would need the key itself)
+ 					if (deferred_bloom_filters) {
+-						TrySetExactBloomFilter(*ht, op, raw_min_val, raw_max_val);
++						TrySetExactBloomFilter(*ht, op, raw_min_val, raw_max_val, is_perfect_hashtable);
+ 						if (ht->GetBloomFilter().IsExact()) {
+-							ht->SetBuildBloomFilter(true);
++							if (!is_perfect_hashtable) {
++								ht->SetBuildBloomFilter(true);
++							}
+ 							deferred_bloom_filters->emplace_back(info, filter_col_idx);
+ 						}
+ 					}
+@@ -1298,6 +1328,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
+ 	if (filter_min_max) {
+ 		filter_pushdown->FinalizeFilters(context, &ht, *this, std::move(filter_min_max), use_perfect_hash,
+ 		                                 &sink.deferred_bloom_filters);
++		if (use_perfect_hash) {
++			PushPerfectHashJoinBloomFilters(context, sink);
++		}
+ 	}
+ 
+ 	// In case of a large build side or duplicates, use regular hash join
+diff --git a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+index c9dbd3b..7ba74c2 100644
+--- a/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
++++ b/src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp
+@@ -56,6 +56,9 @@ public:
+ 	}
+ 	void GatherTask(idx_t task_idx);
+ 	void FinishGather();
++	//! Fills the HT's exact bloom filter (already set to the build key range) with the keys of the built table.
++	//! Returns false if the bloom filter cannot be filled (not exact, already filled or unsupported key type)
++	bool FillExactBloomFilter(ClientContext &context);
+ 
+ private:
+ 	void FillSelectionVectorSwitchProbe(Vector &source, SelectionVector &build_sel_vec, SelectionVector &probe_sel_vec,
+diff --git a/src/storage/compression/bitpacking.cpp b/src/storage/compression/bitpacking.cpp
+index 4c7b4dd..dd252ec 100644
+--- a/src/storage/compression/bitpacking.cpp
++++ b/src/storage/compression/bitpacking.cpp
+@@ -931,12 +931,27 @@ void BitpackingSelect(ColumnSegment &segment, ColumnScanState &state, idx_t vect
+ 			auto width = scan_state.current_width;
+ 			auto frame_of_reference = static_cast<T_U>(scan_state.current_frame_of_reference);
+ 			if (direct_extract && width <= 56) {
++				// the algorithm groups are back to back, each 32 * width bits long: value j of the metadata group
++				// starts at bit j * width of the group data. Load a fixed 8 bytes per value where that stays below
++				// the metadata entry of this group (which is stored after all group data in the segment)
++				const auto group_ptr = scan_state.current_group_ptr;
++				const auto safe_end = scan_state.bitpacking_metadata_ptr + sizeof(bitpacking_metadata_encoded_t);
++				const uint64_t mask = (uint64_t(1) << width) - 1;
+ 				for (; sel_idx < sel_count && sel.get_index(sel_idx) < end; sel_idx++) {
+ 					idx_t group_pos = group_start + (sel.get_index(sel_idx) - base);
+-					idx_t idx_in_block = group_pos % ALGORITHM_GROUP_SIZE;
+-					data_ptr_t block_start = scan_state.current_group_ptr + (group_pos - idx_in_block) * width / 8;
+-					auto value = static_cast<T_U>(BitpackingExtractValue(block_start, idx_in_block, width));
+-					result_data[sel_idx] = static_cast<T>(value + frame_of_reference);
++					const idx_t bit_offset = group_pos * width;
++					const data_ptr_t value_ptr = group_ptr + bit_offset / 8;
++					uint64_t value_bits;
++					if (value_ptr + sizeof(uint64_t) <= safe_end) {
++						uint64_t bits;
++						memcpy(&bits, value_ptr, sizeof(uint64_t));
++						value_bits = (bits >> (bit_offset % 8)) & mask;
++					} else {
++						idx_t idx_in_block = group_pos % ALGORITHM_GROUP_SIZE;
++						data_ptr_t block_start = group_ptr + (group_pos - idx_in_block) * width / 8;
++						value_bits = BitpackingExtractValue(block_start, idx_in_block, width);
++					}
++					result_data[sel_idx] = static_cast<T>(static_cast<T_U>(value_bits) + frame_of_reference);
+ 				}
+ 			} else {
+ 				// unpack each algorithm group that contains a selected row

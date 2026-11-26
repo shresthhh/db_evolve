@@ -1,0 +1,15 @@
+{
+  "title": "Exact bitmap BF through CM compress offset",
+  "hypothesis": "E0006 records JoinFilterPushdownColumn::storage_offset when the probe key passes through __internal_compress_integral_*(x, off). Only offset-shifted min/max and range-set filters are pushed. The BF is explicitly skipped (physical_hash_join.cpp:1059 requires storage_offset.IsNull() and !has_cast). As a result the q09 orders scan still reads all 15M rows into the o_orderkey HJ. A previous run on the same workload pushed the EXACT bitmap BF through the offset: orders scan 15M\u21922.94M rows, q09 -14.3%. The hashed-BF version was +4.7%, so only the exact mode is worth porting. E0007 has since landed the exact bitmap (BloomFilter::SetExactRange/LookupExact), so the remaining piece is a probe-side shift.",
+  "plan": "1) In bloom_filter.hpp BFTableFilter, add a uint64_t key_offset (wrapping add, default 0). It applies only in exact mode: the probe computes LookupExact(widen(stored_value) - offset_as_u64), with signed or unsigned widening based on the scanned (storage) column type, not the HT key type. Apply the same shift in FilterValue and CheckStatistics, which shifts the zonemap min/max with overflow checks; if unsure, return NO_PRUNING_POSSIBLE. Include it in Equals/Copy/ToString/serialization if those exist. 2) In physical_hash_join.cpp FinalizeFilters (~l.1057-1067), add a second branch: when storage_offset is not NULL, ht, key 0, CanUseBloomFilter, and the exact gate (TrySetExactBloomFilter) succeeds, defer the push and pass the offset. The compressed key type (condition type) differs from storage_type, so allow has_cast in this branch only, because the scan column is the original integer column. In PushBloomFilter (deferred path), only push if bf->IsExact() && !ExactOverflow() and set key_offset; otherwise push nothing (never hashed BF through an offset). The exact gate must be decided before Finalize fills the bitmap; if it fails, don't build the BF. 3) Verify on TEMP tables against SET disabled_optimizers='join_filter_pushdown': a BIGINT key with a non-zero min (e.g. 1e9+k), negative keys, an aggregate between scan and join so CM fires, and a sparse build (~10%) so the selectivity wrapper keeps the filter; check in EXPLAIN ANALYZE that the probe scan row count drops.",
+  "target_files": [
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/planner/filter/bloom_filter.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "expected_gain": "q09 -10..-14% (prior -14.3%); possibly q05/q07/q08/q18 a few % wherever CM sits between scan and join.",
+  "generality": "Any join on dense integer keys whose probe key passes through compressed materialization (aggregates or sorts between scan and join), which is common in star/FK joins. Little regression risk: the SelectivityOptionalFilter wrapper disables it when it is unselective.",
+  "risk": "Medium. A wrong offset sign or widening silently drops rows (wrong results). Mitigate with the offset-shifted key tests above. CheckStatistics shifting must not over-prune.",
+  "status": "open",
+  "filed": "g1r8"
+}

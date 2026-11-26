@@ -1,0 +1,40 @@
+{
+  "id": "E0006",
+  "title": "Join key-set range filter through compress projections",
+  "started": "2026-11-24T04:53:10-05:00",
+  "base": "6709876b091b65a0799bc8360a364b72c9f97eb4",
+  "candidate": "596a2065b8b8945762aaf80183b73fff053ecae4",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.2413633999999996,
+  "summary": "I made two changes:\n\n1. **Join filters now pass through integral-compression projections.** `PushdownJoinFilterExpression` in `join_filter_pushdown_optimizer.cpp` now follows `__internal_compress_integral_*(x, const_offset)` down to the column and records the offset in a new `JoinFilterPushdownColumn::storage_offset` field (a `Value`; NULL means no offset).\n   - The UNION rewrite copies the offset to the rewritten columns.\n   - TopN and RowGroupPruner reject targets that carry an offset.\n   - Offsets that are UHUGEINT, NULL or non-integral are rejected, and so are nested offsets.\n\n2. **Offset-aware filter values and a new range-set filter** in `physical_hash_join.cpp`.\n   - A new helper `JoinFilterValueToStorage` adds the offset using HUGEINT arithmetic with an overflow check, then casts to the storage type. The min/max filters and the IN-list filter both use it.\n   - The bloom filter is never pushed for offset columns.\n   - New `PushRangeSetFilter`: for equality joins where `dynamic_or_filter_threshold < HT count <= 64*threshold` and the storage type is an integer of 64 bits or less, it scans the build keys, skips NULLs, sorts and dedups them, and splits them at the `4*threshold - 1` largest gaps. It then pushes an `OptionalFilter` holding an OR of those ranges (exact matches for single keys), so it is used for zonemap pruning only.\n\nMeasured with `dbe-tool bench` against the current best:\n- **q18:** -8.9%, -7.8%, -5.9% and -7.9% across four runs (best 696\u2013754 ms \u2192 yours 639\u2013695 ms).\n- **Rows scanned in the q18 profile:** lineitem 59,986,052 \u2192 12,130,926 (17.5M with 50 ranges); orders 15M \u2192 9.0M (that figure is from the 50-range run; I didn't capture it for the final 200-range build).\n- **q04:** -14% in one run and +8% in another. That's noise; its plan doesn't change in any way that matters.\n- **q17:** +4\u20135.6% in three runs and +0.4% when rerun alone. It does get the range filter (2001 random partkeys, nothing pruned), but these filters are checked only once per row group or segment, never per row, so I believe it is noise.\n- **Geomean** across all templates: -0.8% and -0.4% in the two full runs.\n\nCorrectness spot checks via `dbe-tool sql` gave identical results for a semi join with 600 keys, an inner join with 400 keys (plain columns), and a HAVING semi join over compressed keys with 2149 keys, each compared against an equivalent query that doesn't use the join filter.",
+  "notes": "- `OptionalFilter` is evaluated only in `RowGroup::CheckZonemap` (once per row group) and in `CheckZonemapSegments` (once per segment, because `segment_checked` is set). So many ranges are cheap; going from 50 to 200 ranges cut lineitem rows from 17.5M to 12.1M.\n- One range per key (up to 64\u00d7threshold) would prune slightly more. I didn't try it because the range checks compare `Value` objects, which is slow.\n- The remaining q18 time is mostly the 15M-group aggregate in the subquery (5.1s CPU) and the customer join.\n- Follow-up idea: push the bloom filter through the compression offset (hash `x - offset` masked to the key width; an earlier run measured q09 -8% that way). It's left out here to keep this change to one idea.\n- The header change in `join_filter_pushdown.hpp` rebuilt quickly.",
+  "train_ratio": 0.9855582999288638,
+  "val_ratio": 0.9930879621179892,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9314783395437884,
+    "q03": 1.0112623035579422,
+    "q04": 1.0074906437613909,
+    "q05": 0.9958667115135685,
+    "q07": 0.9862197453766436,
+    "q08": 0.9919862734817745,
+    "q09": 0.9823424449346903,
+    "q13": 0.9879296855854194,
+    "q14": 0.9922707507280478,
+    "q16": 0.9790219983182246,
+    "q17": 1.0161261584787582,
+    "q18": 0.880833484784366,
+    "q19": 1.0383346326596123,
+    "q22": 1.0069407844065814
+  },
+  "improved": [
+    "q18"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T05:15:49-05:00"
+}

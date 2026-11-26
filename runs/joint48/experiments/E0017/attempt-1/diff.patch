@@ -1,0 +1,49 @@
+diff --git a/src/optimizer/compressed_materialization/compress_comparison_join.cpp b/src/optimizer/compressed_materialization/compress_comparison_join.cpp
+index ed5b7dd..c28d68d 100644
+--- a/src/optimizer/compressed_materialization/compress_comparison_join.cpp
++++ b/src/optimizer/compressed_materialization/compress_comparison_join.cpp
+@@ -48,41 +48,12 @@ void CompressedMaterialization::CompressComparisonJoin(unique_ptr<LogicalOperato
+ 	}
+ #endif
+ 
+-	// Find all bindings referenced by non-colref expressions in the conditions
+-	// These are excluded from compression by projection
+-	// But we can try to compress the expression directly
++	// Join condition columns are never compressed: compressing the probe key requires a compress projection on the
++	// probe side, which blocks runtime join filters (min/max, Bloom filter) from reaching the probe scan,
++	// and adds a decompress/compress pair per key. Only build-side payload columns are compressed.
+ 	column_binding_set_t probe_compress_bindings;
+ 	column_binding_set_t referenced_bindings;
+ 	for (const auto &condition : join.conditions) {
+-		if (join.conditions.size() == 1 && join.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+-			// We only try to compress the join condition cols if there's one join condition
+-			// Else it gets messy with the stats if one column shows up in multiple conditions
+-			if (condition.left->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+-			    condition.right->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+-				// Both are bound column refs, see if both can be compressed generically to the same type
+-				auto &lhs_colref = condition.left->Cast<BoundColumnRefExpression>();
+-				auto &rhs_colref = condition.right->Cast<BoundColumnRefExpression>();
+-				auto lhs_it = statistics_map.find(lhs_colref.binding);
+-				auto rhs_it = statistics_map.find(rhs_colref.binding);
+-				if (lhs_it != statistics_map.end() && rhs_it != statistics_map.end() && lhs_it->second &&
+-				    rhs_it->second) {
+-					// For joins we need to compress both using the same statistics, otherwise comparisons don't work
+-					auto merged_stats = lhs_it->second->Copy();
+-					merged_stats.Merge(*rhs_it->second);
+-
+-					// If one can be compressed, both can (same stats)
+-					auto compress_expr = GetCompressExpression(condition.left->Copy(), merged_stats);
+-					if (compress_expr) {
+-						D_ASSERT(GetCompressExpression(condition.right->Copy(), merged_stats));
+-						// This will be compressed generically, but we have to merge the stats
+-						lhs_it->second->Merge(merged_stats);
+-						rhs_it->second->Merge(merged_stats);
+-						probe_compress_bindings.insert(lhs_colref.binding);
+-						continue;
+-					}
+-				}
+-			}
+-		}
+ 		GetReferencedBindings(*condition.left, referenced_bindings);
+ 		GetReferencedBindings(*condition.right, referenced_bindings);
+ 	}

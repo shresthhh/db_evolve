@@ -1,0 +1,27 @@
+{
+  "id": "E0005",
+  "title": "Skip unpartitioned staging for heap-layout agg HTs",
+  "started": "2026-11-24T02:50:53-05:00",
+  "base": "1033aad43d8ba556e66b355e855fc893dfdf09e9",
+  "candidate": "87988e808645be78db2da42f64518f33e50f62eb",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q16 -5.7%; needs at least -5%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.30202660000000003,
+  "summary": "In GroupedAggregateHashTable::FindOrCreateGroupsInternal (src/execution/aggregate_hashtable.cpp), new groups now go to the unpartitioned staging collection only when the row layout is all fixed-width (layout_ptr->AllConstant()). Otherwise they are appended directly to partitioned_data. This removes the second heap copy and pointer recompute that Abandon/Repartition did for VARCHAR or nested group keys. Release build OK. Two `bench q16` runs: 174.4\u2192163.0 ms (-6.5%), then 173.8\u2192160.4 ms (-7.7%). Both runs checked results.",
+  "notes": "This is the third submission of the same idea. Earlier bench medians were about -4% to -5% and very noisy (range -17% to +2%). This session's two runs were -6.5% and -7.7%. If it is rejected again for noise, stop trying it. Other q16 targets would be per-row main-HT sink cost, distinct finalize, or compacting the join's ~300-row output chunks.",
+  "train_ratio": 0.9433053746482865,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 0.9433053746482865
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T02:54:02-05:00"
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0030",
+  "title": "Large radix aggregate slows 17-35% when more base-table blocks are resident",
+  "started": "2026-11-25T02:38:06-05:00",
+  "base": "e715f91cf53b8e8c56da3df2f961f264b6d02f98",
+  "candidate": "7ffd4f8c7d05b52acaabdd67c85b5d88b8f81e69",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q05 -6.9%; needs at least -20.3%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 2.8852244000000007,
+  "summary": "The slowdown is real and comes from the allocator. Once many base-table blocks are resident, freeing and reallocating short-lived 256KB buffer blocks through jemalloc gets markedly slower. I fixed it in src/storage/block_allocator.cpp (plus a small header addition). When the block-allocator pool is not in use (the default, block_allocator_memory=0), the BlockAllocator now keeps a bounded 64MB queue of recently freed block-size allocations. AllocateData(block_size) takes blocks from this queue before calling the fallback allocator, and FreeData(block_size) puts them back unless the queue is full. The queue is emptied back to the allocator in ThreadFlush (worker idle for 0.5s, or thread exit), in FlushAll (memory-pressure and shutdown paths) and in ~BlockAllocator. The allocator outlives the BlockAllocator in DBConfig, so the destructor can free everything.\n\nMeasured in one process (agg reproducer: GROUP BY over 15M groups with HAVING):\n- Old code: 465/478ms; after loading extra columns, 550-714ms and it stays slow.\n- New code: 460-475ms after the same loads.\n- Full q18: after the loads it stays at 500-518ms with the change. The issue measured 630-720ms on the old code, and I did not re-run q18 on the old code myself.\n\nBench against current best:\n- Full run: geomean -1.5%, q04 -11.6%, q05 -8.7%, q18 -0.4%, q13 -0.4%, q07 +4.2%.\n- Reruns: q04 -7.4% and -4.9%, q07 -8.7% and -8.8%, q03 -12.3%, q05 0% and -5.6%, q09 +0.5%, q18 +1.6%, q13 -0.4%.\n\nThe bench barely moves q18 or q13. Their bench times (about 530-540ms for q18) already look like the fast state, so the warm-state penalty described in the issue doesn't seem to appear in the bench. The gains it does show are on hash-join templates, whose builds also churn through many blocks.",
+  "notes": "How I localized it:\n- Not the temporary-memory reservation, and not the eviction queues: base-table and managed blocks go to different queues.\n- Not jemalloc decay or purging: still slow with dirty/muzzy decay set to -1 through mallctl and allocator_flush_threshold=64GB.\n- Not TLB: MADV_HUGEPAGE on the pool mmap gave 0% in steady state. The system THP mode is `madvise`.\n- Not physical page placement: with `SET block_allocator_memory='6GB'` the agg is fast even when the extra columns are loaded before the first agg run.\n- What does fix it: the pool, or a thread-local cache of only 16-64 freed blocks. So the cost is in jemalloc's per-block alloc/free path for 256KB blocks once its arenas are shared with many long-lived blocks.\n- Inside the agg pipeline, scan CPU also doubled (0.18 \u2192 0.37s) in the slow state. A scan-only query was unaffected.\n\nTips:\n- read_csv can read /sys files (read_text fails on them), but /proc files read as empty.\n- Multi-statement `dbe-tool sql` is the way to measure warm-state effects.\n\nFollow-ups:\n- If the bench harness ever runs templates in one shared warm process, q18/q13 should gain 10-20%.\n- Retired ideas that lost to q18 in the full bench (E0009/E0013, large perfect HA) might be worth re-testing on top of this.\n- I did not tune the 64MB cap beyond the 16 vs 64 per-thread experiments.",
+  "train_ratio": 0.9839769274625576,
+  "val_ratio": 0.992115826206722,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9629828878289958,
+    "q03": 1.0211853178783046,
+    "q04": 0.9565521210011589,
+    "q05": 0.9309638094704097,
+    "q07": 0.9911656564307267,
+    "q08": 0.9678800787756342,
+    "q09": 0.9480110299770106,
+    "q13": 0.9989534022186212,
+    "q14": 1.0140004458245366,
+    "q16": 1.0394489827150906,
+    "q17": 0.9860019109311496,
+    "q18": 0.9888148701924195,
+    "q19": 0.988637926121746,
+    "q22": 0.9867939722731025
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-25T03:07:31-05:00"
+}

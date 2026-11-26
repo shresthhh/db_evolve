@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/operator/join/physical_hash_join.cpp: lowering PARALLEL_CONSTRUCT_THRESHOLD from 1M to 64K rows is a general tuning change. It doesn't depend on any query, table or data. The num_threads==1 and KeysAreSkewed fallbacks still route to the serial path.",
+      "Correctness: builds over 1M rows already use the parallel path (InsertHashesLoop<true> with CAS chain insert). Both bloom filter inserts are atomic: hashed BF InsertHashes (bloom_filter.cpp:82) and exact BF InsertExact (bloom_filter.hpp:63) use fetch_or with relaxed ordering. Builds of 64K-1M rows use that same thread-safe code, so there is no new race.",
+      "The adaptive chunks_per_task = clamp(chunk_count/(4*num_threads), 4, 64) cannot divide by zero. The parallel path is only taken when num_threads >= 2, and verify_parallelism still uses 1 chunk per task. Builds over 1M rows are unchanged in practice, because chunk_count/(4*threads) is at least 64 at typical thread counts.",
+      "No extra threads are used beyond the configured scheduler. The change doesn't touch measurement code, settings defaults or tests, and there is no dead or duplicated code."
+    ],
+    "required_changes": []
+  }
+}

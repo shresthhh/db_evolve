@@ -1,0 +1,159 @@
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index 9767282..a12d167 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -18,6 +18,11 @@
+ 
+ #include "miniz_wrapper.hpp"
+ 
++#if defined(__SSE2__) && (defined(__GNUC__) || defined(__clang__))
++#include <emmintrin.h>
++#define DUCKDB_FSST_SKIP_SSE2
++#endif
++
+ namespace duckdb {
+ struct FSSTScanState;
+ 
+@@ -767,6 +772,95 @@ struct FSSTScanState : public StringScanState {
+ 	idx_t pattern_states = 0;
+ 	//! pattern_accept[state / 256]: whether a string ending in the state passes the filter
+ 	vector<uint8_t> pattern_accept;
++	//! States that only few codes leave can skip ahead to the next such code (instead of walking every code)
++	static constexpr idx_t MAX_SKIP_CODES = 16;
++	//! pattern_skip[state / 256]: whether the state is skippable
++	vector<uint8_t> pattern_skip;
++	//! pattern_skip_count[state / 256]: the number of (padded) codes that leave the state, 0 if no code leaves it
++	vector<uint8_t> pattern_skip_count;
++	//! pattern_skip_codes[state / 256 * MAX_SKIP_CODES * 16 + j * 16 + b]: the j-th leaving code, repeated 16 times
++	vector<uint8_t> pattern_skip_codes;
++	//! Whether skipping pays off for this segment (it is disabled when most codes would be walked anyway)
++	bool pattern_skip_enabled = false;
++
++	void InitializeSkip() {
++		static constexpr idx_t ALPHABET = FSSTPatternDFA::ALPHABET;
++		const idx_t all_states = 2 * pattern_states;
++		pattern_skip.assign(all_states, 0);
++		pattern_skip_count.assign(all_states, 0);
++		pattern_skip_codes.assign(pattern_states * MAX_SKIP_CODES * 16, 0);
++		pattern_skip_enabled = false;
++		// "escape pending" states are never skippable: their next byte is a literal
++		for (idx_t s = 0; s < pattern_states; s++) {
++			const uint16_t self = UnsafeNumericCast<uint16_t>(s * ALPHABET);
++			uint8_t codes[ALPHABET];
++			idx_t count = 0;
++			for (idx_t c = 0; c < ALPHABET; c++) {
++				if (pattern_table[s * ALPHABET + c] != self) {
++					codes[count++] = UnsafeNumericCast<uint8_t>(c);
++				}
++			}
++			if (count > MAX_SKIP_CODES) {
++				continue;
++			}
++			// pad to a multiple of 4 with a repeated leaving code (a spurious hit only costs a scalar step)
++			idx_t padded = count;
++			while (count > 0 && padded % 4 != 0) {
++				codes[padded++] = codes[0];
++			}
++			pattern_skip[s] = 1;
++			pattern_skip_count[s] = UnsafeNumericCast<uint8_t>(padded);
++			for (idx_t j = 0; j < padded; j++) {
++				memset(pattern_skip_codes.data() + (s * MAX_SKIP_CODES + j) * 16, codes[j], 16);
++			}
++			pattern_skip_enabled = true;
++		}
++	}
++
++	//! The position of the first code at or after k that leaves the (skippable) state, or len if there is none.
++	//! Bytes up to "limit" may be read.
++	inline uint32_t NextLeave(uint32_t state, const_data_ptr_t str, uint32_t k, uint32_t len, const_data_ptr_t limit,
++	                          idx_t &work) const {
++		const idx_t s = state >> 8;
++		const idx_t count = pattern_skip_count[s];
++		if (count == 0) {
++			// absorbing state
++			return len;
++		}
++#ifdef DUCKDB_FSST_SKIP_SSE2
++		auto codes = pattern_skip_codes.data() + s * MAX_SKIP_CODES * 16;
++		while (k < len && str + k + 16 <= limit) {
++			const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i *>(str + k));
++			__m128i acc = _mm_setzero_si128();
++			for (idx_t j = 0; j < count; j += 4) {
++				auto c = reinterpret_cast<const __m128i *>(codes + j * 16);
++				const __m128i a = _mm_or_si128(_mm_cmpeq_epi8(x, _mm_loadu_si128(c)),
++				                               _mm_cmpeq_epi8(x, _mm_loadu_si128(c + 1)));
++				const __m128i b = _mm_or_si128(_mm_cmpeq_epi8(x, _mm_loadu_si128(c + 2)),
++				                               _mm_cmpeq_epi8(x, _mm_loadu_si128(c + 3)));
++				acc = _mm_or_si128(acc, _mm_or_si128(a, b));
++			}
++			uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(acc));
++			const uint32_t remaining = len - k;
++			if (remaining < 16) {
++				mask &= (1u << remaining) - 1;
++			}
++			work++;
++			if (mask) {
++				return k + static_cast<uint32_t>(__builtin_ctz(mask));
++			}
++			k += 16;
++		}
++#endif
++		// near the end of the buffer (or without SIMD): test the codes one by one
++		const uint16_t *row = pattern_table.data() + state;
++		for (; k < len; k++) {
++			if (row[str[k]] != state) {
++				return k;
++			}
++		}
++		return len;
++	}
+ 
+ 	void InitializePattern(const TableFilter &filter) {
+ 		pattern_filter = &filter;
+@@ -802,6 +896,7 @@ struct FSSTScanState : public StringScanState {
+ 				    UnsafeNumericCast<uint16_t>(dfa->transitions[s * ALPHABET + b] * ALPHABET);
+ 			}
+ 		}
++		InitializeSkip();
+ 	}
+ 
+ 	void StoreLastDelta(uint32_t value, int64_t row) {
+@@ -1111,6 +1206,38 @@ void FSSTStorage::Filter(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 	SelectionVector new_sel(sel_count);
+ 	idx_t approved_count = 0;
+ 	idx_t i = 0;
++	if (false && scan_state.pattern_skip_enabled) {
++		// walk only the codes that can change the state: skippable states jump ahead to the next code that leaves them
++		const uint8_t *skip = scan_state.pattern_skip.data();
++		const_data_ptr_t limit = baseptr + dict.end;
++		idx_t work = 0;
++		idx_t total = 0;
++		for (; i < sel_count; i++) {
++			auto row = sel.get_index(i);
++			const uint32_t len = lengths[row];
++			auto str = get_string(row);
++			uint32_t s = 0;
++			uint32_t k = 0;
++			while (true) {
++				if (skip[s >> 8]) {
++					k = scan_state.NextLeave(s, str, k, len, limit, work);
++				}
++				if (k >= len) {
++					break;
++				}
++				s = table[s + str[k]];
++				k++;
++				work++;
++			}
++			total += len;
++			new_sel.set_index(approved_count, row);
++			approved_count += accept[s >> 8];
++		}
++		if (work * 2 > total) {
++			// most codes are walked anyway: the plain walk below is faster for the rest of the segment
++			scan_state.pattern_skip_enabled = false;
++		}
++	}
+ 	// process four strings at a time to overlap the dependent table lookups
+ 	for (; i + 4 <= sel_count; i += 4) {
+ 		idx_t rows[4];

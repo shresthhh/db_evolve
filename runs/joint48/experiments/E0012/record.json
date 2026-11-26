@@ -1,0 +1,40 @@
+{
+  "id": "E0012",
+  "title": "OR-of-ranges scan filter as dense-mask ExpressionFilter",
+  "started": "2026-11-24T07:26:09-05:00",
+  "base": "511697b3e4b162274d095d068971bb903caf8815",
+  "candidate": "8990731e60d645bb78c228268c43081fdebc84b8",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.9897533999999999,
+  "summary": "I added a fast path for EXPRESSION_FILTER in ColumnSegment::FilterSelection (src/storage/table/column_segment.cpp; the change is in this one file). When the expression is an AND/OR tree whose leaves are BETWEENs or comparisons (=, !=, <, <=, >, >=) of the filtered column (BOUND_REF 0, exact type) against non-NULL constants of the same type, the selected values are first gathered into a dense array. Each node is then evaluated as a branch-free uint8 mask and ANDed/ORed together. The mask is ANDed with validity and turned into a fresh selection vector. Anything else falls back to the existing ExpressionExecutor path unchanged.\n\nMeasured: the lineitem scan in the q19.m0 profile went from 5.12s to 4.76s CPU, and total time from 0.725s to 0.670s. `bench q19` gave -9.0%, -7.5% and -11.1% in three runs; the full bench had q19 at only -2.9% because that run was noisy. The full bench geomean was -0.1%. That run showed q08 +12.5% and q17 +9.9%, but a re-run gave +0.6% and -0.2%, and q22 went from +6.3% to -1.1%. I didn't trace the plans of those templates to rule out the new path, but the re-runs say it was noise.\n\nCorrectness check: on a temp table with NULLs (DECIMAL, INTEGER, DATE, UTINYINT columns), 4 count queries matched the same predicates rewritten with casts so they fall back to the generic path. A sum with flipped constant-on-left comparisons and != matched its hand-computed value. I did not confirm that these test filters were actually pushed down as expression filters, so they may not have exercised the new path.",
+  "notes": "- In the prior run, evaluating the full 2048-row vector even when the incoming selection was sparse made q19 5% slower. Gathering the selected values first is essential.\n- Full-bench noise on unrelated templates is about \u00b110% (q08, q17); re-run individual templates before drawing conclusions.\n- The plan is re-analysed on every vector call (a tree walk plus reading a few Value constants). It's cheap for small trees. Precompiling it into ExpressionFilterState would need a header change.\n- Possible follow-ups:\n  - Add float/double support using DuckDB's NaN-aware comparison operators.\n  - Extend to VARCHAR equality ORs.\n  - The lineitem scan is still about 4.76s CPU, mostly from other filters (shipinstruct string equality, BF) and decoding.",
+  "train_ratio": 0.9900754770197094,
+  "val_ratio": 1.0128043723919715,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0563191111645402,
+    "q03": 1.019641914930957,
+    "q04": 1.0258238451004231,
+    "q05": 0.9886547126150907,
+    "q07": 0.9877948040966201,
+    "q08": 0.977719921156188,
+    "q09": 0.9613792443459894,
+    "q13": 1.022691354746332,
+    "q14": 0.9818988237116771,
+    "q16": 0.9924905501674424,
+    "q17": 0.9976156209660859,
+    "q18": 1.0002787404037046,
+    "q19": 0.8988383196005263,
+    "q22": 0.9592161830925637
+  },
+  "improved": [
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T07:40:14-05:00"
+}

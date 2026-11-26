@@ -1,0 +1,90 @@
+diff --git a/src/common/row_operations/row_aggregate.cpp b/src/common/row_operations/row_aggregate.cpp
+index 6d53b9d..e36186c 100644
+--- a/src/common/row_operations/row_aggregate.cpp
++++ b/src/common/row_operations/row_aggregate.cpp
+@@ -5,6 +5,48 @@
+ 
+ namespace duckdb {
+ 
++template <idx_t WIDTH>
++static void CopyStateTemplate(data_ptr_t *pointers, const SelectionVector &sel, idx_t count, idx_t aggr_offset,
++                              const_data_ptr_t state_template) {
++	if (sel.IsSet()) {
++		for (idx_t i = 0; i < count; ++i) {
++			memcpy(pointers[sel.get_index_unsafe(i)] + aggr_offset, state_template, WIDTH);
++		}
++	} else {
++		for (idx_t i = 0; i < count; ++i) {
++			memcpy(pointers[i] + aggr_offset, state_template, WIDTH);
++		}
++	}
++}
++
++static void CopyStateTemplate(data_ptr_t *pointers, const SelectionVector &sel, idx_t count, idx_t aggr_offset,
++                              const_data_ptr_t state_template, idx_t width) {
++	switch (width) {
++	case 8:
++		return CopyStateTemplate<8>(pointers, sel, count, aggr_offset, state_template);
++	case 16:
++		return CopyStateTemplate<16>(pointers, sel, count, aggr_offset, state_template);
++	case 24:
++		return CopyStateTemplate<24>(pointers, sel, count, aggr_offset, state_template);
++	case 32:
++		return CopyStateTemplate<32>(pointers, sel, count, aggr_offset, state_template);
++	case 48:
++		return CopyStateTemplate<48>(pointers, sel, count, aggr_offset, state_template);
++	case 64:
++		return CopyStateTemplate<64>(pointers, sel, count, aggr_offset, state_template);
++	default:
++		if (sel.IsSet()) {
++			for (idx_t i = 0; i < count; ++i) {
++				memcpy(pointers[sel.get_index_unsafe(i)] + aggr_offset, state_template, width);
++			}
++		} else {
++			for (idx_t i = 0; i < count; ++i) {
++				memcpy(pointers[i] + aggr_offset, state_template, width);
++			}
++		}
++	}
++}
++
+ void RowOperations::InitializeStates(TupleDataLayout &layout, Vector &addresses, const SelectionVector &sel,
+                                      idx_t count) {
+ 	if (count == 0) {
+@@ -14,6 +56,36 @@ void RowOperations::InitializeStates(TupleDataLayout &layout, Vector &addresses,
+ 	auto &offsets = layout.GetOffsets();
+ 	auto aggr_idx = layout.ColumnCount();
+ 
++	// Destructor-free states own no memory, so their initialized bytes do not depend on the state's address:
++	// initialize one template block and copy it into every row instead of calling each init callback per row
++	static constexpr idx_t MAX_TEMPLATE_WIDTH = 256;
++	static constexpr idx_t MIN_TEMPLATE_COUNT = 4;
++	const auto aggr_offset = layout.GetAggrOffset();
++	const auto aggr_width = layout.GetAggrWidth();
++	if (!layout.HasDestructor() && count >= MIN_TEMPLATE_COUNT && aggr_width > 0 &&
++	    aggr_width <= MAX_TEMPLATE_WIDTH && !layout.GetAggregates().empty()) {
++		bool contiguous = true;
++		for (idx_t i = 0; i < layout.GetAggregates().size(); i++) {
++			const auto &aggr = layout.GetAggregates()[i];
++			const auto offset = offsets[aggr_idx + i];
++			if (offset < aggr_offset || offset + aggr.payload_size > aggr_offset + aggr_width) {
++				contiguous = false;
++				break;
++			}
++		}
++		if (contiguous) {
++			alignas(16) data_t state_template[MAX_TEMPLATE_WIDTH];
++			memset(state_template, 0, aggr_width);
++			for (idx_t i = 0; i < layout.GetAggregates().size(); i++) {
++				const auto &aggr = layout.GetAggregates()[i];
++				aggr.function.GetStateInitCallback()(aggr.function,
++				                                     state_template + (offsets[aggr_idx + i] - aggr_offset));
++			}
++			CopyStateTemplate(pointers, sel, count, aggr_offset, state_template, aggr_width);
++			return;
++		}
++	}
++
+ 	for (const auto &aggr : layout.GetAggregates()) {
+ 		if (sel.IsSet()) {
+ 			for (idx_t i = 0; i < count; ++i) {

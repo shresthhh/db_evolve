@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:331: the change is one line. For any join whose build side is a LOGICAL_DELIM_GET, build_side_has_filter is now true. It used to be IsFiltering(children[0]), which tested the probe side. Nothing in the new condition refers to a particular query, table, literal or data distribution. It applies to every decorrelated correlated subquery whose inner join is built from the DELIM_GET.",
+      "Correctness: this flag only lets the existing Bloom filter mechanism be considered. A Bloom filter only drops probe rows that have no build match. The join-type gating earlier in GenerateJoinFilters (no MARK/ANTI/LEFT/OUTER/SINGLE) is unchanged, so no join type that needs unmatched probe rows can lose them. NULL and NOT DISTINCT FROM handling stays in the existing PushBloomFilter path. Nothing new can return wrong answers.",
+      "Cost: when the DELIM set covers the whole key domain, the filter is unselective. The existing CanUseBloomFilter checks (probe estimate larger than build count, COMPARE_EQUAL, not a perfect hash table) and the selectivity-based self-disable limit that cost. The change does not move work elsewhere or touch measurement code.",
+      "The change missed its stated target: q17 showed no gain. The measured gain is on q22, -19..-27%. This is still a legitimate general improvement."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/optimizer/join_filter_pushdown_optimizer.cpp:331: the change is one line. For any join whose build side is a LOGICAL_DELIM_GET, build_side_has_filter is now true. It used to be IsFiltering(children[0]), which tested the probe side. Nothing in the new condition refers to a particular query, table, literal or data distribution. It applies to every decorrelated correlated subquery whose inner join is built from the DELIM_GET.\",\"Correctness: this flag only lets the existing Bloom filter mechanism be considered. A Bloom filter only drops probe rows that have no build match. The join-type gating earlier in GenerateJoinFilters (no MARK/ANTI/LEFT/OUTER/SINGLE) is unchanged, so no join type that needs unmatched probe rows can lose them. NULL and NOT DISTINCT FROM handling stays in the existing PushBloomFilter path. Nothing new can return wrong answers.\",\"Cost: when the DELIM set covers the whole key domain, the filter is unselective. The existing CanUseBloomFilter checks (probe estimate larger than build count, COMPARE_EQUAL, not a perfect hash table) and the selectivity-based self-disable limit that cost. The change does not move work elsewhere or touch measurement code.\",\"The change missed its stated target: q17 showed no gain. The measured gain is on q22, -19..-27%. This is still a legitimate general improvement.\"],\"required_changes\":[]}",
+  "cost_usd": 0.10308980000000001,
+  "seconds": 23.91397786140442,
+  "error": ""
+}

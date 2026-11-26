@@ -1,0 +1,155 @@
+diff --git a/src/optimizer/deliminator.cpp b/src/optimizer/deliminator.cpp
+index 210d17a..758ad59 100644
+--- a/src/optimizer/deliminator.cpp
++++ b/src/optimizer/deliminator.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/planner/operator/logical_delim_get.hpp"
+ #include "duckdb/planner/operator/logical_filter.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
++#include "duckdb/planner/operator/logical_projection.hpp"
+ #include "duckdb/planner/table_filter.hpp"
+ 
+ #include <algorithm>
+@@ -45,6 +46,87 @@ static bool IsEqualityJoinCondition(const JoinCondition &cond) {
+ 	}
+ }
+ 
++static bool OperatorIsDelimGet(LogicalOperator &op);
++
++// Adds the bindings of projections that pass through a binding in 'bindings' (post-order, so chains are followed)
++static void PropagateBindingsThroughProjections(const LogicalOperator &op, vector<ColumnBinding> &bindings) {
++	for (auto &child : op.children) {
++		PropagateBindingsThroughProjections(*child, bindings);
++	}
++	if (op.type != LogicalOperatorType::LOGICAL_PROJECTION) {
++		return;
++	}
++	auto &proj = op.Cast<LogicalProjection>();
++	for (idx_t i = 0; i < proj.expressions.size(); i++) {
++		auto &expr = *proj.expressions[i];
++		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++			continue;
++		}
++		auto &binding = expr.Cast<BoundColumnRefExpression>().binding;
++		if (std::find(bindings.begin(), bindings.end(), binding) != bindings.end()) {
++			bindings.emplace_back(proj.table_index, i);
++		}
++	}
++}
++
++static bool SubtreeIsSimpleSelectJoin(const LogicalOperator &op) {
++	switch (op.type) {
++	case LogicalOperatorType::LOGICAL_PROJECTION:
++	case LogicalOperatorType::LOGICAL_FILTER:
++	case LogicalOperatorType::LOGICAL_GET:
++	case LogicalOperatorType::LOGICAL_DELIM_GET:
++		break;
++	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
++		// joins that do not NULL-extend any of their outputs
++		auto &join = op.Cast<LogicalComparisonJoin>();
++		if (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) {
++			return false;
++		}
++		break;
++	}
++	default:
++		return false;
++	}
++	for (auto &child : op.children) {
++		if (!SubtreeIsSimpleSelectJoin(*child)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++// The selection on the LHS of a SEMI DelimJoin is normally a reason to keep the join with the DelimGet,
++// because it shrinks the RHS. If the RHS is a plain select/join tree that is joined to the DelimGet with
++// equality conditions only, the plain semi join that remains after deliminating gets the same reduction
++// from join filter pushdown (min/max + Bloom filter on the probe side), without the duplicate elimination.
++// On success, 'non_null_bindings' holds the non-DelimGet side bindings of the join with the DelimGet:
++// RemoveJoinWithDelimGet filters these with IS NOT NULL (all conditions are COMPARE_EQUAL).
++static bool SelectionIsReplaceableByJoinFilter(const DelimCandidate &candidate,
++                                               vector<ColumnBinding> &non_null_bindings) {
++	auto &delim_join = candidate.delim_join;
++	if (delim_join.join_type != JoinType::SEMI || candidate.delim_get_count != 1 || candidate.joins.size() != 1) {
++		return false;
++	}
++	auto &join = candidate.joins[0].join.get()->Cast<LogicalComparisonJoin>();
++	if (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) {
++		return false;
++	}
++	if (join.conditions.empty()) {
++		return false;
++	}
++	const idx_t delim_idx = OperatorIsDelimGet(*join.children[0]) ? 0 : 1;
++	for (auto &cond : join.conditions) {
++		if (cond.comparison != ExpressionType::COMPARE_EQUAL ||
++		    cond.left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
++		    cond.right->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++			return false;
++		}
++		auto &other_side = delim_idx == 0 ? *cond.right : *cond.left;
++		non_null_bindings.push_back(other_side.Cast<BoundColumnRefExpression>().binding);
++	}
++	return SubtreeIsSimpleSelectJoin(*delim_join.children[1]);
++}
++
+ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op) {
+ 	root = op;
+ 
+@@ -63,7 +145,12 @@ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op
+ 		          [](const JoinWithDelimGet &lhs, const JoinWithDelimGet &rhs) { return lhs.depth > rhs.depth; });
+ 
+ 		bool all_removed = true;
++		vector<ColumnBinding> non_null_bindings;
++		bool replaceable_selection = false;
+ 		if (!candidate.joins.empty() && HasSelection(delim_join)) {
++			replaceable_selection = SelectionIsReplaceableByJoinFilter(candidate, non_null_bindings);
++		}
++		if (!candidate.joins.empty() && HasSelection(delim_join) && !replaceable_selection) {
+ 			// Keep the deepest join with DelimGet in these cases,
+ 			// as the selection can greatly reduce the cost of the RHS child of the DelimJoin
+ 			candidate.joins.erase(candidate.joins.begin());
+@@ -81,6 +168,22 @@ unique_ptr<LogicalOperator> Deliminator::Optimize(unique_ptr<LogicalOperator> op
+ 		if (candidate.joins.size() == candidate.delim_get_count && all_removed) {
+ 			delim_join.type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+ 			delim_join.duplicate_eliminated_columns.clear();
++			if (replaceable_selection) {
++				// The RHS of these conditions is filtered with IS NOT NULL, so for this SEMI join
++				// IS NOT DISTINCT FROM is equivalent to =, which allows join filter pushdown
++				PropagateBindingsThroughProjections(*delim_join.children[1], non_null_bindings);
++				for (auto &cond : delim_join.conditions) {
++					if (cond.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM ||
++					    cond.right->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++						continue;
++					}
++					auto &binding = cond.right->Cast<BoundColumnRefExpression>().binding;
++					if (std::find(non_null_bindings.begin(), non_null_bindings.end(), binding) !=
++					    non_null_bindings.end()) {
++						cond.comparison = ExpressionType::COMPARE_EQUAL;
++					}
++				}
++			}
+ 		}
+ 
+ 		// Only DelimJoins are ever created as SINGLE joins,
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index fcd2225..03a72d5 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -236,12 +236,11 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
+ 	case JoinType::LEFT:
+ 	case JoinType::OUTER:
+ 	case JoinType::ANTI:
+-	case JoinType::RIGHT_ANTI:
+-	case JoinType::RIGHT_SEMI:
+ 		// cannot generate join filters for these join types
+ 		// mark/single - cannot change cardinality of probe side
+ 		// left/outer always need to include every row from probe side
+-		// FIXME: anti/right_anti - we could do this, but need to invert the join conditions
++		// FIXME: anti - we could do this, but need to invert the join conditions
++		// (right_semi/right_anti only output build rows, so probe rows that cannot match can be dropped)
+ 		return;
+ 	default:
+ 		break;

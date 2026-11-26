@@ -1,0 +1,199 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 5254081..1516202 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "duckdb/common/enums/join_type.hpp"
+ #include "duckdb/common/exception.hpp"
++#include "duckdb/common/huge_page_util.hpp"
+ #include "duckdb/common/radix_partitioning.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/execution/ht_entry.hpp"
+@@ -122,6 +123,36 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
+ }
+ 
+ JoinHashTable::~JoinHashTable() {
++	FreeHashMap();
++}
++
++void JoinHashTable::FreeHashMap() {
++	if (hash_map_huge_pages && hash_map.get()) {
++		HugePageUtil::Release(data_ptr_cast(entries), HashMapCapacity() * sizeof(ht_entry_t));
++	}
++	hash_map.Reset();
++	hash_map_huge_pages = false;
++}
++
++idx_t JoinHashTable::HashMapCapacity() const {
++	const auto slack = hash_map_huge_pages ? HugePageUtil::HUGE_PAGE_SIZE : 0;
++	return (hash_map.GetSize() - slack) / sizeof(ht_entry_t);
++}
++
++void JoinHashTable::AllocateHashMap(idx_t new_capacity) {
++	FreeHashMap();
++	const auto table_size = new_capacity * sizeof(ht_entry_t);
++	if (HugePageUtil::ShouldUse(table_size)) {
++		// Large pointer tables are probed randomly: back them with (2MB-aligned) huge pages to avoid TLB misses
++		hash_map = buffer_manager.GetBufferAllocator().Allocate(table_size + HugePageUtil::HUGE_PAGE_SIZE);
++		auto aligned = HugePageUtil::Align(hash_map.get());
++		HugePageUtil::Advise(aligned, table_size);
++		entries = reinterpret_cast<ht_entry_t *>(aligned);
++		hash_map_huge_pages = true;
++	} else {
++		hash_map = buffer_manager.GetBufferAllocator().Allocate(table_size);
++		entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
++	}
+ }
+ 
+ void JoinHashTable::Merge(JoinHashTable &other) {
+@@ -798,21 +829,19 @@ void JoinHashTable::AllocatePointerTable() {
+ 
+ 	if (hash_map.get()) {
+ 		// There is already a hash map
+-		auto current_capacity = hash_map.GetSize() / sizeof(ht_entry_t);
++		auto current_capacity = HashMapCapacity();
+ 		if (capacity > current_capacity) {
+ 			// Need more space
+-			hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
+-			entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
++			AllocateHashMap(capacity);
+ 		} else {
+ 			// Just use the current hash map
+ 			capacity = current_capacity;
+ 		}
+ 	} else {
+ 		// Allocate a hash map
+-		hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
+-		entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
++		AllocateHashMap(capacity);
+ 	}
+-	D_ASSERT(hash_map.GetSize() == capacity * sizeof(ht_entry_t));
++	D_ASSERT(HashMapCapacity() == capacity);
+ 
+ 	bitmask = capacity - 1;
+ 
+@@ -1670,7 +1699,7 @@ void JoinHashTable::Repartition(JoinHashTable &global_ht) {
+ 
+ void JoinHashTable::Reset() {
+ 	data_collection->Reset();
+-	hash_map.Reset();
++	FreeHashMap();
+ 	current_partitions.SetAllInvalid(RadixPartitioning::NumberOfPartitions(radix_bits));
+ 	finalized = false;
+ }
+diff --git a/src/include/duckdb/common/huge_page_util.hpp b/src/include/duckdb/common/huge_page_util.hpp
+new file mode 100644
+index 0000000..b0fc8bf
+--- /dev/null
++++ b/src/include/duckdb/common/huge_page_util.hpp
+@@ -0,0 +1,90 @@
++//===----------------------------------------------------------------------===//
++//                         DuckDB
++//
++// duckdb/common/huge_page_util.hpp
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb/common/constants.hpp"
++
++#include <cstdio>
++#include <cstring>
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
++namespace duckdb {
++
++//! Helpers to back large, randomly accessed arrays (e.g., hash join tables) with transparent huge pages.
++//! Arrays beyond the TLB reach of 4KB pages pay a TLB miss + page walk on (almost) every random access.
++//! Usage: over-allocate by HUGE_PAGE_SIZE, align the start with Align, call Advise before first touch,
++//! and call Release on the same range before the memory is freed, so that recycled allocator memory
++//! does not keep the huge page advice.
++struct HugePageUtil {
++	static constexpr idx_t HUGE_PAGE_SIZE = 2ULL * 1024ULL * 1024ULL;
++	//! Arrays of at least this size are backed by huge pages
++	static constexpr idx_t MIN_ARRAY_SIZE = 8ULL * 1024ULL * 1024ULL;
++
++	//! Whether transparent huge pages can be requested with madvise
++	static bool Enabled() {
++		static const bool enabled = ReadEnabled();
++		return enabled;
++	}
++
++	static bool ShouldUse(idx_t size) {
++		return size >= MIN_ARRAY_SIZE && Enabled();
++	}
++
++	static data_ptr_t Align(data_ptr_t ptr) {
++		const auto addr = reinterpret_cast<uintptr_t>(ptr);
++		return reinterpret_cast<data_ptr_t>((addr + HUGE_PAGE_SIZE - 1) & ~(uintptr_t(HUGE_PAGE_SIZE) - 1));
++	}
++
++	//! Size rounded down to whole huge pages (the range that is advised/released)
++	static idx_t AdvisedSize(idx_t size) {
++		return size & ~(HUGE_PAGE_SIZE - 1);
++	}
++
++	//! ptr must be aligned with Align
++	static void Advise(data_ptr_t ptr, idx_t size) {
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++		const auto advised_size = AdvisedSize(size);
++		if (advised_size > 0) {
++			madvise(ptr, advised_size, MADV_HUGEPAGE);
++		}
++#endif
++	}
++
++	//! Drops the pages of the range and removes the huge page advice; the contents are lost
++	static void Release(data_ptr_t ptr, idx_t size) {
++#if defined(__linux__) && defined(MADV_HUGEPAGE) && defined(MADV_NOHUGEPAGE)
++		const auto advised_size = AdvisedSize(size);
++		if (advised_size > 0) {
++			madvise(ptr, advised_size, MADV_DONTNEED);
++			madvise(ptr, advised_size, MADV_NOHUGEPAGE);
++		}
++#endif
++	}
++
++private:
++	static bool ReadEnabled() {
++#if defined(__linux__) && defined(MADV_HUGEPAGE) && defined(MADV_NOHUGEPAGE)
++		auto file = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
++		if (!file) {
++			return false;
++		}
++		char buffer[128];
++		const auto read = std::fread(buffer, 1, sizeof(buffer) - 1, file);
++		std::fclose(file);
++		buffer[read] = '\0';
++		return std::strstr(buffer, "[madvise]") != nullptr || std::strstr(buffer, "[always]") != nullptr;
++#else
++		return false;
++#endif
++	}
++};
++
++} // namespace duckdb
+diff --git a/src/include/duckdb/execution/join_hashtable.hpp b/src/include/duckdb/execution/join_hashtable.hpp
+index 942997d..ccba4bc 100644
+--- a/src/include/duckdb/execution/join_hashtable.hpp
++++ b/src/include/duckdb/execution/join_hashtable.hpp
+@@ -335,6 +335,14 @@ private:
+ 	//! The hash map of the HT, created after finalization
+ 	AllocatedData hash_map;
+ 	ht_entry_t *entries = nullptr;
++	//! Whether hash_map has HugePageUtil slack and entries is huge-page aligned and advised
++	bool hash_map_huge_pages = false;
++	//! Allocates hash_map for the given capacity and sets entries
++	void AllocateHashMap(idx_t new_capacity);
++	//! Frees hash_map (dropping any huge page advice first)
++	void FreeHashMap();
++	//! Number of entries that fit in the current hash_map
++	idx_t HashMapCapacity() const;
+ 	//! Whether or not NULL values are considered equal in each of the comparisons
+ 	vector<bool> null_values_are_equal;
+ 	//! An empty tuple that's a "dead end", can be used to stop chains early

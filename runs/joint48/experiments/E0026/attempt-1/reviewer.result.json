@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/planner/filter/bloom_filter.cpp: TemplatedLookupHashed computes duckdb::Hash<T>(v) for valid rows and 0xbf58476d1ce4e5b9 for NULLs. That is exactly what HashOp::Operation / TightLoopHash in vector_hash.cpp produce, so the fused probe gives the same bits as the old HashInternal + LookupHashes path. Like the old path, it does not check the key type against key_type. Selection handling is copied from the exact path: row_sel for flat vectors, slicing for dictionary vectors. Results are therefore the same for NULLs, dictionary inputs and filtered selections. Constant vectors and non-integer types keep the old path.",
+      "Small maintainability nit: BF_NULL_HASH copies a constant that is private to vector_hash.cpp. The comment explains why, but there is no static_assert. The LookupHashedKeys/IsFusedHashType switches repeat the switch in LookupExactKeys. Neither is enough to reject.",
+      "src/execution/operator/join/physical_hash_join.cpp: the new medium exact tier caps the bitmap at 2^27 bits (16MB). At 1024 bits/key it applies only to builds up to 128k keys; bigger builds get the flat 2^27 cap. The condition depends only on build key count and range, not on any particular query. Memory is bounded and allocated during the build, which is timed, so no cost is moved out of the timing. The exact-mode probe is unchanged, keeps its existing overflow/type guards, and has no false negatives.",
+      "The author did not run the requested profile check. The only evidence is bench wall time, which was mixed: full-bench geomean +0.1%, rerun -4.6% on 5 templates. That is fine for a general change that does the same work in fewer passes."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/planner/filter/bloom_filter.cpp: TemplatedLookupHashed computes duckdb::Hash<T>(v) for valid rows and 0xbf58476d1ce4e5b9 for NULLs. That is exactly what HashOp::Operation / TightLoopHash in vector_hash.cpp produce, so the fused probe gives the same bits as the old HashInternal + LookupHashes path. Like the old path, it does not check the key type against key_type. Selection handling is copied from the exact path: row_sel for flat vectors, slicing for dictionary vectors. Results are therefore the same for NULLs, dictionary inputs and filtered selections. Constant vectors and non-integer types keep the old path.\",\"Small maintainability nit: BF_NULL_HASH copies a constant that is private to vector_hash.cpp. The comment explains why, but there is no static_assert. The LookupHashedKeys/IsFusedHashType switches repeat the switch in LookupExactKeys. Neither is enough to reject.\",\"src/execution/operator/join/physical_hash_join.cpp: the new medium exact tier caps the bitmap at 2^27 bits (16MB). At 1024 bits/key it applies only to builds up to 128k keys; bigger builds get the flat 2^27 cap. The condition depends only on build key count and range, not on any particular query. Memory is bounded and allocated during the build, which is timed, so no cost is moved out of the timing. The exact-mode probe is unchanged, keeps its existing overflow/type guards, and has no false negatives.\",\"The author did not run the requested profile check. The only evidence is bench wall time, which was mixed: full-bench geomean +0.1%, rerun -4.6% on 5 templates. That is fine for a general change that does the same work in fewer passes.\"],\"required_changes\":[]}",
+  "cost_usd": 0.19989420000000002,
+  "seconds": 28.63793683052063,
+  "error": ""
+}

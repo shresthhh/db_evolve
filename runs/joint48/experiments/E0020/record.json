@@ -1,0 +1,42 @@
+{
+  "id": "E0020",
+  "title": "Exact-bitmap BF pushed through CM compress offset",
+  "started": "2026-11-24T20:55:02-05:00",
+  "base": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "candidate": "7ecf3e4d6c953002522d3f28973d51d7c4fc09e0",
+  "outcome": "retired",
+  "reasons": [
+    "visible geomean got slower (+0.0%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.6213586000000002,
+  "summary": "Hash joins now push their exact-bitmap Bloom filter to the probe scan even when compressed materialization has stored the join key as value \u2212 offset. Before this change that case got only min/max filters. Build OK. Over three bench runs q09 was \u221212.9%, \u221210.2% and \u221211.1% (about 500 \u2192 450 ms). On the full bench nothing else moved more than \u00b110%, and the bench treats differences under ~5% as noise. The geomean was \u22121.9% on the full bench and \u22122.1% / \u22124.5% on the subset runs.\n\nWhat changed:\n1) bloom_filter.hpp/.cpp: BFTableFilter has a new `key_offset` field (default 0) with SetKeyOffset. Copy and Serialize/Deserialize carry it (property 203, with a default). The exact-mode Filter, FilterValue and CheckStatistics paths subtract key_offset from the sign- or zero-extended 64-bit storage value before the bitmap test. The subtraction is modulo 2^64. A real member always maps exactly to its stored key, and wraparound can only cause a false positive, which the join then discards. CheckStatisticsExact now checks that the shifted key range round-trips into the column type and is ordered; if not, it returns NO_PRUNING_POSSIBLE. This avoids wrong row-group pruning when the range can't be represented in that type.\n2) physical_hash_join.cpp FinalizeFilters has a new branch. It fires when storage_offset is non-null, the condition type is integral, the filter is on join condition 0 and CanUseBloomFilter passes. It calls TrySetExactBloomFilter with the RAW min/max from the hash table (before the offset is applied), and defers the push only if the filter really is exact. A hashed filter is never pushed through an offset. PushBloomFilter sets key_type to the probe column's storage type and sets key_offset from the offset's low 64 bits (via HUGEINT). If the filter is not exact it pushes nothing.\n\nCorrectness checks: I compared each query against SET disabled_optimizers='join_filter_pushdown', and the results matched in both tests.\n- 15M-row BIGINT build with keys starting at 1e12 (offset 1e12) against a 60M-row probe starting below the offset. EXPLAIN ANALYZE shows the filter taking the probe from 45M rows (after the min/max range filter) to 6.4M.\n- Negative INTEGER keys (around \u22122e9) with NULLs on both sides, as an inner join and as an IN subquery.",
+  "notes": "q04 does not reach this path: its lineitem probe already gets an exact filter without compression in the current best plan. The q04 \u22127..\u22129% and +8.8% seen across runs, and q03's \u22125.5%/+9.2%, are noise, so the issue's expected q04 gain is not real on this tree. The only real gain is q09. The modular subtraction of the offset needs no HUGEINT on the probe path, because wraparound only produces false positives. However, the stats-pruning range check needs the round-trip check, since a cast inside the compression chain can make the shifted range unrepresentable in the probe type. CheckStatistics returning ALWAYS_TRUE on false positives is harmless.",
+  "train_ratio": 1.0002726713507886,
+  "val_ratio": 1.0016168533143484,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9734375609651403,
+    "q03": 1.027919295340921,
+    "q04": 1.0058471797955713,
+    "q05": 1.0171020463051592,
+    "q07": 1.0490962048307588,
+    "q08": 1.022937839940846,
+    "q09": 0.9119925358957424,
+    "q13": 0.997001314678071,
+    "q14": 0.9996596369539584,
+    "q16": 0.9953064095342187,
+    "q17": 1.0056887994298602,
+    "q18": 1.0022984503159262,
+    "q19": 0.9972211001671156,
+    "q22": 1.0048039559488298
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T21:15:48-05:00"
+}

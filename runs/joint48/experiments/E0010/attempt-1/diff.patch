@@ -1,0 +1,120 @@
+diff --git a/src/execution/aggregate_hashtable.cpp b/src/execution/aggregate_hashtable.cpp
+index 2629b6a..0f43c5b 100644
+--- a/src/execution/aggregate_hashtable.cpp
++++ b/src/execution/aggregate_hashtable.cpp
+@@ -517,11 +517,10 @@ optional_idx GroupedAggregateHashTable::TryAddCompressedGroups(DataChunk &groups
+ }
+ 
+ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter) {
+-	sink_count += groups.size();
+-
+ 	// check if we can use an optimized path that utilizes compressed vectors
+ 	auto result = TryAddCompressedGroups(groups, payload, filter);
+ 	if (result.IsValid()) {
++		sink_count += groups.size();
+ 		return result.GetIndex();
+ 	}
+ 	// otherwise append the raw values
+@@ -566,6 +565,7 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, Vector &group_hashe
+ 	if (groups.size() == 0) {
+ 		return 0;
+ 	}
++	sink_count += groups.size();
+ 
+ #ifdef DEBUG
+ 	D_ASSERT(groups.ColumnCount() + 1 == layout_ptr->ColumnCount());
+diff --git a/src/execution/operator/aggregate/physical_hash_aggregate.cpp b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+index 4eda5cb..a28df47 100644
+--- a/src/execution/operator/aggregate/physical_hash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_hash_aggregate.cpp
+@@ -185,6 +185,22 @@ PhysicalHashAggregate::PhysicalHashAggregate(PhysicalPlan &physical_plan, Client
+ 		groupings.emplace_back(grouping_sets[i], grouped_aggregate_data, distinct_collection_info, group_validity,
+ 		                       distinct_validity);
+ 	}
++
++	// With many groups, partition the distinct hash tables on the hash of the main groups only,
++	// so that each distinct partition holds complete groups when it is re-aggregated into the main table
++	static constexpr idx_t DISTINCT_GROUP_PARTITION_THRESHOLD = 4096;
++	if (estimated_cardinality >= DISTINCT_GROUP_PARTITION_THRESHOLD) {
++		for (auto &grouping : groupings) {
++			if (!grouping.distinct_data || grouping.table_data.grouping_set.empty()) {
++				continue;
++			}
++			for (auto &radix_table : grouping.distinct_data->radix_tables) {
++				if (radix_table) {
++					radix_table->partition_prefix_count = grouping.table_data.grouping_set.size();
++				}
++			}
++		}
++	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..0bad0dc 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -376,6 +376,9 @@ public:
+ 	unique_ptr<GroupedAggregateHashTable> ht;
+ 	//! Chunk with group columns
+ 	DataChunk group_chunk;
++	//! Hashes of the group columns and of the partition prefix columns (only used with partition_prefix_count)
++	Vector hashes;
++	Vector prefix_hashes;
+ 
+ 	//! After seeing this many tuples, we decide whether to adapt our strategy
+ 	//! This also serves as the maximum HT sink capacity
+@@ -390,7 +393,8 @@ public:
+ };
+ 
+ RadixHTLocalSinkState::RadixHTLocalSinkState(ClientContext &, const RadixPartitionedHashTable &radix_ht)
+-    : adapted(false), local_sink_capacity(DConstants::INVALID_INDEX) {
++    : hashes(LogicalType::HASH), prefix_hashes(LogicalType::HASH), adapted(false),
++      local_sink_capacity(DConstants::INVALID_INDEX) {
+ 	// If there are no groups we create a fake group so everything has the same group
+ 	group_chunk.InitializeEmpty(radix_ht.group_types);
+ 	if (radix_ht.grouping_set.empty()) {
+@@ -566,7 +570,28 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 	PopulateGroupChunk(group_chunk, chunk);
+ 
+ 	auto &ht = *lstate.ht;
+-	ht.AddChunk(group_chunk, payload_input, filter);
++	if (partition_prefix_count == 0 || group_chunk.size() == 0) {
++		ht.AddChunk(group_chunk, payload_input, filter);
++	} else {
++		// Hash the full group, but take the radix (partition) bits from the hash of the prefix columns only
++		const auto count = group_chunk.size();
++		auto &hashes = lstate.hashes;
++		auto &prefix_hashes = lstate.prefix_hashes;
++		group_chunk.Hash(hashes);
++		VectorOperations::Hash(group_chunk.data[0], prefix_hashes, count);
++		for (idx_t col_idx = 1; col_idx < partition_prefix_count; col_idx++) {
++			VectorOperations::CombineHash(prefix_hashes, group_chunk.data[col_idx], count);
++		}
++		hashes.Flatten(count);
++		prefix_hashes.Flatten(count);
++		static constexpr hash_t RADIX_MASK = RadixPartitioning::Mask(RadixPartitioning::MAX_RADIX_BITS);
++		auto hash_data = FlatVector::GetData<hash_t>(hashes);
++		const auto prefix_data = FlatVector::GetData<hash_t>(prefix_hashes);
++		for (idx_t i = 0; i < count; i++) {
++			hash_data[i] = (hash_data[i] & ~RADIX_MASK) | (prefix_data[i] & RADIX_MASK);
++		}
++		ht.AddChunk(group_chunk, hashes, payload_input, filter);
++	}
+ 
+ 	// Decide whether we should adapt our strategy to the data
+ 	if (!lstate.adapted && lstate.ht->GetSinkCount() >= RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD) {
+diff --git a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+index cf294cf..61ecba8 100644
+--- a/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
++++ b/src/include/duckdb/execution/radix_partitioned_hashtable.hpp
+@@ -35,6 +35,9 @@ public:
+ 	vector<Value> grouping_values;
+ 	//! Whether there are no NULLs in the groups
+ 	const TupleDataValidityType group_validity;
++	//! If non-zero, the radix (partition) bits of the hash are taken from the hash of only the first
++	//! 'partition_prefix_count' group columns, so that each partition holds all rows of a given prefix
++	idx_t partition_prefix_count = 0;
+ 
+ public:
+ 	//! Sink Interface

@@ -1,0 +1,27 @@
+{
+  "id": "E0006",
+  "title": "Exact bitmap BF for dense-int join keys on partsupp-style probes",
+  "started": "2026-11-24T02:55:22-05:00",
+  "base": "1033aad43d8ba556e66b355e855fc893dfdf09e9",
+  "candidate": "0ad9b3c52958fd5c935b6715571bd2712ffc69bd",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 2,
+  "cost_usd": 2.1209431999999997,
+  "summary": "The exact bitmap bloom filter for dense integer join keys is in place, and it now only applies to plain integer logical types. TrySetExactBloomFilter in physical_hash_join.cpp used to choose types by physical storage, which let DECIMAL, DATE and the like into exact mode. It now checks the logical type and only accepts TINYINT, SMALLINT, INTEGER, BIGINT, UTINYINT, USMALLINT, UINTEGER and UBIGINT. For these the Value min/max is the same as the stored value. DECIMAL, DATE, TIMESTAMP, ENUM and similar types fall back to the hashed bloom filter. Rest of the mechanism is unchanged: when max-min fits within the cap (128 bits per build row, at most 512MiB), the filter is a bitmap and the scan probes it with a bit test on (key - min). Checked with dbe-tool sql on temp tables: 8M-row probe, 2M-range build keeping every 7th key, with equi-joins on DECIMAL(15,2), DATE and INTEGER keys. Results with pushdown on were identical to results with disabled_optimizers='join_filter_pushdown' (dec 1142860 rows, date 835200, int 1142860), and the DECIMAL join no longer throws. I didn't confirm that a bloom filter was actually pushed in those test joins. Bench on q16: 172.9 ms \u2192 160.3 ms (-7.3%), from the quick check of 2 bindings \u00d7 4 hot runs; the tool calls anything under ~5% noise.",
+  "notes": "The reviewer asked for a committed DECIMAL/DATE test, but test/ is off limits under the path policy. The same check was run ad hoc through dbe-tool sql on temp tables, comparing against join_filter_pushdown disabled. Possible follow-up: allow DATE (and DECIMAL) by reading min/max as raw physical values with Value::GetValueUnsafe<T>, since range filters on date keys are common. Lesson: Value::GetValue<int64_t> does a logical cast, so it is not a raw read for types that share integer storage.",
+  "train_ratio": 0.9050461916205442,
+  "val_ratio": NaN,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q16": 0.9050461916205442
+  },
+  "improved": [
+    "q16"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T03:07:50-05:00"
+}

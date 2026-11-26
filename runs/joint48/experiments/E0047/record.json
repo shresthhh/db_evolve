@@ -1,0 +1,46 @@
+{
+  "id": "E0047",
+  "title": "q18 clustered agg bundle: batched run-interval registration + template state init",
+  "started": "2026-11-26T02:30:01-05:00",
+  "base": "c9a15ca13231772ca138544b1fb8b150cf2c1c88",
+  "candidate": "593749f76272101b9216efd7ec00b5f81e5cfc8d",
+  "outcome": "retired",
+  "reasons": [
+    "q09 slower by 12.5% (37 ms), beyond its 8.6% threshold",
+    "q14 slower by 7.1% (6 ms), beyond its 5.1% threshold",
+    "no visible template faster beyond its noise (best: q05 -6.9%; needs at least -20.3%)",
+    "visible geomean got slower (+0.9%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.9996665999999998,
+  "summary": "Two changes, both in .cpp files:\n(1) radix_partitioned_hashtable.cpp: RegisterRunInterval is replaced by FlushRunIntervals. Each thread now collects the intervals of its streamed chunks in a local buffer (`pending_intervals`, capacity 64). It registers them in the global interval map under one lock when the buffer fills, and once more at Combine. Overlap detection is unchanged: the same lower_bound/prev check runs on the exact open endpoints, with no merging of adjacent intervals. On overlap it sets run_intervals_overlap, the thread stops streaming, and later chunks go to the main hash table as before.\n(2) row_aggregate.cpp, RowOperations::InitializeStates: for layouts with no aggregate destructors, at least 16 rows, and an aggregate region of at most 128 bytes, the code initializes the states once into a template and copies it to each row. The copy has a fixed size for widths 8/16/24/32 and a variable size otherwise. Before using the template, it initializes two separate zeroed buffers and compares the bytes; if they differ (an init that depends on its address), it falls back to the per-aggregate path.\nTimings (bench, against current best):\n- q18, after the fixed-width copy: -1.1%, -4.8%, -5.5%, and -4.9% in the full run. That run's geomean was -2.3%, with q16 -6.1%, q17 -8.4% and q19 -6.2%. q16 was also -5.4% in a separate run.\n- First version, which copied with a variable-width memcpy: q18 was noise (-6.8%, +2.2%, +1.4%, +4.1%). The fixed-width copy is what made the change pay off.\n- q13 was +2.8% and +3.5% in two runs. That is inside the noise, but slightly consistent.\nCorrectness: I ran a union of two identical sorted ranges (forces a late overlap: 1M groups of 6 rows, sum/count/min/max/avg) and checked the totals by hand. I also ran a mixed set of aggregates (hugeint sum, bit_or, first, string_agg, list, max with NULLs, bool_and, arg_max) with a NULL group key and checked those by hand. I could not compare against the original engine or run the test suite, because the shell only allows dbe-tool. The issue's suggested comparison against the disabled clustered path and a shuffled copy was not done.",
+  "notes": "- The global run_intervals map is only an early exit that stops streaming. Correctness comes from ClusteredIntervalsDisjoint over all intervals at finalize, which falls back to MergeRunStores, so detecting overlap late is safe by construction.\n- Template-copy init with a variable-size memcpy per row was no better than the indirect init calls; making the copy size a compile-time constant is what gave the gain.\n- I did not measure the two parts separately after the fixed-width change, so the split of the gain between them is unknown. E0046 measured template init alone (variable memcpy) at about -2%.\n- q13's +3% across two runs may be worth a recheck. Its perfect aggregate also calls InitializeStates, so the per-call cost of building the template and comparing the two buffers is a candidate cause.",
+  "train_ratio": 1.0091242806925738,
+  "val_ratio": 1.0564257080599122,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9433631269053763,
+    "q03": 1.002000379812927,
+    "q04": 1.014586448036876,
+    "q05": 0.9310834430677717,
+    "q07": 0.9811071437389935,
+    "q08": 1.0190987352741234,
+    "q09": 1.1254481506853429,
+    "q13": 1.0352964422284334,
+    "q14": 1.0708177005439252,
+    "q16": 0.9803354999235516,
+    "q17": 1.0311836258580807,
+    "q18": 0.9667099167213381,
+    "q19": 1.0154409080465407,
+    "q22": 1.0273081093261949
+  },
+  "improved": [],
+  "regressed": [
+    "q09",
+    "q14"
+  ],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-26T02:45:34-05:00"
+}

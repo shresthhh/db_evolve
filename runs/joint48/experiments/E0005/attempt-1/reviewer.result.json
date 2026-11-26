@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The change is general. It applies to any hash join with more than one equality key, where the first key is a plain column with no cast and the existing BF gates pass (build side has a filter, probe side larger than build side, hash table not perfect). Nothing in it refers to particular tables, columns or literals.",
+      "Correctness: the JoinHashTable constructor asserts that equality conditions come first, so condition 0 is always an equality, and layout column 0 is condition 0's key. In Finalize, key column 0 is gathered from the HT rows and hashed with VectorOperations::Hash, the same call BFTableFilter makes on the probe side, so the BF holds a superset of the build-side first-key values. A partial-key BF can only give false positives, never false negatives, so it is sound. NULL keys: if nulls are not equal, those rows never reach the HT; for IS NOT DISTINCT FROM, the NULL hash is inserted and PushBloomFilter lets nulls pass through `NullValuesAreEqual(0)`.",
+      "Parallel finalize and spilling: the first-key insertion runs at the same point in Finalize that the old InsertHashes call did, and InsertHashes is only called from Finalize. Coverage and concurrency are therefore the same as for single-key joins.",
+      "Build-side cost: one extra Gather plus Hash per build chunk, only when the BF is active and the join has several keys. This is a real cost paid during the query, so it is not hidden. SelectivityOptionalFilter switches the BF off if it doesn't filter enough.",
+      "Minor: physical_hash_join.cpp:899 is longer than the formatter's line limit. Cosmetic only."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"The change is general. It applies to any hash join with more than one equality key, where the first key is a plain column with no cast and the existing BF gates pass (build side has a filter, probe side larger than build side, hash table not perfect). Nothing in it refers to particular tables, columns or literals.\",\"Correctness: the JoinHashTable constructor asserts that equality conditions come first, so condition 0 is always an equality, and layout column 0 is condition 0's key. In Finalize, key column 0 is gathered from the HT rows and hashed with VectorOperations::Hash, the same call BFTableFilter makes on the probe side, so the BF holds a superset of the build-side first-key values. A partial-key BF can only give false positives, never false negatives, so it is sound. NULL keys: if nulls are not equal, those rows never reach the HT; for IS NOT DISTINCT FROM, the NULL hash is inserted and PushBloomFilter lets nulls pass through `NullValuesAreEqual(0)`.\",\"Parallel finalize and spilling: the first-key insertion runs at the same point in Finalize that the old InsertHashes call did, and InsertHashes is only called from Finalize. Coverage and concurrency are therefore the same as for single-key joins.\",\"Build-side cost: one extra Gather plus Hash per build chunk, only when the BF is active and the join has several keys. This is a real cost paid during the query, so it is not hidden. SelectivityOptionalFilter switches the BF off if it doesn't filter enough.\",\"Minor: physical_hash_join.cpp:899 is longer than the formatter's line limit. Cosmetic only.\"],\"required_changes\":[]}",
+  "cost_usd": 0.18405280000000002,
+  "seconds": 46.413581132888794,
+  "error": ""
+}

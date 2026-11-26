@@ -1,0 +1,391 @@
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index df16e5f..f96d7d5 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "duckdb/common/bitpacking.hpp"
+ #include "duckdb/common/constants.hpp"
++#include "duckdb/common/likely.hpp"
+ #include "duckdb/common/random_engine.hpp"
+ #include "duckdb/function/compression/compression.hpp"
+ #include "duckdb/main/config.hpp"
+@@ -570,6 +571,93 @@ struct FSSTScanState : public StringScanState {
+ 			return FSSTPrimitives::DecompressValue(duckdb_fsst_decoder_ptr, str_buffer, str_ptr, str_len);
+ 		}
+ 	}
++
++	//! Decode one FSST string into "out", which must have room for 8 bytes per compressed byte
++	static inline idx_t DecodeString(const duckdb_fsst_decoder_t &decoder, const_data_ptr_t in, idx_t in_len,
++	                                 data_ptr_t out) {
++		idx_t pos_in = 0;
++		idx_t pos_out = 0;
++		while (pos_in < in_len) {
++			const uint8_t code = in[pos_in];
++			if (DUCKDB_LIKELY(code != FSST_ESC)) {
++				// every symbol is stored as 8 bytes, of which the first len[code] are valid
++				memcpy(out + pos_out, &decoder.symbol[code], sizeof(uint64_t));
++				pos_out += decoder.len[code];
++				pos_in++;
++			} else {
++				if (pos_in + 1 >= in_len) {
++					throw IOException("Corrupt database file: FSST string ends with an escape code");
++				}
++				out[pos_out++] = in[pos_in + 1];
++				pos_in += 2;
++			}
++		}
++		return pos_out;
++	}
++
++	//! Decompress "count" strings (row index of result j given by get_index(j)) back to back into shared
++	//! allocations of the string heap. Each string's decode is bounded by the remaining space of the allocation,
++	//! which always covers the worst case (8 bytes per code) of all strings still to be decoded in it.
++	template <class GET_INDEX>
++	void DecompressStrings(StringDictionaryContainer dict, data_ptr_t baseptr, const bp_delta_offsets_t &offsets,
++	                       idx_t count, GET_INDEX get_index, string_t *result_data,
++	                       VectorStringBuffer &str_buffer) const {
++		if (all_values_inlined) {
++			for (idx_t j = 0; j < count; j++) {
++				result_data[j] = DecompressString(dict, baseptr, offsets, get_index(j), str_buffer);
++			}
++			return;
++		}
++		// cap on the worst-case decoded size of one shared allocation
++		static constexpr idx_t BATCH_BOUND = 65536;
++		// slack so that the last string of a batch can also use the fast decode loop
++		static constexpr idx_t BATCH_SLACK = 32;
++		auto decoder = static_cast<duckdb_fsst_decoder_t *>(duckdb_fsst_decoder_ptr);
++		idx_t batch_start = 0;
++		while (batch_start < count) {
++			idx_t bound = 0;
++			idx_t batch_end = batch_start;
++			for (; batch_end < count; batch_end++) {
++				idx_t str_bound = idx_t(bitunpack_buffer[offsets.scan_offset + get_index(batch_end)]) * 8;
++				if (batch_end > batch_start && bound + str_bound > BATCH_BOUND) {
++					break;
++				}
++				bound += str_bound;
++			}
++			if (bound == 0) {
++				// only empty strings
++				for (idx_t j = batch_start; j < batch_end; j++) {
++					result_data[j] = string_t(nullptr, 0);
++				}
++				batch_start = batch_end;
++				continue;
++			}
++			const idx_t alloc_len = bound + BATCH_SLACK;
++			auto target = str_buffer.AllocateShrinkableBuffer(alloc_len);
++			idx_t used = 0;
++			for (idx_t j = batch_start; j < batch_end; j++) {
++				auto index = get_index(j);
++				uint32_t str_len = bitunpack_buffer[offsets.scan_offset + index];
++				if (str_len == 0) {
++					result_data[j] = string_t(nullptr, 0);
++					continue;
++				}
++				auto str_ptr = FSSTStorage::FetchStringPointer(
++				    dict, baseptr,
++				    UnsafeNumericCast<int32_t>(delta_decode_buffer[index + offsets.unused_delta_decoded_values]));
++				auto out = target + used;
++				auto decoded_size = DecodeString(*decoder, const_data_ptr_cast(str_ptr), str_len, out);
++				D_ASSERT(decoded_size <= alloc_len - used);
++				// strings that fit inline are copied into the string_t, so their space is reused
++				result_data[j] = string_t(const_char_ptr_cast(out), UnsafeNumericCast<uint32_t>(decoded_size));
++				if (decoded_size > string_t::INLINE_LENGTH) {
++					used += decoded_size;
++				}
++			}
++			str_buffer.FinalizeShrinkableBuffer(target, alloc_len, used);
++			batch_start = batch_end;
++		}
++	}
+ };
+ 
+ unique_ptr<SegmentScanState> FSSTStorage::StringInitScan(const QueryContext &context, ColumnSegment &segment) {
+@@ -696,9 +784,8 @@ void FSSTStorage::StringScanPartial(ColumnSegment &segment, ColumnScanState &sta
+ 	} else {
+ 		// Just decompress
+ 		auto &str_buffer = StringVector::GetStringBuffer(result);
+-		for (idx_t i = 0; i < scan_count; i++) {
+-			result_data[i + result_offset] = scan_state.DecompressString(dict, baseptr, offsets, i, str_buffer);
+-		}
++		scan_state.DecompressStrings(
++		    dict, baseptr, offsets, scan_count, [](idx_t i) { return i; }, result_data + result_offset, str_buffer);
+ 	}
+ 	EndScan(scan_state, offsets, start, scan_count);
+ }
+@@ -725,10 +812,8 @@ void FSSTStorage::Select(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 	auto offsets = StartScan(scan_state, base_data, start, vector_count);
+ 	auto result_data = FlatVector::GetData<string_t>(result);
+ 
+-	for (idx_t i = 0; i < sel_count; i++) {
+-		idx_t index = sel.get_index(i);
+-		result_data[i] = scan_state.DecompressString(dict, baseptr, offsets, index, str_buffer);
+-	}
++	scan_state.DecompressStrings(
++	    dict, baseptr, offsets, sel_count, [&sel](idx_t i) { return sel.get_index(i); }, result_data, str_buffer);
+ 	EndScan(scan_state, offsets, start, vector_count);
+ }
+ 
+diff --git a/src/storage/table/column_segment.cpp b/src/storage/table/column_segment.cpp
+index 520f973..99e2afa 100644
+--- a/src/storage/table/column_segment.cpp
++++ b/src/storage/table/column_segment.cpp
+@@ -18,10 +18,16 @@
+ #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
++#include "duckdb/planner/expression/bound_operator_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/common/operator/comparison_operators.hpp"
+ 
+ #include <cstring>
++#if defined(__SSE2__) && (defined(__GNUC__) || defined(__clang__))
++#include <emmintrin.h>
++#define DUCKDB_SUBSTRING_PREFILTER_SSE2
++#endif
+ 
+ namespace duckdb {
+ 
+@@ -652,6 +658,228 @@ static bool TryDenseMaskFilterSelection(const Expression &expr, const LogicalTyp
+ 	return true;
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Substring prefilter
++//===--------------------------------------------------------------------===//
++//! Returns the first occurrence of needle (needle_len >= 2) in [hay, hay + hay_len), or nullptr
++static const char *FindSubstring(const char *hay, idx_t hay_len, const char *needle, idx_t needle_len) {
++	if (hay_len < needle_len) {
++		return nullptr;
++	}
++	// candidate start positions are [hay, end)
++	const char *end = hay + (hay_len - needle_len + 1);
++	const char *pos = hay;
++	const char first = needle[0];
++	const char last = needle[needle_len - 1];
++#ifdef DUCKDB_SUBSTRING_PREFILTER_SSE2
++	if (end - hay >= 16) {
++		const __m128i first_v = _mm_set1_epi8(first);
++		const __m128i last_v = _mm_set1_epi8(last);
++		while (true) {
++			bool final_block = false;
++			if (pos + 16 > end) {
++				// overlap the final block with positions that were already checked
++				pos = end - 16;
++				final_block = true;
++			}
++			auto block_first = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos));
++			auto block_last = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos + needle_len - 1));
++			auto mask = static_cast<uint32_t>(_mm_movemask_epi8(
++			    _mm_and_si128(_mm_cmpeq_epi8(block_first, first_v), _mm_cmpeq_epi8(block_last, last_v))));
++			while (mask) {
++				auto offset = __builtin_ctz(mask);
++				if (memcmp(pos + offset + 1, needle + 1, needle_len - 2) == 0) {
++					return pos + offset;
++				}
++				mask &= mask - 1;
++			}
++			pos += 16;
++			if (final_block || pos == end) {
++				return nullptr;
++			}
++		}
++	}
++#endif
++	for (; pos < end; pos++) {
++		if (pos[0] == first && pos[needle_len - 1] == last && memcmp(pos + 1, needle + 1, needle_len - 2) == 0) {
++			return pos;
++		}
++	}
++	return nullptr;
++}
++
++//! Checks whether the filter is a substring predicate (LIKE / NOT LIKE / contains, optionally negated) on the column
++//! with a constant pattern. If so, "needle" is a literal that every string satisfying the inner predicate contains,
++//! and "negate" is set if the filter passes for (non-NULL) strings that do not satisfy the inner predicate.
++static bool GetSubstringPrefilter(const Expression &expr, string &needle, bool &negate) {
++	negate = false;
++	reference<const Expression> current(expr);
++	if (current.get().GetExpressionType() == ExpressionType::OPERATOR_NOT) {
++		auto &op = current.get().Cast<BoundOperatorExpression>();
++		if (op.children.size() != 1) {
++			return false;
++		}
++		negate = true;
++		current = *op.children[0];
++	}
++	if (current.get().GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return false;
++	}
++	auto &func = current.get().Cast<BoundFunctionExpression>();
++	if (func.children.size() != 2 || func.return_type.id() != LogicalTypeId::BOOLEAN ||
++	    func.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
++	    func.children[0]->return_type.id() != LogicalTypeId::VARCHAR ||
++	    func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return false;
++	}
++	auto &constant = func.children[1]->Cast<BoundConstantExpression>().value;
++	if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
++		return false;
++	}
++	auto &pattern = StringValue::Get(constant);
++	auto &name = func.function.name;
++	if (name == "contains") {
++		needle = pattern;
++	} else if (name == "~~" || name == "!~~") {
++		// these have no escape character: use the longest literal between wildcards
++		if (name == "!~~") {
++			negate = !negate;
++		}
++		needle.clear();
++		idx_t start = 0;
++		for (idx_t i = 0; i <= pattern.size(); i++) {
++			if (i == pattern.size() || pattern[i] == '%' || pattern[i] == '_') {
++				if (i - start > needle.size()) {
++					needle = pattern.substr(start, i - start);
++				}
++				start = i + 1;
++			}
++		}
++	} else {
++		return false;
++	}
++	return needle.size() >= 2;
++}
++
++//! For substring filters: search the literal over runs of strings that are stored back to back in memory, and only
++//! evaluate the filter expression on rows where it can be satisfied by the literal's presence
++static bool TrySubstringPrefilter(const Expression &expr, Vector &vector, UnifiedVectorFormat &vdata,
++                                  SelectionVector &sel, idx_t &approved_tuple_count, idx_t scan_count,
++                                  ExpressionFilterState &state) {
++	if (scan_count > STANDARD_VECTOR_SIZE || approved_tuple_count == 0 ||
++	    vector.GetType().id() != LogicalTypeId::VARCHAR || vector.GetVectorType() != VectorType::FLAT_VECTOR) {
++		return false;
++	}
++	string needle;
++	bool negate;
++	if (!GetSubstringPrefilter(expr, needle, negate)) {
++		return false;
++	}
++	const auto needle_ptr = needle.c_str();
++	const auto needle_len = needle.size();
++	auto data = UnifiedVectorFormat::GetData<string_t>(vdata);
++	auto &validity = vdata.validity;
++
++	// classify every candidate as NULL, not containing the literal, or containing the literal
++	static constexpr uint8_t ROW_MISS = 0;
++	static constexpr uint8_t ROW_HIT = 1;
++	static constexpr uint8_t ROW_NULL = 2;
++	uint8_t row_state[STANDARD_VECTOR_SIZE];
++	idx_t i = 0;
++	while (i < approved_tuple_count) {
++		auto row = vdata.sel->get_index(sel.get_index(i));
++		if (!validity.RowIsValid(row)) {
++			row_state[i++] = ROW_NULL;
++			continue;
++		}
++		auto &str = data[row];
++		if (str.IsInlined()) {
++			row_state[i++] = FindSubstring(str.GetData(), str.GetSize(), needle_ptr, needle_len) ? ROW_HIT : ROW_MISS;
++			continue;
++		}
++		// extend the run of non-inlined strings that directly follow each other in memory
++		const char *run_begin = str.GetData();
++		const char *run_end = run_begin + str.GetSize();
++		idx_t run_start = i;
++		row_state[i++] = ROW_MISS;
++		while (i < approved_tuple_count) {
++			auto next_row = vdata.sel->get_index(sel.get_index(i));
++			if (!validity.RowIsValid(next_row)) {
++				break;
++			}
++			auto &next = data[next_row];
++			if (next.IsInlined() || next.GetData() != run_end) {
++				break;
++			}
++			run_end += next.GetSize();
++			row_state[i++] = ROW_MISS;
++		}
++		// search the literal over the run, and map every occurrence to its row
++		idx_t k = run_start;
++		const char *row_end = run_begin + data[vdata.sel->get_index(sel.get_index(k))].GetSize();
++		const char *pos = run_begin;
++		while (pos < run_end) {
++			auto found = FindSubstring(pos, idx_t(run_end - pos), needle_ptr, needle_len);
++			if (!found) {
++				break;
++			}
++			while (row_end <= found) {
++				k++;
++				row_end += data[vdata.sel->get_index(sel.get_index(k))].GetSize();
++			}
++			if (found + needle_len <= row_end) {
++				// occurrence lies within row k: continue at the next row
++				row_state[k] = ROW_HIT;
++				pos = row_end;
++			} else {
++				// occurrence spans a row boundary
++				pos = found + 1;
++			}
++		}
++	}
++
++	// evaluate the filter expression on the rows containing the literal
++	SelectionVector hit_sel(approved_tuple_count);
++	idx_t hit_count = 0;
++	for (idx_t j = 0; j < approved_tuple_count; j++) {
++		if (row_state[j] == ROW_HIT) {
++			hit_sel.set_index(hit_count++, sel.get_index(j));
++		}
++	}
++	SelectionVector result_sel(approved_tuple_count);
++	idx_t match_count = 0;
++	if (hit_count > 0) {
++		DataChunk chunk;
++		chunk.data.emplace_back(vector);
++		chunk.SetCardinality(scan_count);
++		match_count = state.executor.SelectExpression(chunk, result_sel, hit_sel, hit_count);
++	}
++	if (!negate) {
++		sel.Initialize(result_sel);
++		approved_tuple_count = match_count;
++		return true;
++	}
++	// negated: non-NULL rows without the literal pass, rows with it pass if the expression selected them
++	uint8_t row_matched[STANDARD_VECTOR_SIZE];
++	for (idx_t j = 0; j < hit_count; j++) {
++		row_matched[hit_sel.get_index(j)] = 0;
++	}
++	for (idx_t j = 0; j < match_count; j++) {
++		row_matched[result_sel.get_index(j)] = 1;
++	}
++	SelectionVector merged_sel(approved_tuple_count);
++	idx_t merged_count = 0;
++	for (idx_t j = 0; j < approved_tuple_count; j++) {
++		auto idx = sel.get_index(j);
++		if (row_state[j] == ROW_MISS || (row_state[j] == ROW_HIT && row_matched[idx])) {
++			merged_sel.set_index(merged_count++, idx);
++		}
++	}
++	sel.Initialize(merged_sel);
++	approved_tuple_count = merged_count;
++	return true;
++}
++
+ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
+                                      const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
+                                      idx_t &approved_tuple_count) {
+@@ -816,6 +1044,9 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
+ 			return approved_tuple_count;
+ 		}
+ 		auto &state = filter_state.Cast<ExpressionFilterState>();
++		if (TrySubstringPrefilter(*expr_filter.expr, vector, vdata, sel, approved_tuple_count, scan_count, state)) {
++			return approved_tuple_count;
++		}
+ 		SelectionVector result_sel(approved_tuple_count);
+ 		if (scan_count > STANDARD_VECTOR_SIZE) {
+ 			// scan count is > vector size - split up the vector into multiple chunks

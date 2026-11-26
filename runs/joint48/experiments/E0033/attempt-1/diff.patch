@@ -1,0 +1,403 @@
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index ecdafc8..5dc54af 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -8,9 +8,12 @@
+ #include "duckdb/execution/executor.hpp"
+ #include "duckdb/execution/ht_entry.hpp"
+ #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/storage/temporary_memory_manager.hpp"
+ 
++#include <algorithm>
++
+ namespace duckdb {
+ 
+ RadixPartitionedHashTable::RadixPartitionedHashTable(GroupingSet &grouping_set_p, const GroupedAggregateData &op_p,
+@@ -206,6 +209,20 @@ public:
+ 	idx_t count_before_combining;
+ 	//! Maximum partition size if all unique
+ 	idx_t max_partition_size;
++
++	//! Clustered leading key: threads split each chunk that is sorted on the first group column into the rows of its
++	//! first/last key ("boundary" rows, sunk into a separate small HT) and the rows strictly in between ("interior").
++	//! If the open intervals of all chunks are disjoint and no boundary key lies inside any of them, every interior
++	//! group occurs in exactly one chunk, so the main HT's data is duplicate-free and needs no combine
++	bool clustered_enabled;
++	//! Set if any thread saw a chunk that could not be split (unsorted, NULLs, too many chunks, no lookups)
++	atomic<bool> any_unclustered;
++	//! Open (min, max) intervals of the interior rows of all split chunks (order-preserving key encoding)
++	vector<pair<uint64_t, uint64_t>> clustered_intervals;
++	//! First/last keys of all split chunks
++	vector<uint64_t> clustered_boundary_keys;
++	//! Data of the boundary HTs (a single partition)
++	unique_ptr<PartitionedTupleData> boundary_data;
+ };
+ 
+ RadixHTGlobalSinkState::RadixHTGlobalSinkState(ClientContext &context_p, const RadixPartitionedHashTable &radix_ht_p)
+@@ -216,7 +233,29 @@ RadixHTGlobalSinkState::RadixHTGlobalSinkState(ClientContext &context_p, const R
+       block_alloc_size(BufferManager::GetBufferManager(context).GetBlockAllocSize()), any_combined(false),
+       radix_ht(radix_ht_p), config(*this), stored_allocators_size(0), finalize_done(0),
+       scan_pin_properties(TupleDataPinProperties::DESTROY_AFTER_DONE), count_before_combining(0),
+-      max_partition_size(0) {
++      max_partition_size(0), clustered_enabled(false), any_unclustered(false) {
++	// The clustered-key path needs an integral leading group key, and no second Sink phase (DISTINCT aggregates)
++	if (number_of_threads > 1 && !radix_ht.grouping_set.empty()) {
++		switch (radix_ht.group_types[0].InternalType()) {
++		case PhysicalType::INT8:
++		case PhysicalType::INT16:
++		case PhysicalType::INT32:
++		case PhysicalType::INT64:
++		case PhysicalType::UINT8:
++		case PhysicalType::UINT16:
++		case PhysicalType::UINT32:
++		case PhysicalType::UINT64:
++			clustered_enabled = true;
++			break;
++		default:
++			break;
++		}
++		for (auto &aggregate : radix_ht.op.aggregates) {
++			if (aggregate->Cast<BoundAggregateExpression>().IsDistinct()) {
++				clustered_enabled = false;
++			}
++		}
++	}
+ 	// Compute minimum reservation
+ 	auto tuples_per_block = block_alloc_size / radix_ht.GetLayout().GetRowWidth();
+ 	idx_t ht_count =
+@@ -387,10 +426,26 @@ public:
+ 
+ 	//! Data that is abandoned ends up here (only if we're doing external aggregation)
+ 	unique_ptr<PartitionedTupleData> abandoned_data;
++
++	//! Maximum number of split chunks per thread for the clustered-key path
++	static constexpr idx_t MAX_CLUSTERED_CHUNKS = 1048576;
++	//! Whether this thread still splits chunks on a clustered leading key
++	bool clustered;
++	//! HT for the rows of the first/last key of each split chunk
++	unique_ptr<GroupedAggregateHashTable> boundary_ht;
++	//! Interior intervals and boundary keys of the split chunks
++	vector<pair<uint64_t, uint64_t>> intervals;
++	vector<uint64_t> boundary_keys;
++	//! Buffers for splitting
++	UnifiedVectorFormat key_format;
++	SelectionVector boundary_sel;
++	DataChunk slice_groups;
++	DataChunk slice_payload;
+ };
+ 
+ RadixHTLocalSinkState::RadixHTLocalSinkState(ClientContext &, const RadixPartitionedHashTable &radix_ht)
+-    : adapted(false), local_sink_capacity(DConstants::INVALID_INDEX) {
++    : adapted(false), local_sink_capacity(DConstants::INVALID_INDEX), clustered(false),
++      boundary_sel(STANDARD_VECTOR_SIZE) {
+ 	// If there are no groups we create a fake group so everything has the same group
+ 	group_chunk.InitializeEmpty(radix_ht.group_types);
+ 	if (radix_ht.grouping_set.empty()) {
+@@ -446,6 +501,11 @@ void DecideAdaptation(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lst
+ 	if (hll_percentage > SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD) {
+ 		// Almost everything is unique, skip lookups, just append, defer deduplication to GetData phase
+ 		ht.SkipLookups();
++		if (lstate.clustered) {
++			// Without lookups, duplicate interior keys within a chunk are not merged
++			lstate.clustered = false;
++			gstate.any_unclustered = true;
++		}
+ 		return;
+ 	}
+ 
+@@ -545,6 +605,171 @@ void MaybeRepartition(ClientContext &context, RadixHTGlobalSinkState &gstate, Ra
+ 	ht.Repartition();
+ }
+ 
++//! Order-preserving encoding of an integral key as uint64_t (equal keys map to equal codes)
++template <class T>
++static uint64_t ClusteredOrderKey(const T value) {
++	if (std::is_signed<T>::value) {
++		return static_cast<uint64_t>(static_cast<int64_t>(value)) ^ (static_cast<uint64_t>(1) << 63);
++	}
++	return static_cast<uint64_t>(value);
++}
++
++//! Checks that the key column is non-NULL and non-decreasing, and finds the end of the first run of equal keys and the
++//! start of the last run (first_end == count if all keys are equal)
++template <class T>
++static bool FindClusteredRuns(const UnifiedVectorFormat &format, const idx_t count, idx_t &first_end,
++                              idx_t &last_start, uint64_t &min_key, uint64_t &max_key) {
++	const auto data = UnifiedVectorFormat::GetData<T>(format);
++	const auto &sel = *format.sel;
++	if (!format.validity.AllValid()) {
++		for (idx_t i = 0; i < count; i++) {
++			if (!format.validity.RowIsValid(sel.get_index(i))) {
++				return false;
++			}
++		}
++	}
++	const T first = data[sel.get_index(0)];
++	T prev = first;
++	first_end = count;
++	last_start = 0;
++	for (idx_t i = 1; i < count; i++) {
++		const T cur = data[sel.get_index(i)];
++		if (cur != prev) {
++			if (cur < prev) {
++				return false;
++			}
++			if (first_end == count) {
++				first_end = i;
++			}
++			last_start = i;
++			prev = cur;
++		}
++	}
++	min_key = ClusteredOrderKey<T>(first);
++	max_key = ClusteredOrderKey<T>(prev);
++	return true;
++}
++
++//! Sinks a chunk that is sorted on the first group key: the rows of its first and last key go to the boundary HT, the
++//! rows strictly in between go to the main HT. Returns false (and sinks nothing) if the chunk cannot be split
++static bool SinkClustered(ClientContext &context, const RadixPartitionedHashTable &radix_ht,
++                          RadixHTLocalSinkState &lstate, DataChunk &group_chunk, DataChunk &payload_input,
++                          const unsafe_vector<idx_t> &filter) {
++	const auto count = group_chunk.size();
++	if (count == 0) {
++		return true;
++	}
++	if (count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= RadixHTLocalSinkState::MAX_CLUSTERED_CHUNKS) {
++		return false;
++	}
++	auto &key = group_chunk.data[0];
++	key.ToUnifiedFormat(count, lstate.key_format);
++	idx_t first_end;
++	idx_t last_start;
++	uint64_t min_key;
++	uint64_t max_key;
++	bool sorted;
++	switch (key.GetType().InternalType()) {
++	case PhysicalType::INT8:
++		sorted = FindClusteredRuns<int8_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::INT16:
++		sorted = FindClusteredRuns<int16_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::INT32:
++		sorted = FindClusteredRuns<int32_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::INT64:
++		sorted = FindClusteredRuns<int64_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::UINT8:
++		sorted = FindClusteredRuns<uint8_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::UINT16:
++		sorted = FindClusteredRuns<uint16_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::UINT32:
++		sorted = FindClusteredRuns<uint32_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	case PhysicalType::UINT64:
++		sorted = FindClusteredRuns<uint64_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		break;
++	default:
++		return false;
++	}
++	if (!sorted) {
++		return false;
++	}
++
++	if (!lstate.boundary_ht) {
++		lstate.boundary_ht = radix_ht.CreateHT(context, GroupedAggregateHashTable::InitialCapacity(), 0);
++		lstate.slice_groups.InitializeEmpty(group_chunk.GetTypes());
++		lstate.slice_payload.InitializeEmpty(payload_input.GetTypes());
++	}
++	auto &boundary_ht = *lstate.boundary_ht;
++	auto &slice_groups = lstate.slice_groups;
++	auto &slice_payload = lstate.slice_payload;
++
++	if (first_end == count) {
++		// A single key: everything is boundary
++		boundary_ht.AddChunk(group_chunk, payload_input, filter);
++		lstate.boundary_keys.push_back(min_key);
++		return true;
++	}
++
++	// Boundary rows: the first and the last run
++	auto &sel = lstate.boundary_sel;
++	idx_t boundary_count = 0;
++	for (idx_t i = 0; i < first_end; i++) {
++		sel.set_index(boundary_count++, i);
++	}
++	for (idx_t i = last_start; i < count; i++) {
++		sel.set_index(boundary_count++, i);
++	}
++	slice_groups.Slice(group_chunk, sel, boundary_count);
++	slice_payload.Slice(payload_input, sel, boundary_count);
++	boundary_ht.AddChunk(slice_groups, slice_payload, filter);
++	lstate.boundary_keys.push_back(min_key);
++	lstate.boundary_keys.push_back(max_key);
++
++	// Interior rows: a contiguous range with keys strictly in (min_key, max_key)
++	if (first_end < last_start) {
++		for (idx_t c = 0; c < group_chunk.ColumnCount(); c++) {
++			slice_groups.data[c].Slice(group_chunk.data[c], first_end, last_start);
++		}
++		slice_groups.SetCardinality(last_start - first_end);
++		for (idx_t c = 0; c < payload_input.ColumnCount(); c++) {
++			slice_payload.data[c].Slice(payload_input.data[c], first_end, last_start);
++		}
++		slice_payload.SetCardinality(last_start - first_end);
++		lstate.ht->AddChunk(slice_groups, slice_payload, filter);
++		lstate.intervals.emplace_back(min_key, max_key);
++	}
++	return true;
++}
++
++//! Checks that the interior rows of all split chunks are key-disjoint from each other and from all boundary rows
++static bool ClusteredIntervalsDisjoint(vector<pair<uint64_t, uint64_t>> &intervals, const vector<uint64_t> &keys) {
++	std::sort(intervals.begin(), intervals.end());
++	for (idx_t i = 1; i < intervals.size(); i++) {
++		if (intervals[i - 1].second > intervals[i].first) {
++			return false;
++		}
++	}
++	for (const auto &key : keys) {
++		// The only interval that can strictly contain the key is the last one with min < key
++		auto it = std::lower_bound(intervals.begin(), intervals.end(), make_pair(key, uint64_t(0)));
++		if (it == intervals.begin()) {
++			continue;
++		}
++		--it;
++		if (it->first < key && key < it->second) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
+                                      DataChunk &payload_input, const unsafe_vector<idx_t> &filter) const {
+ 	auto &gstate = input.global_state.Cast<RadixHTGlobalSinkState>();
+@@ -559,6 +784,7 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 			// Using grow strategy, so won't ever adapt
+ 			lstate.adapted = true;
+ 		}
++		lstate.clustered = gstate.clustered_enabled && !gstate.any_unclustered;
+ 		gstate.active_threads++;
+ 	}
+ 
+@@ -566,7 +792,16 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
+ 	PopulateGroupChunk(group_chunk, chunk);
+ 
+ 	auto &ht = *lstate.ht;
+-	ht.AddChunk(group_chunk, payload_input, filter);
++	if (lstate.clustered && gstate.any_unclustered) {
++		lstate.clustered = false;
++	}
++	if (!lstate.clustered || !SinkClustered(context.client, *this, lstate, group_chunk, payload_input, filter)) {
++		if (lstate.clustered) {
++			lstate.clustered = false;
++			gstate.any_unclustered = true;
++		}
++		ht.AddChunk(group_chunk, payload_input, filter);
++	}
+ 
+ 	// Decide whether we should adapt our strategy to the data
+ 	if (!lstate.adapted && lstate.ht->GetSinkCount() >= RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD) {
+@@ -633,8 +868,33 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
+ 	// Eagerly destroy the HT
+ 	lstate.ht.reset();
+ 
++	unique_ptr<PartitionedTupleData> boundary_data;
++	shared_ptr<ArenaAllocator> boundary_allocator;
++	if (lstate.boundary_ht) {
++		boundary_data = lstate.boundary_ht->AcquirePartitionedData();
++		boundary_allocator = lstate.boundary_ht->GetAggregateAllocator();
++		lstate.boundary_ht.reset();
++	}
++
+ 	auto guard = gstate.Lock();
+ 	D_ASSERT(!gstate.finalized);
++	if (boundary_data) {
++		if (gstate.boundary_data) {
++			gstate.boundary_data->Combine(*boundary_data);
++		} else {
++			gstate.boundary_data = std::move(boundary_data);
++		}
++		gstate.stored_allocators.emplace_back(std::move(boundary_allocator));
++		gstate.stored_allocators_size += gstate.stored_allocators.back()->AllocationSize();
++		if (!gstate.any_unclustered) {
++			gstate.clustered_intervals.insert(gstate.clustered_intervals.end(), lstate.intervals.begin(),
++			                                  lstate.intervals.end());
++			gstate.clustered_boundary_keys.insert(gstate.clustered_boundary_keys.end(), lstate.boundary_keys.begin(),
++			                                      lstate.boundary_keys.end());
++		}
++		lstate.intervals.clear();
++		lstate.boundary_keys.clear();
++	}
+ 	if (gstate.uncombined_data) {
+ 		gstate.uncombined_data->Combine(*lstate.abandoned_data);
+ 	} else {
+@@ -649,12 +909,40 @@ void RadixPartitionedHashTable::Finalize(ClientContext &context, GlobalSinkState
+ 	auto guard = gstate.Lock();
+ 	D_ASSERT(!gstate.finalized);
+ 
++	// If true, the main data is duplicate-free (clustered leading key), and only the boundary data needs combining
++	bool clustered_disjoint = false;
++	if (gstate.boundary_data) {
++		clustered_disjoint = gstate.uncombined_data && !gstate.external && !gstate.any_unclustered &&
++		                     ClusteredIntervalsDisjoint(gstate.clustered_intervals, gstate.clustered_boundary_keys);
++		if (!clustered_disjoint) {
++			// Fall back: merge the boundary data into the main data and combine everything
++			if (!gstate.uncombined_data) {
++				gstate.uncombined_data = std::move(gstate.boundary_data);
++			} else {
++				auto &uncombined_data = *gstate.uncombined_data;
++				if (gstate.boundary_data->PartitionCount() != uncombined_data.PartitionCount()) {
++					auto repartitioned = make_uniq<RadixPartitionedTupleData>(
++					    BufferManager::GetBufferManager(context), GetLayoutPtr(), MemoryTag::HASH_TABLE,
++					    RadixPartitioning::RadixBitsOfPowerOfTwo(uncombined_data.PartitionCount()),
++					    GetLayout().ColumnCount() - 1);
++					gstate.boundary_data->Repartition(context, *repartitioned);
++					gstate.boundary_data = std::move(repartitioned);
++				}
++				uncombined_data.Combine(*gstate.boundary_data);
++				gstate.boundary_data.reset();
++			}
++		}
++	}
++	gstate.clustered_intervals.clear();
++	gstate.clustered_boundary_keys.clear();
++
+ 	if (gstate.uncombined_data) {
+ 		auto &uncombined_data = *gstate.uncombined_data;
+ 		gstate.count_before_combining = uncombined_data.Count();
+ 
+ 		// If true there is no need to combine, it was all done by a single thread in a single HT
+-		const auto single_ht = !gstate.external && gstate.active_threads == 1 && gstate.number_of_threads == 1;
++		const auto single_ht =
++		    (!gstate.external && gstate.active_threads == 1 && gstate.number_of_threads == 1) || clustered_disjoint;
+ 
+ 		auto &uncombined_partition_data = uncombined_data.GetPartitions();
+ 		const auto n_partitions = uncombined_partition_data.size();
+@@ -673,6 +961,19 @@ void RadixPartitionedHashTable::Finalize(ClientContext &context, GlobalSinkState
+ 				gstate.partitions.back()->state = AggregatePartitionState::READY_TO_SCAN;
+ 			}
+ 		}
++		if (clustered_disjoint) {
++			// The boundary data still has to be combined
++			D_ASSERT(gstate.boundary_data);
++			gstate.count_before_combining += gstate.boundary_data->Count();
++			for (auto &partition : gstate.boundary_data->GetPartitions()) {
++				auto partition_size =
++				    partition->SizeInBytes() +
++				    GroupedAggregateHashTable::GetCapacityForCount(partition->Count()) * sizeof(ht_entry_t);
++				gstate.max_partition_size = MaxValue(gstate.max_partition_size, partition_size);
++				gstate.partitions.emplace_back(make_uniq<AggregatePartition>(std::move(partition)));
++			}
++			gstate.boundary_data.reset();
++		}
+ 	} else {
+ 		gstate.count_before_combining = 0;
+ 	}

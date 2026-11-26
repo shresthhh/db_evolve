@@ -1,0 +1,31 @@
+diff --git a/src/optimizer/deliminator.cpp b/src/optimizer/deliminator.cpp
+index caeba2a..adc4011 100644
+--- a/src/optimizer/deliminator.cpp
++++ b/src/optimizer/deliminator.cpp
+@@ -74,13 +74,14 @@ static bool SubqueryIsSimple(const LogicalOperator &op) {
+ 	return true;
+ }
+ 
+-//! A SEMI delim join whose LHS has a selection normally keeps its join with the DelimGet, so that the
++//! A SEMI/ANTI delim join whose LHS has a selection normally keeps its join with the DelimGet, so that the
+ //! (de-duplicated) selected LHS keys reduce the RHS. When the RHS is simple and the correlation is a plain
+ //! equality, a regular SEMI join with runtime join filters (min/max, Bloom filter) achieves the same reduction
+ //! without materializing and de-duplicating the LHS keys and without the extra join.
+ static bool SelectionIsReplaceableByJoinFilter(const DelimCandidate &candidate) {
+ 	auto &delim_join = candidate.delim_join;
+-	if (delim_join.join_type != JoinType::SEMI || candidate.delim_get_count != 1 || candidate.joins.size() != 1) {
++	if ((delim_join.join_type != JoinType::SEMI && delim_join.join_type != JoinType::ANTI) ||
++	    candidate.delim_get_count != 1 || candidate.joins.size() != 1) {
+ 		return false;
+ 	}
+ 	auto &join_op = *candidate.joins[0].join.get();
+@@ -102,7 +103,8 @@ static bool SelectionIsReplaceableByJoinFilter(const DelimCandidate &candidate)
+ }
+ 
+ //! After removing the join with the DelimGet, the replacing columns are filtered with IS NOT NULL.
+-//! For a SEMI join, IS NOT DISTINCT FROM against a non-NULL RHS column is equivalent to =, which allows join filters
++//! For a SEMI/ANTI join, IS NOT DISTINCT FROM against a non-NULL RHS column is equivalent to =, which allows join
++//! filters (a NULL LHS key never matches either way, so ANTI still emits it; RIGHT_ANTI keeps NULL build keys)
+ static void ConvertNotDistinctToEqual(LogicalComparisonJoin &delim_join, const vector<ColumnBinding> &non_null) {
+ 	for (auto &cond : delim_join.conditions) {
+ 		if (cond.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM ||

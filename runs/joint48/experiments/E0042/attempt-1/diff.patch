@@ -1,0 +1,660 @@
+diff --git a/src/function/table/table_scan.cpp b/src/function/table/table_scan.cpp
+index 03ced48..d1dd3c2 100644
+--- a/src/function/table/table_scan.cpp
++++ b/src/function/table/table_scan.cpp
+@@ -309,6 +309,10 @@ public:
+ 		}
+ 
+ 		l_state->scan_state.Initialize(std::move(storage_ids), context.client, input.filters, input.sample_options);
++		if (input.filters && input.CanRemoveFilterColumns() && !bind_data.is_create_index) {
++			// filtered columns that are not projected are only needed for evaluating their filter
++			l_state->scan_state.filters.SetFilterOnlyColumns(input.projection_ids);
++		}
+ 
+ 		l_state->rows_in_current_row_group = storage.NextParallelScan(context.client, state, l_state->scan_state);
+ 		if (l_state->rows_in_current_row_group > 0) {
+diff --git a/src/include/duckdb/storage/table/scan_state.hpp b/src/include/duckdb/storage/table/scan_state.hpp
+index 32aac49..5ea75c8 100644
+--- a/src/include/duckdb/storage/table/scan_state.hpp
++++ b/src/include/duckdb/storage/table/scan_state.hpp
+@@ -131,6 +131,8 @@ struct ColumnScanState {
+ 	unique_ptr<PushedDownExpressionState> expression_state;
+ 	//! Whether or not updates should be allowed
+ 	UpdateScanType update_scan_type = UpdateScanType::STANDARD;
++	//! Whether the column is only scanned to evaluate a filter, i.e. its values are not used after filtering
++	bool filter_only = false;
+ 
+ public:
+ 	void PushDownCast(const LogicalType &original_type, const LogicalType &cast_type);
+@@ -175,6 +177,8 @@ struct ScanFilter {
+ 	StorageIndex table_column_index;
+ 	TableFilter &filter;
+ 	bool always_true;
++	//! Whether the filtered column is not projected out of the scan (its values are only needed for the filter)
++	bool filter_only = false;
+ 	unique_ptr<TableFilterState> filter_state;
+ 
+ 	bool IsAlwaysTrue() const {
+@@ -187,6 +191,8 @@ public:
+ 	~ScanFilterInfo();
+ 
+ 	void Initialize(ClientContext &context, TableFilterSet &filters, const vector<StorageIndex> &column_ids);
++	//! Marks the filters on columns that are not in "projection_ids" (indexes into the scanned columns) as filter-only
++	void SetFilterOnlyColumns(const vector<idx_t> &projection_ids);
+ 
+ 	const vector<ScanFilter> &GetFilterList() const {
+ 		return filter_list;
+diff --git a/src/storage/compression/fsst.cpp b/src/storage/compression/fsst.cpp
+index f96d7d5..9767282 100644
+--- a/src/storage/compression/fsst.cpp
++++ b/src/storage/compression/fsst.cpp
+@@ -9,6 +9,10 @@
+ #include "duckdb/storage/string_uncompressed.hpp"
+ #include "duckdb/storage/table/column_data_checkpointer.hpp"
+ #include "duckdb/main/settings.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
++#include "duckdb/planner/expression/bound_operator_expression.hpp"
+ 
+ #include "fsst.h"
+ 
+@@ -59,6 +63,8 @@ struct FSSTStorage {
+ 	                           idx_t result_idx);
+ 	static void Select(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
+ 	                   const SelectionVector &sel, idx_t sel_count);
++	static void Filter(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++	                   SelectionVector &sel, idx_t &sel_count, const TableFilter &filter, TableFilterState &filter_state);
+ 
+ 	static void SetDictionary(ColumnSegment &segment, BufferHandle &handle, StringDictionaryContainer container);
+ 	static StringDictionaryContainer GetDictionary(ColumnSegment &segment, BufferHandle &handle);
+@@ -520,6 +526,211 @@ void FSSTStorage::FinalizeCompress(CompressionState &state_p) {
+ 	state.Flush(true);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Pattern filter
++//===--------------------------------------------------------------------===//
++//! A filter of the form [NOT] (str LIKE pattern) where the pattern consists of literal parts separated by '%'
++//! (this includes contains, prefix and suffix), as a DFA over bytes. A string passes the filter iff the DFA ends in an
++//! accepting state after consuming it.
++struct FSSTPatternDFA {
++	//! upper bound on the number of states, so that lifted transition tables can be addressed with 16 bits
++	static constexpr idx_t MAX_STATES = 127;
++	static constexpr idx_t ALPHABET = 256;
++
++	idx_t state_count = 0;
++	//! transitions[state * ALPHABET + byte]
++	vector<uint8_t> transitions;
++	//! accept[state]: whether a string that ends in the state passes the filter
++	vector<uint8_t> accept;
++
++	static unique_ptr<FSSTPatternDFA> TryCreate(const TableFilter &filter);
++	static unique_ptr<FSSTPatternDFA> Build(const vector<string> &parts, bool anchored_start, bool anchored_end,
++	                                        bool negate);
++};
++
++unique_ptr<FSSTPatternDFA> FSSTPatternDFA::TryCreate(const TableFilter &filter) {
++	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
++		return nullptr;
++	}
++	bool negate = false;
++	reference<const Expression> current(*filter.Cast<ExpressionFilter>().expr);
++	if (current.get().GetExpressionType() == ExpressionType::OPERATOR_NOT) {
++		auto &op = current.get().Cast<BoundOperatorExpression>();
++		if (op.children.size() != 1) {
++			return nullptr;
++		}
++		negate = true;
++		current = *op.children[0];
++	}
++	if (current.get().GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return nullptr;
++	}
++	auto &func = current.get().Cast<BoundFunctionExpression>();
++	if (func.children.size() != 2 || func.return_type.id() != LogicalTypeId::BOOLEAN ||
++	    func.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
++	    func.children[0]->return_type.id() != LogicalTypeId::VARCHAR ||
++	    func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return nullptr;
++	}
++	auto &constant = func.children[1]->Cast<BoundConstantExpression>().value;
++	if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
++		return nullptr;
++	}
++	auto &pattern = StringValue::Get(constant);
++	auto &name = func.function.name;
++	vector<string> parts;
++	bool anchored_start = false;
++	bool anchored_end = false;
++	if (name == "contains") {
++		parts.push_back(pattern);
++	} else if (name == "prefix" || name == "starts_with") {
++		parts.push_back(pattern);
++		anchored_start = true;
++	} else if (name == "suffix" || name == "ends_with") {
++		parts.push_back(pattern);
++		anchored_end = true;
++	} else if (name == "~~" || name == "!~~") {
++		if (name == "!~~") {
++			negate = !negate;
++		}
++		// only patterns of literals and '%' are supported
++		if (pattern.find('_') != string::npos || pattern.find('\\') != string::npos) {
++			return nullptr;
++		}
++		anchored_start = pattern.empty() || pattern[0] != '%';
++		anchored_end = pattern.empty() || pattern.back() != '%';
++		idx_t start = 0;
++		for (idx_t i = 0; i <= pattern.size(); i++) {
++			if (i == pattern.size() || pattern[i] == '%') {
++				parts.push_back(pattern.substr(start, i - start));
++				start = i + 1;
++			}
++		}
++	} else {
++		return nullptr;
++	}
++	// empty parts are trivially matched
++	vector<string> non_empty_parts;
++	for (auto &part : parts) {
++		if (!part.empty()) {
++			non_empty_parts.push_back(std::move(part));
++		}
++	}
++	return Build(non_empty_parts, anchored_start, anchored_end, negate);
++}
++
++unique_ptr<FSSTPatternDFA> FSSTPatternDFA::Build(const vector<string> &parts, bool anchored_start, bool anchored_end,
++                                                 bool negate) {
++	idx_t total_length = 0;
++	for (auto &part : parts) {
++		total_length += part.size();
++	}
++	if (total_length + 3 > MAX_STATES) {
++		return nullptr;
++	}
++	auto result = make_uniq<FSSTPatternDFA>();
++	auto &transitions = result->transitions;
++	auto &accept = result->accept;
++	auto set_row = [&](idx_t state, idx_t target) {
++		memset(transitions.data() + state * ALPHABET, UnsafeNumericCast<uint8_t>(target), ALPHABET);
++	};
++	if (parts.empty()) {
++		// state 0 is the start, state 1 is reached by any byte
++		result->state_count = 2;
++		transitions.resize(2 * ALPHABET);
++		accept = {1, 0};
++		if (anchored_start && anchored_end) {
++			// only the empty string matches
++			set_row(0, 1);
++			set_row(1, 1);
++		} else {
++			// everything matches
++			set_row(0, 0);
++			accept[1] = 1;
++			set_row(1, 1);
++		}
++	} else {
++		// part i occupies the states [base[i], base[i] + |part i|), an anchored last part has one more state for the
++		// complete match. "done" means all parts were found (the rest of the string is free), "dead" means no match
++		vector<idx_t> base(parts.size());
++		idx_t state_count = 0;
++		for (idx_t i = 0; i < parts.size(); i++) {
++			base[i] = state_count;
++			state_count += parts[i].size();
++			if (i + 1 == parts.size() && anchored_end) {
++				state_count++;
++			}
++		}
++		const idx_t done = state_count++;
++		const idx_t dead = state_count++;
++		result->state_count = state_count;
++		transitions.resize(state_count * ALPHABET);
++		accept.assign(state_count, 0);
++		set_row(done, done);
++		accept[done] = 1;
++		set_row(dead, dead);
++		for (idx_t i = 0; i < parts.size(); i++) {
++			auto part = const_data_ptr_cast(parts[i].c_str());
++			const idx_t m = parts[i].size();
++			const bool last = i + 1 == parts.size();
++			const idx_t after = last ? done : base[i + 1];
++			const bool must_end = last && anchored_end;
++			if (i == 0 && anchored_start) {
++				// the part must match at the start of the string
++				for (idx_t j = 0; j < m; j++) {
++					set_row(base[i] + j, dead);
++					idx_t target = j + 1 < m ? base[i] + j + 1 : (must_end ? base[i] + m : after);
++					transitions[(base[i] + j) * ALPHABET + part[j]] = UnsafeNumericCast<uint8_t>(target);
++				}
++				if (must_end) {
++					// nothing may follow the part
++					set_row(base[i] + m, dead);
++					accept[base[i] + m] = 1;
++				}
++				continue;
++			}
++			// KMP automaton: delta[j][c] is the longest prefix of the part that is a suffix of (matched j) + c
++			vector<uint8_t> delta((m + 1) * ALPHABET);
++			idx_t fail = 0;
++			for (idx_t j = 0; j <= m; j++) {
++				if (j >= 2) {
++					fail = delta[fail * ALPHABET + part[j - 1]];
++				}
++				for (idx_t c = 0; c < ALPHABET; c++) {
++					delta[j * ALPHABET + c] = j == 0 ? 0 : delta[fail * ALPHABET + c];
++				}
++				if (j < m) {
++					delta[j * ALPHABET + part[j]] = UnsafeNumericCast<uint8_t>(j + 1);
++				}
++			}
++			const idx_t row_count = must_end ? m + 1 : m;
++			for (idx_t j = 0; j < row_count; j++) {
++				for (idx_t c = 0; c < ALPHABET; c++) {
++					idx_t next = delta[j * ALPHABET + c];
++					idx_t target;
++					if (must_end) {
++						// the part has to be matched at the end of the string: keep matching after a full match
++						target = base[i] + next;
++					} else {
++						// the first occurrence of the part is enough
++						target = next == m ? after : base[i] + next;
++					}
++					transitions[(base[i] + j) * ALPHABET + c] = UnsafeNumericCast<uint8_t>(target);
++				}
++			}
++			if (must_end) {
++				accept[base[i] + m] = 1;
++			}
++		}
++	}
++	if (negate) {
++		for (auto &entry : accept) {
++			entry = !entry;
++		}
++	}
++	return result;
++}
++
+ //===--------------------------------------------------------------------===//
+ // Scan
+ //===--------------------------------------------------------------------===//
+@@ -546,6 +757,53 @@ struct FSSTScanState : public StringScanState {
+ 
+ 	bool all_values_inlined = false;
+ 
++	//! The filter for which the pattern table below was created
++	const TableFilter *pattern_filter = nullptr;
++	//! Whether the filter is a supported pattern filter
++	bool has_pattern = false;
++	//! The pattern DFA lifted to the FSST codes of this segment: pattern_table[state + code] is the next state, where
++	//! states are multiples of 256. States >= 256 * pattern_states are "escape code seen, literal byte pending"
++	vector<uint16_t> pattern_table;
++	idx_t pattern_states = 0;
++	//! pattern_accept[state / 256]: whether a string ending in the state passes the filter
++	vector<uint8_t> pattern_accept;
++
++	void InitializePattern(const TableFilter &filter) {
++		pattern_filter = &filter;
++		auto dfa = FSSTPatternDFA::TryCreate(filter);
++		has_pattern = dfa != nullptr;
++		if (!dfa) {
++			return;
++		}
++		static constexpr idx_t ALPHABET = FSSTPatternDFA::ALPHABET;
++		const idx_t state_count = dfa->state_count;
++		pattern_states = state_count;
++		pattern_table.assign(2 * state_count * ALPHABET, 0);
++		pattern_accept.assign(2 * state_count, 0);
++		auto decoder = static_cast<duckdb_fsst_decoder_t *>(duckdb_fsst_decoder_ptr);
++		for (idx_t s = 0; s < state_count; s++) {
++			pattern_accept[s] = dfa->accept[s];
++			if (decoder) {
++				for (idx_t code = 0; code < FSST_ESC; code++) {
++					uint8_t symbol[sizeof(uint64_t)];
++					memcpy(symbol, &decoder->symbol[code], sizeof(uint64_t));
++					const idx_t len = MinValue<idx_t>(decoder->len[code], sizeof(uint64_t));
++					idx_t t = s;
++					for (idx_t k = 0; k < len; k++) {
++						t = dfa->transitions[t * ALPHABET + symbol[k]];
++					}
++					pattern_table[s * ALPHABET + code] = UnsafeNumericCast<uint16_t>(t * ALPHABET);
++				}
++			}
++			const idx_t pending = state_count + s;
++			pattern_table[s * ALPHABET + FSST_ESC] = UnsafeNumericCast<uint16_t>(pending * ALPHABET);
++			for (idx_t b = 0; b < ALPHABET; b++) {
++				pattern_table[pending * ALPHABET + b] =
++				    UnsafeNumericCast<uint16_t>(dfa->transitions[s * ALPHABET + b] * ALPHABET);
++			}
++		}
++	}
++
+ 	void StoreLastDelta(uint32_t value, int64_t row) {
+ 		last_known_index = value;
+ 		last_known_row = row;
+@@ -817,6 +1075,121 @@ void FSSTStorage::Select(ColumnSegment &segment, ColumnScanState &state, idx_t v
+ 	EndScan(scan_state, offsets, start, vector_count);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Filter
++//===--------------------------------------------------------------------===//
++void FSSTStorage::Filter(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++                         SelectionVector &sel, idx_t &sel_count, const TableFilter &filter,
++                         TableFilterState &filter_state) {
++	auto &scan_state = state.scan_state->Cast<FSSTScanState>();
++	if (scan_state.pattern_filter != &filter) {
++		scan_state.InitializePattern(filter);
++	}
++	if (!scan_state.has_pattern || vector_count > STANDARD_VECTOR_SIZE) {
++		// fallback: scan + filter
++		StringScan(segment, state, vector_count, result);
++		UnifiedVectorFormat vdata;
++		result.ToUnifiedFormat(vector_count, vdata);
++		ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, vector_count, sel_count);
++		return;
++	}
++	// run the pattern DFA over the compressed strings of the candidate rows
++	auto start = state.GetPositionInSegment();
++	auto baseptr = scan_state.handle.Ptr() + segment.GetBlockOffset();
++	auto dict = GetDictionary(segment, scan_state.handle);
++	auto base_data = data_ptr_cast(baseptr + sizeof(fsst_compression_header_t));
++	auto offsets = StartScan(scan_state, base_data, start, vector_count);
++	auto lengths = scan_state.bitunpack_buffer.get() + offsets.scan_offset;
++	auto dict_offsets = scan_state.delta_decode_buffer.get() + offsets.unused_delta_decoded_values;
++	auto get_string = [&](idx_t row) {
++		return const_data_ptr_cast(
++		    FetchStringPointer(dict, baseptr, UnsafeNumericCast<int32_t>(dict_offsets[row])));
++	};
++	const uint16_t *table = scan_state.pattern_table.data();
++	const uint8_t *accept = scan_state.pattern_accept.data();
++
++	SelectionVector new_sel(sel_count);
++	idx_t approved_count = 0;
++	idx_t i = 0;
++	// process four strings at a time to overlap the dependent table lookups
++	for (; i + 4 <= sel_count; i += 4) {
++		idx_t rows[4];
++		const_data_ptr_t strs[4];
++		uint32_t lens[4];
++		uint32_t states[4] = {0, 0, 0, 0};
++		for (idx_t l = 0; l < 4; l++) {
++			rows[l] = sel.get_index(i + l);
++			lens[l] = lengths[rows[l]];
++			strs[l] = get_string(rows[l]);
++		}
++		const uint32_t common = MinValue(MinValue(lens[0], lens[1]), MinValue(lens[2], lens[3]));
++		for (uint32_t k = 0; k < common; k++) {
++			states[0] = table[states[0] + strs[0][k]];
++			states[1] = table[states[1] + strs[1][k]];
++			states[2] = table[states[2] + strs[2][k]];
++			states[3] = table[states[3] + strs[3][k]];
++		}
++		for (idx_t l = 0; l < 4; l++) {
++			uint32_t s = states[l];
++			for (uint32_t k = common; k < lens[l]; k++) {
++				s = table[s + strs[l][k]];
++			}
++			new_sel.set_index(approved_count, rows[l]);
++			approved_count += accept[s >> 8];
++		}
++	}
++	for (; i < sel_count; i++) {
++		auto row = sel.get_index(i);
++		auto len = lengths[row];
++		auto str = get_string(row);
++		uint32_t s = 0;
++		for (uint32_t k = 0; k < len; k++) {
++			s = table[s + str[k]];
++		}
++		new_sel.set_index(approved_count, row);
++		approved_count += accept[s >> 8];
++	}
++
++	if (state.filter_only) {
++		// the values are not used after filtering - emit a placeholder instead of decompressing
++		result.Reference(Value(result.GetType()));
++	} else if (scan_state.duckdb_fsst_decoder && Settings::Get<EnableFSSTVectorsSetting>(segment.db)) {
++		// emit the compressed strings - only the selected rows are decompressed when the vector is sliced
++		result.SetVectorType(VectorType::FSST_VECTOR);
++		auto string_block_limit = StringUncompressed::GetStringBlockLimit(segment.GetBlockSize());
++		FSSTVector::RegisterDecoder(result, scan_state.duckdb_fsst_decoder, string_block_limit);
++		auto result_data = FSSTVector::GetCompressedData<string_t>(result);
++		for (idx_t row = 0; row < vector_count; row++) {
++			result_data[row] = UncompressedStringStorage::FetchStringFromDict(
++			    segment, dict.end, result, baseptr, UnsafeNumericCast<int32_t>(dict_offsets[row]), lengths[row]);
++		}
++		FSSTVector::SetCount(result, vector_count);
++	} else {
++		// decompress the selected rows
++		D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
++		auto result_data = FlatVector::GetData<string_t>(result);
++		for (idx_t row = 0; row < vector_count; row++) {
++			result_data[row] = string_t(nullptr, 0);
++		}
++		if (scan_state.duckdb_fsst_decoder && approved_count > 0) {
++			auto &str_buffer = StringVector::GetStringBuffer(result);
++			string_t decoded[STANDARD_VECTOR_SIZE];
++			scan_state.DecompressStrings(
++			    dict, baseptr, offsets, approved_count, [&new_sel](idx_t j) { return new_sel.get_index(j); }, decoded,
++			    str_buffer);
++			for (idx_t j = 0; j < approved_count; j++) {
++				result_data[new_sel.get_index(j)] = decoded[j];
++			}
++		}
++	}
++	EndScan(scan_state, offsets, start, vector_count);
++
++	if (approved_count < vector_count) {
++		sel.Initialize(new_sel);
++	}
++	sel_count = approved_count;
++}
++
+ //===--------------------------------------------------------------------===//
+ // Fetch
+ //===--------------------------------------------------------------------===//
+@@ -867,13 +1240,15 @@ void FSSTStorage::StringFetchRow(ColumnSegment &segment, ColumnFetchState &state
+ //===--------------------------------------------------------------------===//
+ CompressionFunction FSSTFun::GetFunction(PhysicalType data_type) {
+ 	D_ASSERT(data_type == PhysicalType::VARCHAR);
+-	return CompressionFunction(CompressionType::COMPRESSION_FSST, data_type, FSSTStorage::StringInitAnalyze,
+-	                           FSSTStorage::StringAnalyze, FSSTStorage::StringFinalAnalyze,
+-	                           FSSTStorage::InitCompression, FSSTStorage::Compress, FSSTStorage::FinalizeCompress,
+-	                           FSSTStorage::StringInitScan, FSSTStorage::StringScan,
+-	                           FSSTStorage::StringScanPartial<false>, FSSTStorage::StringFetchRow,
+-	                           UncompressedFunctions::EmptySkip, UncompressedStringStorage::StringInitSegment, nullptr,
+-	                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, FSSTStorage::Select);
++	auto result = CompressionFunction(
++	    CompressionType::COMPRESSION_FSST, data_type, FSSTStorage::StringInitAnalyze, FSSTStorage::StringAnalyze,
++	    FSSTStorage::StringFinalAnalyze, FSSTStorage::InitCompression, FSSTStorage::Compress,
++	    FSSTStorage::FinalizeCompress, FSSTStorage::StringInitScan, FSSTStorage::StringScan,
++	    FSSTStorage::StringScanPartial<false>, FSSTStorage::StringFetchRow, UncompressedFunctions::EmptySkip,
++	    UncompressedStringStorage::StringInitSegment, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
++	    nullptr, FSSTStorage::Select);
++	result.filter = FSSTStorage::Filter;
++	return result;
+ }
+ 
+ bool FSSTFun::TypeIsSupported(const PhysicalType physical_type) {
+diff --git a/src/storage/table/row_group.cpp b/src/storage/table/row_group.cpp
+index 1981972..5bb83e3 100644
+--- a/src/storage/table/row_group.cpp
++++ b/src/storage/table/row_group.cpp
+@@ -779,6 +779,7 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
+ 						continue;
+ 					}
+ 					auto &col_data = GetColumn(column_idx);
++					state.column_scans[scan_idx].filter_only = filter.filter_only;
+ 					col_data.Filter(transaction, state.vector_index, state.column_scans[scan_idx], result_vector, sel,
+ 					                approved_tuple_count, filter.filter, table_filter_state);
+ 				}
+diff --git a/src/storage/table/scan_state.cpp b/src/storage/table/scan_state.cpp
+index 8655247..09c1a0c 100644
+--- a/src/storage/table/scan_state.cpp
++++ b/src/storage/table/scan_state.cpp
+@@ -69,6 +69,19 @@ void ScanFilterInfo::Initialize(ClientContext &context, TableFilterSet &filters,
+ 	base_column_has_filter = column_has_filter;
+ }
+ 
++void ScanFilterInfo::SetFilterOnlyColumns(const vector<idx_t> &projection_ids) {
++	for (auto &filter : filter_list) {
++		bool projected = false;
++		for (auto &projection_id : projection_ids) {
++			if (projection_id == filter.scan_column_index) {
++				projected = true;
++				break;
++			}
++		}
++		filter.filter_only = !projected;
++	}
++}
++
+ bool ScanFilterInfo::ColumnHasFilters(idx_t column_idx) {
+ 	if (column_idx < column_has_filter.size()) {
+ 		return column_has_filter[column_idx];
+diff --git a/src/storage/table/standard_column_data.cpp b/src/storage/table/standard_column_data.cpp
+index e98ec9d..c74ba69 100644
+--- a/src/storage/table/standard_column_data.cpp
++++ b/src/storage/table/standard_column_data.cpp
+@@ -73,6 +73,104 @@ idx_t StandardColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_
+ 	return scan_count;
+ }
+ 
++//! Whether the current segment of "state" holds the next "count" rows
++static bool SegmentCovers(const ColumnScanState &state, idx_t count) {
++	if (!state.current) {
++		return false;
++	}
++	return state.current->GetRowStart() + state.current->GetNode().count - state.offset_in_column >= count;
++}
++
++//! Whether all segments holding the next "count" rows of "state" have a filter function (and, if "check_nulls" is
++//! set, cannot contain NULL values)
++static bool CanFilterAcrossSegments(const ColumnScanState &state, idx_t count, bool check_nulls) {
++	if (!state.segment_tree) {
++		return false;
++	}
++	auto segment = state.current;
++	idx_t position = state.offset_in_column;
++	idx_t covered = 0;
++	while (covered < count) {
++		if (!segment) {
++			return false;
++		}
++		auto &node = segment->GetNode();
++		auto segment_end = segment->GetRowStart() + node.count;
++		if (position > segment_end) {
++			return false;
++		}
++		auto piece_count = MinValue<idx_t>(segment_end - position, count - covered);
++		if (piece_count > 0) {
++			if (!node.GetCompressionFunction().filter) {
++				return false;
++			}
++			if (check_nulls && node.stats.statistics.CanHaveNull()) {
++				return false;
++			}
++		}
++		covered += piece_count;
++		position += piece_count;
++		if (covered < count) {
++			segment = state.segment_tree->GetNextSegment(*segment);
++		}
++	}
++	return true;
++}
++
++//! Filters the next "count" rows of "state" that span multiple segments, applying each segment's filter function to
++//! its piece of the rows. The scanned values are not emitted.
++static void FilterAcrossSegments(ColumnScanState &state, const LogicalType &type, idx_t count, SelectionVector &sel,
++                                 idx_t &sel_count, const TableFilter &filter, TableFilterState &filter_state) {
++	SelectionVector new_sel(STANDARD_VECTOR_SIZE);
++	idx_t new_count = 0;
++	idx_t remaining = count;
++	idx_t piece_offset = 0;
++	while (remaining > 0) {
++		auto &current = state.current->GetNode();
++		auto piece_count =
++		    MinValue<idx_t>(remaining, state.current->GetRowStart() + current.count - state.offset_in_column);
++		if (piece_count > 0) {
++			state.internal_index = state.offset_in_column;
++			// the candidate rows that fall into this piece, relative to the piece start
++			SelectionVector piece_sel(piece_count);
++			idx_t piece_sel_count = 0;
++			for (idx_t i = 0; i < sel_count; i++) {
++				auto idx = sel.get_index(i);
++				if (idx >= piece_offset && idx < piece_offset + piece_count) {
++					piece_sel.set_index(piece_sel_count++, idx - piece_offset);
++				}
++			}
++			if (piece_sel_count > 0) {
++				Vector piece_result(type);
++				current.Filter(state, piece_count, piece_result, piece_sel, piece_sel_count, filter, filter_state);
++				for (idx_t i = 0; i < piece_sel_count; i++) {
++					new_sel.set_index(new_count++, piece_sel.get_index(i) + piece_offset);
++				}
++				state.offset_in_column += piece_count;
++				state.internal_index = state.offset_in_column;
++			} else {
++				state.offset_in_column += piece_count;
++				current.Skip(state);
++			}
++			remaining -= piece_count;
++			piece_offset += piece_count;
++		}
++		if (remaining > 0) {
++			auto next = state.segment_tree->GetNextSegment(*state.current);
++			if (!next) {
++				throw InternalException("StandardColumnData::Filter - ran out of segments");
++			}
++			state.previous_states.emplace_back(std::move(state.scan_state));
++			state.current = next;
++			state.current->GetNode().InitializeScan(state);
++			state.segment_checked = false;
++		}
++	}
++	state.internal_index = state.offset_in_column;
++	sel.Initialize(new_sel);
++	sel_count = new_count;
++}
++
+ void StandardColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
+                                 SelectionVector &sel, idx_t &count, const TableFilter &filter,
+                                 TableFilterState &filter_state) {
+@@ -87,8 +185,32 @@ void StandardColumnData::Filter(TransactionData transaction, idx_t vector_index,
+ 	auto scan_type = GetVectorScanType(state, target_count, result);
+ 	bool scan_entire_vector = scan_type == ScanVectorType::SCAN_ENTIRE_VECTOR;
+ 	bool verify_fetch_row = state.scan_options && state.scan_options->force_fetch_row;
+-	if (!has_filter || !validity_has_filter || !scan_entire_vector || verify_fetch_row) {
++	if (!has_filter || !validity_has_filter || verify_fetch_row) {
++		ColumnData::Filter(transaction, vector_index, state, result, sel, count, filter, filter_state);
++		return;
++	}
++	if (!scan_entire_vector) {
+ 		// we are not scanning an entire vector - this can have several causes (updates, etc)
++		// a filter-only vector that spans multiple segments (and has no updates) can be filtered piece by piece
++		if (!state.filter_only || HasUpdates() || validity->HasUpdates() ||
++		    !CanFilterAcrossSegments(state, target_count, !filter_includes_validity) ||
++		    (!filter_includes_validity && !SegmentCovers(state.child_states[0], target_count))) {
++			ColumnData::Filter(transaction, vector_index, state, result, sel, count, filter, filter_state);
++			return;
++		}
++		BeginScanVectorInternal(state);
++		FilterAcrossSegments(state, result.GetType(), target_count, sel, count, filter, filter_state);
++		if (!filter_includes_validity) {
++			validity->FilterVector(state.child_states[0], result, target_count, sel, count, filter, filter_state);
++		} else {
++			validity->Skip(state.child_states[0], target_count);
++		}
++		// the values of a filter-only column are not used: emit a placeholder
++		result.Reference(Value(result.GetType()));
++		return;
++	}
++	if (!filter_includes_validity && state.current->GetNode().stats.statistics.CanHaveNull()) {
++		// the segment filter sees NULL rows as regular values - only the validity filter removes them
+ 		ColumnData::Filter(transaction, vector_index, state, result, sel, count, filter, filter_state);
+ 		return;
+ 	}

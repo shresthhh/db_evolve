@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp TrySetExactBloomFilter: the only change is a threshold on the existing exact-bitmap mechanism, which already handles ranges up to 2^32 and is already used for them. Exact bitmaps are now also allowed when range < min(2^27, count*1024). The rule depends only on build-side key count and min/max range. It does not look at query, table or literal values, and it covers any integer FK join with a sparse filtered build side.",
+      "Overflow: the multiplication count*1024 only runs when count <= 2^17, so it is at most 2^27. In the else branch the 2^27 cap already means fewer than 1024 bits per key, so both branches are consistent. The 2^32 EXACT_BF_MAX_RANGE guard is still applied in the final check.",
+      "Correctness: exact bitmaps have no false positives or negatives, so widening when they are used can't change results. The NULL-equal, type-match and signedness guards above the change are untouched.",
+      "Cost: at most 16MB of bitmap (128 bytes per build key) per join, zeroed during the build and counted in query time, so cost is not moved outside the timing. A possible slowdown when probe keys arrive in random order is a performance trade-off the author states openly, not a correctness problem.",
+      "No measurement, settings or test files are touched. The diff is small, and the comment now matches the code."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"physical_hash_join.cpp TrySetExactBloomFilter: the only change is a threshold on the existing exact-bitmap mechanism, which already handles ranges up to 2^32 and is already used for them. Exact bitmaps are now also allowed when range < min(2^27, count*1024). The rule depends only on build-side key count and min/max range. It does not look at query, table or literal values, and it covers any integer FK join with a sparse filtered build side.\",\"Overflow: the multiplication count*1024 only runs when count <= 2^17, so it is at most 2^27. In the else branch the 2^27 cap already means fewer than 1024 bits per key, so both branches are consistent. The 2^32 EXACT_BF_MAX_RANGE guard is still applied in the final check.\",\"Correctness: exact bitmaps have no false positives or negatives, so widening when they are used can't change results. The NULL-equal, type-match and signedness guards above the change are untouched.\",\"Cost: at most 16MB of bitmap (128 bytes per build key) per join, zeroed during the build and counted in query time, so cost is not moved outside the timing. A possible slowdown when probe keys arrive in random order is a performance trade-off the author states openly, not a correctness problem.\",\"No measurement, settings or test files are touched. The diff is small, and the comment now matches the code.\"],\"required_changes\":[]}",
+  "cost_usd": 0.11455299999999999,
+  "seconds": 22.1753990650177,
+  "error": ""
+}

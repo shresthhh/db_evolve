@@ -1,0 +1,14 @@
+{
+  "title": "Raise operator output caching threshold to 256 rows (sparse HJ/FILTER output coalescing)",
+  "hypothesis": "E0040 showed that downstream operators pay a fixed cost per chunk (about 3.5us per chunk in HJ probe). Merging filtered scan chunks below 256 rows (STANDARD_VECTOR_SIZE/8) cut the geomean 9.3% with no regressions. The same merging already exists for operator outputs in CachingPhysicalOperator (src/execution/physical_operator.cpp SelectExecutionMode, used by PhysicalJoin, PhysicalFilter and PhysicalCrossProduct). But it only triggers for chunks of at most CACHE_THRESHOLD = 64 rows (physical_operator.hpp:270). Join and filter outputs with 65-255 rows per chunk pass through unmerged, and every operator above them pays the per-chunk cost. Examples: joins against a filtered dimension that keep 6-25% of rows (region, nation or segment joins) and post-join FILTERs. In q07 hot, the n1/n2 OR FILTER keeps 50%, and 1/5 or 2/25 selective dimension joins are common in q02, q03, q05, q07 and q08. Also, every flush calls make_uniq<DataChunk> plus cached_chunk->Initialize, which reallocates the full vector set each time.",
+  "plan": "1) In src/include/duckdb/execution/physical_operator.hpp, change CachingPhysicalOperator::CACHE_THRESHOLD from 64 to STANDARD_VECTOR_SIZE/8 (256 at the default vector size). Keep the existing ORDERED/PARTITIONED/continuation logic in SelectExecutionMode unchanged; it already handles correctness for every threshold. 2) Optional, if cheap: in CachingPhysicalOperator::Execute (physical_operator.cpp ~443-460), avoid the make_uniq<DataChunk> temporary in RETURN_CACHED_APPEND_CHUNK. Do this by keeping a second owned DataChunk in CachingOperatorState and swapping the two, instead of re-Initializing (allocating) after every Move. 3) Measure thresholds 128 and 256 on full bench. Check q22 and q04 alone, because the scan version regressed q22 at 512 rows, where copying about 260 rows/chunk cost as much as it saved. Report which HJ/FILTER operators in q03/q07/q08 change chunk counts (operator timing of the parents).",
+  "target_files": [
+    "src/include/duckdb/execution/physical_operator.hpp",
+    "src/execution/physical_operator.cpp"
+  ],
+  "expected_gain": "A few % on join-heavy templates with selective dimension joins (q02, q03, q05, q07, q08); geomean -1..-3%. Uncertain, because scan-level coalescing (E0040) already densified the biggest sources.",
+  "generality": "Every pipeline where a hash join, filter or cross product drops most but not almost all rows. This is generic across star/snowflake joins. Queries whose operator outputs sit at 150-256 rows/chunk pay a copy that may cost about what it saves (the q22-style break-even), so 128 is the fallback threshold.",
+  "risk": "Low. The mechanism and its order-preserving modes already exist and are tested; only the threshold changes. Main risk is a small regression from extra copies near break-even.",
+  "status": "open",
+  "filed": "g3r9"
+}

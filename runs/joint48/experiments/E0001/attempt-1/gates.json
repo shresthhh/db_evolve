@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/optimizer.cpp: the only change is a reordering. JoinDependentFilterRule is now registered just before DistributivityRule instead of after it. Before, DistributivityRule factored the shared join-key term out of the root OR, so JoinDependentFilterRule's root-OR precondition never held for predicates like q19's. The change does not mention any query, table, column or literal.",
+      "Correctness: the rule (src/optimizer/rule/join_dependent_filter.cpp) keeps the original OR intact and ANDs implied single-table OR filters onto it. It skips volatile expressions and only derives a filter for a table that appears in every branch. Moving it earlier does not change what it is allowed to derive, so NULLs, other types and volatile functions behave as before.",
+      "Termination: the rule only fires when the root expression is an OR (`is_root`). Its output root is an AND, so it cannot fire again on its own result and there is no rewrite loop. DistributivityRule still runs afterwards on the inner OR.",
+      "Scope: this applies to any OR-of-conjunctions filter or ANY_JOIN condition that spans several tables, such as TPC-H q07/q19 and BI-generated SQL. It is not narrow to this benchmark. Nothing moves cost elsewhere, no measurement code is touched, and no code is duplicated.",
+      "Minor caveat: the author did not run the optimizer or plan-snapshot unit tests. Some EXPLAIN-based tests may show the extra derived filters, but that is a plan change, not a correctness problem."
+    ],
+    "required_changes": []
+  }
+}

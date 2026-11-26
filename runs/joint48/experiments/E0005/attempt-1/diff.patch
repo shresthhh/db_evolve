@@ -1,0 +1,73 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 82d5829..773cbff 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -714,10 +714,23 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+ 	}
+ }
+ 
++//! The HT hash combines all equality keys, but the bloom filter is only on the first key:
++//! gather the first key column and hash it on its own (matching the probe-side hashing)
++static void InsertFirstKeyIntoBloomFilter(const TupleDataCollection &data_collection, const LogicalType &key_type,
++                                          const BloomFilter &bloom_filter, TupleDataChunkState &chunk_state,
++                                          const idx_t count) {
++	Vector key0(key_type, count);
++	data_collection.Gather(chunk_state.row_locations, *FlatVector::IncrementalSelectionVector(), count, 0, key0,
++	                       *FlatVector::IncrementalSelectionVector(), nullptr);
++	Vector key0_hashes(LogicalType::HASH, count);
++	VectorOperations::Hash(key0, key0_hashes, count);
++	bloom_filter.InsertHashes(key0_hashes, count);
++}
++
+ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataChunkState &chunk_state,
+                                  InsertState &insert_state, bool parallel) {
+-	// Insert Hashes into the BF
+-	if (bloom_filter.IsInitialized()) {
++	// Insert Hashes into the BF (multi-key joins insert the first key's hashes in Finalize instead)
++	if (bloom_filter.IsInitialized() && equality_types.size() == 1) {
+ 		bloom_filter.InsertHashes(hashes_v, count);
+ 	}
+ 	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(this->entries);
+@@ -784,12 +797,16 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
+ 	const auto row_locations = iterator.GetRowLocations();
+ 
+ 	InsertState insert_state(*this);
++	const bool first_key_bloom_filter = bloom_filter.IsInitialized() && equality_types.size() > 1;
+ 	do {
+ 		const auto count = iterator.GetCurrentChunkCount();
+ 		for (idx_t i = 0; i < count; i++) {
+ 			hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+ 		}
+ 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
++		if (first_key_bloom_filter) {
++			InsertFirstKeyIntoBloomFilter(*data_collection, equality_types[0], bloom_filter, chunk_state, count);
++		}
+ 
+ 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
+ 	} while (iterator.Next());
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index ed5a8b5..a9af468 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -770,9 +770,9 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ 		return false;
+ 	}
+ 
+-	// bf is only supported for single key joins with equality condition as the Filter API only allows
+-	// single-column filters so far
+-	const bool can_use_bf = ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL;
++	// the Filter API only allows single-column filters so far: the bf is built on the first (equality) join key
++	// only, the caller only pushes it for the filter on that key
++	const bool can_use_bf = cmp == ExpressionType::COMPARE_EQUAL;
+ 
+ 	// building the bloom filter is costly on the build to make probing faster, so only use it if there are
+ 	// more probing tuples than build tuples
+@@ -896,7 +896,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
+-				if (!has_cast && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				if (!has_cast && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.

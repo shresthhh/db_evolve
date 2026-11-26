@@ -1,0 +1,42 @@
+{
+  "id": "E0035",
+  "title": "Parallel hash-join finalize for medium builds (64K-1M rows)",
+  "started": "2026-11-25T07:59:36-05:00",
+  "base": "95b3104ecc4ac63ef6508038d38e362d3e9c1ddb",
+  "candidate": "f58ee71c46a2c1c9d4623388d87b7c1c7d25f25a",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.5439992,
+  "summary": "Changed only src/execution/operator/join/physical_hash_join.cpp. The build is OK.\n(1) Lowered PARALLEL_CONSTRUCT_THRESHOLD from 1048576 to 65536. The hash-join pointer-table init and the Finalize/InsertHashes loop (which also fills the BF) now run in parallel for builds of 64K rows or more. The num_threads==1 and KeysAreSkewed fallbacks are unchanged.\n(2) HashJoinFinalizeEvent: chunks_per_task is now clamp(chunk_count/(4*num_threads), 4, 64), so medium builds get enough tasks to use every thread. verify_parallelism still uses 1 chunk per task.\n(3) The table-init MINIMUM_ENTRIES_PER_TASK (131072) is unchanged.\n\nMicro A/B (temp-table builds probed against a 15M-row table, same results before and after):\n- 703K unique-key build: about 100 \u2192 62ms.\n- 937K-row build with duplicate keys (about 4 rows per key, which exercises chain insert under CAS): about 72 \u2192 50ms.\n\nBench vs current best:\n- Large gains: q05 -29.1% (-24.2% on rerun), q04 -20.1% (-27.4% on rerun), q08 -24.3%, q16 -12.6%, q03 -11.7%, q22 -9.0%, q09 -8.0%.\n- Within noise: q02 -2.1%; everything else within \u00b12%, apart from q17.\n- q17 was +4.1% on the first run and -6.8% on the rerun, so it is noise.\n- Geomean -8.5%.",
+  "notes": "The gain was much larger than the issue predicted (geomean -8.5% vs the expected -2..-4%), so the serial finalize was a significant hidden phase on 8 threads.\n\nI did not tune the threshold below 64K or test 100K/300K builds separately. A follow-up could try 32K, or scale the threshold with thread count.\n\nOther places where fixed \"small \u2192 single-thread\" thresholds may be too conservative: radix agg finalize, perfect HJ build gates, and the external/partitioned HJ path (around line 1670), which still uses CHUNKS_PER_TASK directly.",
+  "train_ratio": 0.9168428508401623,
+  "val_ratio": 0.9409888780676199,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9754368370072708,
+    "q03": 0.9224467630455874,
+    "q04": 0.6959213253065178,
+    "q05": 0.7237645791252661,
+    "q07": 0.9699687192945293,
+    "q08": 0.854471616273147,
+    "q09": 0.921777948265037,
+    "q13": 1.00323360238328,
+    "q14": 1.0027611897169981,
+    "q16": 0.9299808043839138,
+    "q17": 0.9845438415334353,
+    "q18": 0.9865644978583744,
+    "q19": 1.020196877624386,
+    "q22": 0.9239126603720719
+  },
+  "improved": [
+    "q04",
+    "q05",
+    "q08"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-25T08:08:26-05:00"
+}

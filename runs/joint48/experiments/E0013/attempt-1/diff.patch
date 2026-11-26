@@ -1,0 +1,630 @@
+diff --git a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+index 7a08b43..9529ac0 100644
+--- a/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
++++ b/src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
+ 
++#include "duckdb/common/atomic.hpp"
+ #include "duckdb/execution/perfect_aggregate_hashtable.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+@@ -74,22 +75,42 @@ PhysicalPerfectHashAggregate::PhysicalPerfectHashAggregate(PhysicalPlan &physica
+ unique_ptr<PerfectAggregateHashTable> PhysicalPerfectHashAggregate::CreateHT(Allocator &allocator,
+                                                                              ClientContext &context) const {
+ 	return make_uniq<PerfectAggregateHashTable>(context, allocator, group_types, payload_types, aggregate_objects,
+-	                                            group_minima, required_bits);
++	                                            group_minima, required_bits, is_large);
+ }
+ 
++//! Large mode: the combine is split into at most this many slot stripes (each with its own lock)
++static constexpr idx_t LARGE_COMBINE_MAX_STRIPES = 64;
++static constexpr idx_t LARGE_COMBINE_MIN_STRIPE_SIZE = 4096;
++//! Large mode: the source hands out blocks of this many slots to the scanning threads
++static constexpr idx_t LARGE_SCAN_BLOCK_SIZE = 65536;
++
+ //===--------------------------------------------------------------------===//
+ // Sink
+ //===--------------------------------------------------------------------===//
+ class PerfectHashAggregateGlobalState : public GlobalSinkState {
+ public:
+ 	PerfectHashAggregateGlobalState(const PhysicalPerfectHashAggregate &op, ClientContext &context)
+-	    : ht(op.CreateHT(Allocator::Get(context), context)) {
++	    : ht(op.CreateHT(Allocator::Get(context), context)), stripe_count(0), stripe_size(0), next_stripe(0) {
++		if (op.is_large) {
++			auto total_groups = ht->TotalGroups();
++			stripe_count = MaxValue<idx_t>(
++			    1, MinValue<idx_t>(LARGE_COMBINE_MAX_STRIPES, total_groups / LARGE_COMBINE_MIN_STRIPE_SIZE));
++			stripe_size = (total_groups + stripe_count - 1) / stripe_count;
++			stripe_locks = make_unsafe_uniq_array<mutex>(stripe_count);
++		}
+ 	}
+ 
+ 	//! The lock for updating the global aggregate state
+ 	mutex lock;
+ 	//! The global aggregate hash table
+ 	unique_ptr<PerfectAggregateHashTable> ht;
++
++	//! Large mode: slot stripes that can be combined concurrently
++	idx_t stripe_count;
++	idx_t stripe_size;
++	unsafe_unique_array<mutex> stripe_locks;
++	//! Large mode: the stripe the next combining thread starts at
++	atomic<idx_t> next_stripe;
+ };
+ 
+ class PerfectHashAggregateLocalState : public LocalSinkState {
+@@ -163,6 +184,9 @@ SinkResultType PhysicalPerfectHashAggregate::Sink(ExecutionContext &context, Dat
+ //===--------------------------------------------------------------------===//
+ SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &context,
+                                                             OperatorSinkCombineInput &input) const {
++	if (is_large) {
++		return CombineLarge(context, input);
++	}
+ 	auto &lstate = input.local_state.Cast<PerfectHashAggregateLocalState>();
+ 	auto &gstate = input.global_state.Cast<PerfectHashAggregateGlobalState>();
+ 
+@@ -172,6 +196,30 @@ SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &co
+ 	return SinkCombineResultType::FINISHED;
+ }
+ 
++SinkCombineResultType PhysicalPerfectHashAggregate::CombineLarge(ExecutionContext &context,
++                                                                 OperatorSinkCombineInput &input) const {
++	auto &lstate = input.local_state.Cast<PerfectHashAggregateLocalState>();
++	auto &gstate = input.global_state.Cast<PerfectHashAggregateGlobalState>();
++
++	// combine stripe by stripe, every thread starting at a different stripe, so that threads rarely wait
++	const auto total_groups = gstate.ht->TotalGroups();
++	const auto first_stripe = gstate.next_stripe++ % gstate.stripe_count;
++	for (idx_t s = 0; s < gstate.stripe_count; s++) {
++		const auto stripe = (first_stripe + s) % gstate.stripe_count;
++		const auto start = stripe * gstate.stripe_size;
++		const auto end = MinValue<idx_t>(start + gstate.stripe_size, total_groups);
++		if (start >= end) {
++			continue;
++		}
++		lock_guard<mutex> l(gstate.stripe_locks[stripe]);
++		gstate.ht->CombineRange(*lstate.ht, start, end);
++	}
++	lock_guard<mutex> l(gstate.lock);
++	gstate.ht->TakeAllocator(*lstate.ht);
++
++	return SinkCombineResultType::FINISHED;
++}
++
+ //===--------------------------------------------------------------------===//
+ // Source
+ //===--------------------------------------------------------------------===//
+@@ -184,12 +232,77 @@ public:
+ 	idx_t ht_scan_position;
+ };
+ 
++//! Large mode: threads grab blocks of slots to scan
++class PerfectHashAggregateLargeState : public GlobalSourceState {
++public:
++	explicit PerfectHashAggregateLargeState(idx_t total_groups) : total_groups(total_groups), next_block(0) {
++		block_count = (total_groups + LARGE_SCAN_BLOCK_SIZE - 1) / LARGE_SCAN_BLOCK_SIZE;
++	}
++
++	idx_t MaxThreads() override {
++		return MaxValue<idx_t>(block_count, 1);
++	}
++
++	idx_t total_groups;
++	idx_t block_count;
++	atomic<idx_t> next_block;
++};
++
++class PerfectHashAggregateLargeLocalState : public LocalSourceState {
++public:
++	explicit PerfectHashAggregateLargeLocalState(ClientContext &context)
++	    : scan_position(0), scan_end(0), addresses(LogicalType::POINTER), arena(Allocator::Get(context)) {
++	}
++
++	idx_t scan_position;
++	idx_t scan_end;
++	Vector addresses;
++	ArenaAllocator arena;
++};
++
+ unique_ptr<GlobalSourceState> PhysicalPerfectHashAggregate::GetGlobalSourceState(ClientContext &context) const {
++	if (is_large) {
++		auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
++		return make_uniq<PerfectHashAggregateLargeState>(gstate.ht->TotalGroups());
++	}
+ 	return make_uniq<PerfectHashAggregateState>();
+ }
+ 
++unique_ptr<LocalSourceState> PhysicalPerfectHashAggregate::GetLocalSourceState(ExecutionContext &context,
++                                                                               GlobalSourceState &gstate) const {
++	if (is_large) {
++		return make_uniq<PerfectHashAggregateLargeLocalState>(context.client);
++	}
++	return PhysicalOperator::GetLocalSourceState(context, gstate);
++}
++
++SourceResultType PhysicalPerfectHashAggregate::GetDataLarge(ExecutionContext &context, DataChunk &chunk,
++                                                            OperatorSourceInput &input) const {
++	auto &state = input.global_state.Cast<PerfectHashAggregateLargeState>();
++	auto &lstate = input.local_state.Cast<PerfectHashAggregateLargeLocalState>();
++	auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
++
++	while (true) {
++		if (lstate.scan_position < lstate.scan_end) {
++			gstate.ht->ScanRange(lstate.scan_position, lstate.scan_end, lstate.addresses, lstate.arena, chunk);
++			if (chunk.size() > 0) {
++				return SourceResultType::HAVE_MORE_OUTPUT;
++			}
++		}
++		const auto block = state.next_block++;
++		if (block >= state.block_count) {
++			return SourceResultType::FINISHED;
++		}
++		lstate.scan_position = block * LARGE_SCAN_BLOCK_SIZE;
++		lstate.scan_end = MinValue<idx_t>(lstate.scan_position + LARGE_SCAN_BLOCK_SIZE, state.total_groups);
++	}
++}
++
+ SourceResultType PhysicalPerfectHashAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                                OperatorSourceInput &input) const {
++	if (is_large) {
++		return GetDataLarge(context, chunk, input);
++	}
+ 	auto &state = input.global_state.Cast<PerfectHashAggregateState>();
+ 	auto &gstate = sink_state->Cast<PerfectHashAggregateGlobalState>();
+ 
+@@ -225,6 +338,9 @@ InsertionOrderPreservingMap<string> PhysicalPerfectHashAggregate::ParamsToString
+ 		}
+ 	}
+ 	result["Aggregates"] = aggregate_info;
++	if (is_large) {
++		result["Large Table"] = "true";
++	}
+ 	return result;
+ }
+ 
+diff --git a/src/execution/perfect_aggregate_hashtable.cpp b/src/execution/perfect_aggregate_hashtable.cpp
+index 30f66c0..cbeec48 100644
+--- a/src/execution/perfect_aggregate_hashtable.cpp
++++ b/src/execution/perfect_aggregate_hashtable.cpp
+@@ -3,6 +3,7 @@
+ #include "duckdb/common/numeric_utils.hpp"
+ #include "duckdb/common/row_operations/row_operations.hpp"
+ #include "duckdb/execution/expression_executor.hpp"
++#include "duckdb/storage/buffer_manager.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -10,11 +11,13 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+                                                      const vector<LogicalType> &group_types_p,
+                                                      vector<LogicalType> payload_types_p,
+                                                      vector<AggregateObject> aggregate_objects_p,
+-                                                     vector<Value> group_minima_p, vector<idx_t> required_bits_p)
++                                                     vector<Value> group_minima_p, vector<idx_t> required_bits_p,
++                                                     bool lazy_init_p)
+     : BaseAggregateHashTable(context, allocator, aggregate_objects_p, std::move(payload_types_p)),
+       addresses(LogicalType::POINTER), required_bits(std::move(required_bits_p)), total_required_bits(0),
+       group_minima(std::move(group_minima_p)), sel(STANDARD_VECTOR_SIZE),
+-      aggregate_allocator(make_uniq<ArenaAllocator>(allocator)) {
++      aggregate_allocator(make_uniq<ArenaAllocator>(allocator)), lazy_init(lazy_init_p),
++      init_addresses(LogicalType::POINTER) {
+ 	for (auto &group_bits : required_bits) {
+ 		total_required_bits += group_bits;
+ 	}
+@@ -25,13 +28,26 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
+ 	layout_ptr->Initialize(std::move(aggregate_objects_p));
+ 	tuple_size = layout_ptr->GetRowWidth();
+ 
++	if (lazy_init) {
++		// large tables: allocate through the (memory-tracked) buffer allocator, and initialize states when a slot is
++		// first used, so that untouched slots are never paged in
++		auto &buffer_allocator = BufferManager::GetBufferManager(context).GetBufferAllocator();
++		large_data = buffer_allocator.Allocate(tuple_size * total_groups);
++		data = large_data.get();
++		large_group_is_set = buffer_allocator.Allocate(total_groups * sizeof(bool));
++		group_is_set = reinterpret_cast<bool *>(large_group_is_set.get());
++		memset(group_is_set, 0, total_groups * sizeof(bool));
++		return;
++	}
++
+ 	// allocate and null initialize the data
+ 	owned_data = make_unsafe_uniq_array_uninitialized<data_t>(tuple_size * total_groups);
+ 	data = owned_data.get();
+ 
+ 	// set up the empty payloads for every tuple, and initialize the "occupied" flag to false
+-	group_is_set = make_unsafe_uniq_array_uninitialized<bool>(total_groups);
+-	memset(group_is_set.get(), 0, total_groups * sizeof(bool));
++	owned_group_is_set = make_unsafe_uniq_array_uninitialized<bool>(total_groups);
++	group_is_set = owned_group_is_set.get();
++	memset(group_is_set, 0, total_groups * sizeof(bool));
+ 
+ 	// initialize the hash table for each entry
+ 	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
+@@ -114,7 +130,60 @@ static void ComputeGroupLocation(Vector &group, Value &min, uintptr_t *address_d
+ 	}
+ }
+ 
++void PerfectAggregateHashTable::AddChunkLazy(DataChunk &groups, DataChunk &payload) {
++	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
++	memset(address_data, 0, groups.size() * sizeof(uintptr_t));
++	D_ASSERT(groups.ColumnCount() == group_minima.size());
++
++	idx_t current_shift = total_required_bits;
++	for (idx_t i = 0; i < groups.ColumnCount(); i++) {
++		current_shift -= required_bits[i];
++		ComputeGroupLocation(groups.data[i], group_minima[i], address_data, current_shift, groups.size());
++	}
++	// compute the slot pointers, and collect the slots that are used for the first time
++	auto init_data = FlatVector::GetData<uintptr_t>(init_addresses);
++	idx_t init_count = 0;
++	for (idx_t i = 0; i < groups.size(); i++) {
++		const auto group = address_data[i];
++		if (group >= total_groups) {
++			throw InvalidInputException("Perfect hash aggregate: aggregate group %llu exceeded total groups %llu. This "
++			                            "likely means that the statistics in your data source are corrupt.\n* PRAGMA "
++			                            "disable_optimizer to disable optimizations that rely on correct statistics",
++			                            group, total_groups);
++		}
++		address_data[i] = uintptr_t(data) + group * tuple_size;
++		if (!group_is_set[group]) {
++			group_is_set[group] = true;
++			init_data[init_count++] = address_data[i];
++		}
++	}
++	if (init_count > 0) {
++		RowOperations::InitializeStates(*layout_ptr, init_addresses, *FlatVector::IncrementalSelectionVector(),
++		                                init_count);
++	}
++
++	idx_t payload_idx = 0;
++	auto &aggregates = layout_ptr->GetAggregates();
++	RowOperationsState row_state(*aggregate_allocator);
++	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
++		auto &aggregate = aggregates[aggr_idx];
++		auto input_count = (idx_t)aggregate.child_count;
++		if (aggregate.filter) {
++			RowOperations::UpdateFilteredStates(row_state, filter_set.GetFilterData(aggr_idx), aggregate, addresses,
++			                                    payload, payload_idx);
++		} else {
++			RowOperations::UpdateStates(row_state, aggregate, addresses, payload, payload_idx, payload.size());
++		}
++		payload_idx += input_count;
++		VectorOperations::AddInPlace(addresses, UnsafeNumericCast<int64_t>(aggregate.payload_size), payload.size());
++	}
++}
++
+ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload) {
++	if (lazy_init) {
++		AddChunkLazy(groups, payload);
++		return;
++	}
+ 	// first we need to find the location in the HT of each of the groups
+ 	auto address_data = FlatVector::GetData<uintptr_t>(addresses);
+ 	// zero-initialize the address data
+@@ -160,7 +229,59 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload)
+ 	}
+ }
+ 
++void PerfectAggregateHashTable::CombineRange(PerfectAggregateHashTable &other, idx_t start, idx_t end) {
++	D_ASSERT(lazy_init && other.lazy_init);
++	D_ASSERT(total_groups == other.total_groups);
++	D_ASSERT(tuple_size == other.tuple_size);
++	D_ASSERT(start <= end && end <= total_groups);
++
++	Vector source_addresses(LogicalType::POINTER);
++	Vector target_addresses(LogicalType::POINTER);
++	Vector new_target_addresses(LogicalType::POINTER);
++	auto source_addresses_ptr = FlatVector::GetData<data_ptr_t>(source_addresses);
++	auto target_addresses_ptr = FlatVector::GetData<data_ptr_t>(target_addresses);
++	auto new_target_addresses_ptr = FlatVector::GetData<data_ptr_t>(new_target_addresses);
++
++	idx_t combine_count = 0;
++	idx_t init_count = 0;
++	// any memory the combined states need comes from the source arena, which is taken over afterwards
++	RowOperationsState row_state(*other.aggregate_allocator);
++	for (idx_t i = start; i < end; i++) {
++		if (!other.group_is_set[i]) {
++			continue;
++		}
++		auto target_ptr = data + tuple_size * i;
++		if (!group_is_set[i]) {
++			group_is_set[i] = true;
++			new_target_addresses_ptr[init_count++] = target_ptr;
++		}
++		source_addresses_ptr[combine_count] = other.data + tuple_size * i;
++		target_addresses_ptr[combine_count] = target_ptr;
++		combine_count++;
++		if (combine_count == STANDARD_VECTOR_SIZE) {
++			RowOperations::InitializeStates(*layout_ptr, new_target_addresses, *FlatVector::IncrementalSelectionVector(),
++			                                init_count);
++			init_count = 0;
++			RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
++			combine_count = 0;
++		}
++	}
++	RowOperations::InitializeStates(*layout_ptr, new_target_addresses, *FlatVector::IncrementalSelectionVector(),
++	                                init_count);
++	RowOperations::CombineStates(row_state, *layout_ptr, source_addresses, target_addresses, combine_count);
++}
++
++void PerfectAggregateHashTable::TakeAllocator(PerfectAggregateHashTable &other) {
++	stored_allocators.push_back(std::move(other.aggregate_allocator));
++	other.aggregate_allocator = make_uniq<ArenaAllocator>(allocator);
++}
++
+ void PerfectAggregateHashTable::Combine(PerfectAggregateHashTable &other) {
++	if (lazy_init) {
++		CombineRange(other, 0, total_groups);
++		TakeAllocator(other);
++		return;
++	}
+ 	D_ASSERT(total_groups == other.total_groups);
+ 	D_ASSERT(tuple_size == other.tuple_size);
+ 
+@@ -286,6 +407,37 @@ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
+ 	RowOperations::FinalizeStates(row_state, *layout_ptr, addresses, result, grouping_columns);
+ }
+ 
++void PerfectAggregateHashTable::ScanRange(idx_t &scan_position, idx_t end, Vector &scan_addresses,
++                                          ArenaAllocator &arena, DataChunk &result) {
++	D_ASSERT(end <= total_groups);
++	auto data_pointers = FlatVector::GetData<data_ptr_t>(scan_addresses);
++	uint32_t group_values[STANDARD_VECTOR_SIZE];
++
++	idx_t entry_count = 0;
++	for (; scan_position < end; scan_position++) {
++		if (group_is_set[scan_position]) {
++			data_pointers[entry_count] = data + tuple_size * scan_position;
++			group_values[entry_count] = NumericCast<uint32_t>(scan_position);
++			entry_count++;
++			if (entry_count == STANDARD_VECTOR_SIZE) {
++				scan_position++;
++				break;
++			}
++		}
++	}
++	if (entry_count == 0) {
++		return;
++	}
++	idx_t shift = total_required_bits;
++	for (idx_t i = 0; i < grouping_columns; i++) {
++		shift -= required_bits[i];
++		ReconstructGroupVector(group_values, group_minima[i], required_bits[i], shift, entry_count, result.data[i]);
++	}
++	result.SetCardinality(entry_count);
++	RowOperationsState row_state(arena);
++	RowOperations::FinalizeStates(row_state, *layout_ptr, scan_addresses, result, grouping_columns);
++}
++
+ void PerfectAggregateHashTable::Destroy() {
+ 	// check if there is any destructor to call
+ 	bool has_destructor = false;
+@@ -304,6 +456,21 @@ void PerfectAggregateHashTable::Destroy() {
+ 
+ 	// iterate over all initialised slots of the hash table
+ 	RowOperationsState row_state(*aggregate_allocator);
++	if (lazy_init) {
++		// only slots that were used have initialized states
++		for (idx_t i = 0; i < total_groups; i++) {
++			if (!group_is_set[i]) {
++				continue;
++			}
++			data_pointers[count++] = data + tuple_size * i;
++			if (count == STANDARD_VECTOR_SIZE) {
++				RowOperations::DestroyStates(row_state, *layout_ptr, addresses, count);
++				count = 0;
++			}
++		}
++		RowOperations::DestroyStates(row_state, *layout_ptr, addresses, count);
++		return;
++	}
+ 	data_ptr_t payload_ptr = data;
+ 	for (idx_t i = 0; i < total_groups; i++) {
+ 		data_pointers[count++] = payload_ptr;
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 9134893..6b4cfc9 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -11,6 +11,8 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/function/function_binder.hpp"
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/parallel/task_scheduler.hpp"
++#include "duckdb/storage/buffer_manager.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+@@ -124,10 +126,58 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
+-static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, vector<idx_t> &bits_per_group) {
++static bool SubtreeContainsDelimScan(const PhysicalOperator &op) {
++	if (op.type == PhysicalOperatorType::DELIM_SCAN) {
++		return true;
++	}
++	for (auto &child : op.children) {
++		if (SubtreeContainsDelimScan(child.get())) {
++			return true;
++		}
++	}
++	return false;
++}
++
++//! Perfect hash tables beyond the configured threshold ("large mode") are allowed up to this many bits, provided the
++//! input is expected to fill a sizeable fraction of the slots and the per-thread tables fit comfortably in memory
++static constexpr idx_t LARGE_PERFECT_HT_MAX_BITS = 22;
++static constexpr idx_t LARGE_PERFECT_HT_MIN_THRESHOLD = 12;
++
++static bool CanUseLargePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, PhysicalOperator &child,
++                                            idx_t total_bits) {
++	const idx_t slots = idx_t(1) << total_bits;
++	// the input must be expected to be dense enough to fill the table: otherwise a regular hash table is cheaper
++	if (child.estimated_cardinality < slots / 2) {
++		return false;
++	}
++	// estimates of inputs that depend on a correlated (delim) join are unreliable
++	if (SubtreeContainsDelimScan(child)) {
++		return false;
++	}
++	// every thread builds a full table: make sure they fit comfortably in memory
++	idx_t tuple_size = 1; // the "group is set" flag
++	for (auto &expression : op.expressions) {
++		auto &aggregate = expression->Cast<BoundAggregateExpression>();
++		tuple_size += AlignValue(aggregate.function.GetStateSizeCallback()(aggregate.function));
++	}
++	const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
++	const auto max_memory = BufferManager::GetBufferManager(context).GetQueryMaxMemory();
++	if (slots * tuple_size * (threads + 1) > max_memory / 8) {
++		return false;
++	}
++	return true;
++}
++
++static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate &op, PhysicalOperator &child,
++                                       vector<idx_t> &bits_per_group, bool &is_large) {
++	is_large = false;
+ 	if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+ 		return false;
+ 	}
++	const idx_t threshold = Settings::Get<PerfectHtThresholdSetting>(context);
++	const idx_t max_bits = threshold >= LARGE_PERFECT_HT_MIN_THRESHOLD
++	                           ? MaxValue<idx_t>(threshold, LARGE_PERFECT_HT_MAX_BITS)
++	                           : threshold;
+ 	idx_t perfect_hash_bits = 0;
+ 	for (idx_t group_idx = 0; group_idx < op.groups.size(); group_idx++) {
+ 		auto &group = op.groups[group_idx];
+@@ -227,7 +277,7 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 		bits_per_group.push_back(required_bits);
+ 		perfect_hash_bits += required_bits;
+ 		// check if we have exceeded the bits for the hash
+-		if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)) {
++		if (perfect_hash_bits > max_bits) {
+ 			// too many bits for perfect hash
+ 			return false;
+ 		}
+@@ -239,6 +289,12 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 			return false;
+ 		}
+ 	}
++	if (perfect_hash_bits > threshold) {
++		if (!CanUseLargePerfectHashAggregate(context, op, child, perfect_hash_bits)) {
++			return false;
++		}
++		is_large = true;
++	}
+ 	return true;
+ }
+ 
+@@ -298,10 +354,12 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
+ 		return group_by;
+ 	}
+ 
+-	if (CanUsePerfectHashAggregate(context, op, required_bits)) {
++	bool is_large_perfect_ht = false;
++	if (CanUsePerfectHashAggregate(context, op, plan, required_bits, is_large_perfect_ht)) {
+ 		auto &group_by = Make<PhysicalPerfectHashAggregate>(context, op.types, std::move(op.expressions),
+ 		                                                    std::move(op.groups), std::move(op.group_stats),
+ 		                                                    std::move(required_bits), op.estimated_cardinality);
++		group_by.Cast<PhysicalPerfectHashAggregate>().is_large = is_large_perfect_ht;
+ 		group_by.children.push_back(plan);
+ 		return group_by;
+ 	}
+diff --git a/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp b/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
+index 939f743..18cf754 100644
+--- a/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
++++ b/src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp
+@@ -34,12 +34,17 @@ public:
+ public:
+ 	// Source interface
+ 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
++	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
++	                                                 GlobalSourceState &gstate) const override;
+ 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+ 	                                 OperatorSourceInput &input) const override;
+ 
+ 	bool IsSource() const override {
+ 		return true;
+ 	}
++	bool ParallelSource() const override {
++		return is_large;
++	}
+ 	OrderPreservationType SourceOrder() const override {
+ 		return OrderPreservationType::NO_ORDER;
+ 	}
+@@ -82,6 +87,14 @@ public:
+ 	vector<idx_t> required_bits;
+ 
+ 	unordered_map<Expression *, size_t> filter_indexes;
++
++	//! Whether the table exceeds the regular perfect hash threshold ("large mode"): states are initialized lazily,
++	//! the combine is striped over slot ranges, and the source scans slot blocks in parallel
++	bool is_large = false;
++
++private:
++	SinkCombineResultType CombineLarge(ExecutionContext &context, OperatorSinkCombineInput &input) const;
++	SourceResultType GetDataLarge(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const;
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+index 211c27b..ff6c066 100644
+--- a/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
++++ b/src/include/duckdb/execution/perfect_aggregate_hashtable.hpp
+@@ -17,7 +17,7 @@ class PerfectAggregateHashTable : public BaseAggregateHashTable {
+ public:
+ 	PerfectAggregateHashTable(ClientContext &context, Allocator &allocator, const vector<LogicalType> &group_types,
+ 	                          vector<LogicalType> payload_types_p, vector<AggregateObject> aggregate_objects,
+-	                          vector<Value> group_minima, vector<idx_t> required_bits);
++	                          vector<Value> group_minima, vector<idx_t> required_bits, bool lazy_init = false);
+ 	~PerfectAggregateHashTable() override;
+ 
+ public:
+@@ -30,6 +30,20 @@ public:
+ 	//! Scan the HT starting from the scan_position
+ 	void Scan(idx_t &scan_position, DataChunk &result);
+ 
++	//! Lazy-init (large) mode only: combines the slots [start, end) of the other HT into this one. Any state memory
++	//! allocated by the combine comes from the other HT's arena, so disjoint ranges can be combined concurrently
++	void CombineRange(PerfectAggregateHashTable &other, idx_t start, idx_t end);
++	//! Lazy-init (large) mode only: take ownership of the other HT's arena (must be called after all CombineRange calls)
++	void TakeAllocator(PerfectAggregateHashTable &other);
++	//! Lazy-init (large) mode only: scan the slots [scan_position, end) using caller-owned addresses and arena, so
++	//! that disjoint ranges can be scanned concurrently
++	void ScanRange(idx_t &scan_position, idx_t end, Vector &scan_addresses, ArenaAllocator &arena,
++	               DataChunk &result);
++
++	idx_t TotalGroups() const {
++		return total_groups;
++	}
++
+ protected:
+ 	Vector addresses;
+ 	//! The required bits per group
+@@ -48,7 +62,11 @@ protected:
+ 	//! The owned data of the HT
+ 	unsafe_unique_array<data_t> owned_data;
+ 	//! Information on whether or not a specific group has any entries
+-	unsafe_unique_array<bool> group_is_set;
++	bool *group_is_set;
++	unsafe_unique_array<bool> owned_group_is_set;
++	//! Lazy-init (large) mode: the data and the group flags are allocated through the database allocator
++	AllocatedData large_data;
++	AllocatedData large_group_is_set;
+ 
+ 	//! The minimum values for each of the group columns
+ 	vector<Value> group_minima;
+@@ -61,7 +79,13 @@ protected:
+ 	//! Owning arena allocators that this HT has data from
+ 	vector<unique_ptr<ArenaAllocator>> stored_allocators;
+ 
++	//! Whether aggregate states are only initialized when a slot is first used
++	bool lazy_init;
++	//! Addresses of slots that need their states initialized (lazy mode)
++	Vector init_addresses;
++
+ private:
++	void AddChunkLazy(DataChunk &groups, DataChunk &payload);
+ 	//! Destroy the perfect aggregate HT (called automatically by the destructor)
+ 	void Destroy();
+ };

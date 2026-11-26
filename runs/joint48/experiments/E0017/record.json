@@ -1,0 +1,43 @@
+{
+  "id": "E0017",
+  "title": "Stop compressing hash-join keys in compressed materialization",
+  "started": "2026-11-24T11:28:16-05:00",
+  "base": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "candidate": "ecb93ab2d779cbceb8f80d359a68ce87fa93a5d6",
+  "outcome": "retired",
+  "reasons": [
+    "visible geomean got slower (+0.6%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.9158560000000001,
+  "summary": "In CompressedMaterialization::CompressComparisonJoin (src/optimizer/compressed_materialization/compress_comparison_join.cpp), I removed the block that compressed both columns of a single equality condition generically and added the probe key to probe_compress_bindings. Every condition now goes through GetReferencedBindings, so join keys are never compressed. Build-side payload columns are still compressed, and aggregate/order/distinct CM is unchanged.\n\nWhy it was slow: the hash join only builds a Bloom filter when `storage_offset.IsNull()` (physical_hash_join.cpp:1059). A probe key under a CM compress projection gets an offset, so its probe scan only got min/max filters and never the BF. With the change, q09's orders scan and q03's lineitem scan get the BF, as the profiles show.\n\nBench (4 runs, the bench itself is \u00b110-20% noisy): q09 -7.1%, -11.9%, -14.3%, -15.3%, -19.0%. q03 swung between +9.6% and -17% (-11.6% on the last full run). Last full bench geomean -4.8%, with nothing slower than +4.6% (q04).\n\nThe q19 \"+21%\" from early runs was noise. The q19 plan is identical with and without the change because CM never touches that join, and an unchanged tree measured -17% on q19. q13 still uses the perfect RIGHT HJ (0.39s for 15M probe rows) and measured -5.9..+3.9%. q18 was \u00b11.6%. I didn't try variant B (no join CM at all) because the key-only variant already gives the expected q09/q03 gains.",
+  "notes": "The bench is very noisy, \u00b120% per template on identical code (q19 and q08 especially), so compare profile plans before believing a regression.\n\nOn q13 the aggregate CM now adds a 15M-row compress projection (about 0.58s CPU) above the RIGHT join, replacing the old decompress/compress pair. Follow-up idea: skip the aggregate CM compress when the group key comes straight from a large join output and the perfect HA already uses the stats range.\n\nAn alternative fix would have been to let BF push through the storage_offset by shifting keys on the probe side. Removing key compression is simpler and also drops the projections.",
+  "train_ratio": 1.0060938336173249,
+  "val_ratio": 1.0125212420678693,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9749786243356449,
+    "q03": 1.0388173811718777,
+    "q04": 1.0165550772314722,
+    "q05": 1.0465848523628225,
+    "q07": 1.035770439216975,
+    "q08": 1.024373176685958,
+    "q09": 0.8925500570953147,
+    "q13": 1.0975137449875778,
+    "q14": 1.0476010501346293,
+    "q16": 1.0315259318589842,
+    "q17": 1.0068758514535183,
+    "q18": 1.0004697266978038,
+    "q19": 0.9075379667573962,
+    "q22": 0.9840431566878054
+  },
+  "improved": [
+    "q09",
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T11:50:32-05:00"
+}

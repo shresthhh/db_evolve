@@ -1,0 +1,16 @@
+{
+  "id": "E0046",
+  "title": "Template-copy aggregate state initialization for destructor-free layouts",
+  "started": "2026-11-26T01:35:48-05:00",
+  "base": "c9a15ca13231772ca138544b1fb8b150cf2c1c88",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.4756757999999999,
+  "summary": "I'm abandoning this change: it builds and works, but q18 only improved by about 2%, short of the 5% bar. The change is in RowOperations::InitializeStates (src/common/row_operations/row_aggregate.cpp). It takes a fast path when all of these hold: the layout has no destructors, count >= 4, the aggregate width is between 1 and 256 bytes, and every aggregate offset falls inside [aggr_offset, aggr_offset+aggr_width). On that path it zeroes a stack template, runs each aggregate's init callback once on the template, and memcpys the template into each row (with or without sel). The copy is specialized for widths 8/16/24/32/48/64 and uses a generic memcpy for other widths. Otherwise the old per-row callback loop runs. It covers the radix HT (FindOrCreateGroups), the perfect HA and the streamed-run store. Build OK and the bench result checks passed. q18 across six bench runs: -6.7%, +3.1%, -2.9%, -3.1%, -4.1%, +2.4% (average about -2%). In the full bench runs every other template stayed within noise; q05/q07/q08 were +8..12% in one run and -0.5..-1.8% on a rerun.",
+  "notes": "The ~60-72ms CPU that E0045 attributed to per-row init callbacks did not show up as wall-time savings. The indirect call predicts perfectly and the init is a store or two into a cache line that the next step (UpdateStates or the address fill) touches anyway, so taking the callback out saves very little. Per-row state-init micro-optimizations for aggregation are a dead end. Remaining per-group cost is in the probe, the address fill and the update loops (see the radix agg ablation).",
+  "finished": "2026-11-26T02:28:15-05:00"
+}

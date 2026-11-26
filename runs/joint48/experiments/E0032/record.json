@@ -1,0 +1,16 @@
+{
+  "id": "E0032",
+  "title": "Faster substring search: rare-pair candidate test + exact multi-literal LIKE in prefilter",
+  "started": "2026-11-25T06:53:19-05:00",
+  "base": "1320822f46f181a24e9abe6bebacfabc31b8a0f5",
+  "candidate": null,
+  "outcome": "retired",
+  "reasons": [
+    "abandoned by the implementer after investigation"
+  ],
+  "attempts": 1,
+  "cost_usd": 0.8376066,
+  "summary": "I'm abandoning this change. It builds and gives the right results, but q13 only improves by about 4% on average, which is well under its 14% noise bar.\n\nWhat changed, all in src/storage/table/column_segment.cpp:\n- `FindSubstring` is replaced by a `SubstringSearcher` struct, set up once per vector.\n- The SSE candidate test now uses the needle's two rarest bytes, picked by an English letter-frequency ranking, instead of its first and last bytes.\n- Candidates are confirmed with a masked 8-byte word compare, plus memcmp for any bytes past 8. It falls back to plain memcmp when fewer than 8 bytes of input are left.\n- New exact path: for contains(), and for LIKE / NOT LIKE patterns that start and end with '%', contain no '_' and have one or more literals, each hit row is checked by finding the literals in order. This skips SelectExpression. For negated filters the result is inverted.\n\nCorrectness: I checked counts against the normal (non-scan-filter) evaluation path for LIKE, NOT LIKE, multi-literal, single-byte-literal, anchored-pattern and NOT contains() cases. My first version returned wrong NOT LIKE counts because the exact path didn't invert for negated filters; that is fixed.\n\nq13 against the current best, across five bench runs: -4.7%, -1.9%, -3.8%, -5.3% (full bench), -7.5%, -1.4%. The full-bench geomean was +1.3%. q04, q07 and q08 were +6..+13% in one run, but they have no LIKE filters and came back to +2..+3% on re-runs, so that looks like noise.",
+  "notes": "- The q13 orders scan uses about 2.24s of CPU, and most of that is FSST decode; the substring search is a small share. My rough ad-hoc timings (which include process startup): NOT LIKE '%special%packages%' ~306-314ms, '%zzzqx%' ~275ms, sum(length()) ~189ms.\n- Of what's left, about 86ms is the cost of the prefilter itself (finding runs, building selections, the 16-byte SSE scan), not the extra work per candidate.\n- Further work on the search alone won't clear q13's bar. This change could be bundled with a decode-side improvement, since the tree is saved.\n- When adding any exact inner-predicate shortcut: SelectExpression evaluates the full filter including the NOT, so the shortcut must invert for negated filters.\n- In `TrySubstringPrefilter`, the parameter named `vector` hides the type, so write `duckdb::vector<>` there.",
+  "finished": "2026-11-25T07:01:58-05:00"
+}

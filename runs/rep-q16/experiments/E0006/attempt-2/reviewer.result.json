@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp TrySetExactBloomFilter: the condition is shape-based only. It needs a single equality key, NULLs not comparing equal, the same logical type on both sides, a plain integer logical type, and a key range of at most 128 bits per build row (capped at 2^32 bits, the same 512MiB as the hashed bloom filter). No names, literals or dataset knowledge are involved.",
+      "It only runs on the in-memory hash join path: the external path returns before FinalizeFilters. So ht.Count() and min/max cover every row in the hash table, and the bitmap is filled from layout column 0 (the only key column) during Finalize. Parallel finalize tasks set bits with atomic fetch_or.",
+      "Type safety: the existing has_cast check guarantees the scan column type equals the join's left type, and the new check requires left type == right type. So the scan applies the same integer mapping as the build. DECIMAL, DATE and ENUM are excluded by logical type id, so there is no mismatch between logical and physical values.",
+      "NULLs are handled: exact mode is only used when the filter rejects NULLs. NULLs are skipped on insert and fail in Filter and FilterValue. Signed keys are sign-extended and offsets use wrap-around subtraction, so ranges are exact and keys outside the range miss.",
+      "CheckStatistics and FilterValue get matching exact-mode variants, and 128-bit stats types return NO_PRUNING_POSSIBLE. Copy shares the same BloomFilter by reference, as before, so exact state is kept.",
+      "Minor: building throws an InternalException if a key falls outside min/max. That is an invariant check, not a reachable error, because min/max are aggregated over the same build chunks."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"physical_hash_join.cpp TrySetExactBloomFilter: the condition is shape-based only. It needs a single equality key, NULLs not comparing equal, the same logical type on both sides, a plain integer logical type, and a key range of at most 128 bits per build row (capped at 2^32 bits, the same 512MiB as the hashed bloom filter). No names, literals or dataset knowledge are involved.\",\"It only runs on the in-memory hash join path: the external path returns before FinalizeFilters. So ht.Count() and min/max cover every row in the hash table, and the bitmap is filled from layout column 0 (the only key column) during Finalize. Parallel finalize tasks set bits with atomic fetch_or.\",\"Type safety: the existing has_cast check guarantees the scan column type equals the join's left type, and the new check requires left type == right type. So the scan applies the same integer mapping as the build. DECIMAL, DATE and ENUM are excluded by logical type id, so there is no mismatch between logical and physical values.\",\"NULLs are handled: exact mode is only used when the filter rejects NULLs. NULLs are skipped on insert and fail in Filter and FilterValue. Signed keys are sign-extended and offsets use wrap-around subtraction, so ranges are exact and keys outside the range miss.\",\"CheckStatistics and FilterValue get matching exact-mode variants, and 128-bit stats types return NO_PRUNING_POSSIBLE. Copy shares the same BloomFilter by reference, as before, so exact state is kept.\",\"Minor: building throws an InternalException if a key falls outside min/max. That is an invariant check, not a reachable error, because min/max are aggregated over the same build chunks.\"],\"required_changes\":[]}",
+  "cost_usd": 0.3175088,
+  "seconds": 56.03842210769653,
+  "error": ""
+}

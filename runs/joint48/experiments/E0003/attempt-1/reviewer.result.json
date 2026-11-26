@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "perfect_hash_join_executor.cpp CanDoPerfectHashJoin: extending to JoinType::RIGHT is general (single integer equality key, unique build keys). The new min/max IsNull guard covers builds that are empty or all-NULL. The off-by-one dup check (`Count > range+1`) is a real bug fix: a fully dense key set has range+1 keys. Real duplicate detection still happens in TemplatedFillSelectionVectorBuild through bitmap_build_idx, so duplicates still fall back to the regular join.",
+      "NULL build keys: RIGHT joins keep NULL-key rows in the HT with has_null=false. The fill now skips invalid keys, so those rows get no slot and are never marked found, and the existing ScanFullOuter emits them as unmatched. ht.Count() includes NULL rows, which only makes the pre-check more conservative.",
+      "Match tracking: the per-slot byte array is written during probe (concurrent writes of the same value 1, which is benign). FlushFoundMatch runs once under the source-state lock in Initialize, before PrepareScanHT, and writes found_match at ht.tuple_size, the same offset join_hashtable.cpp uses. The addresses vector shares its buffer through Reference, so it survives the end of FullScanHashTable. The in-memory HT stays pinned.",
+      "The larger 4M range is allowed only for joins that propagate the build side, and only when the build is at least half-dense. That is a generic density heuristic tied to no workload constant, and the memory it uses is comparable to the regular HT it replaces. The external/spill path resets the perfect executor, as before.",
+      "Optimizer: computing min/max aggregates for RIGHT joins too is the minimal change needed to reach the gate. No test, benchmark or settings files are touched."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"perfect_hash_join_executor.cpp CanDoPerfectHashJoin: extending to JoinType::RIGHT is general (single integer equality key, unique build keys). The new min/max IsNull guard covers builds that are empty or all-NULL. The off-by-one dup check (`Count > range+1`) is a real bug fix: a fully dense key set has range+1 keys. Real duplicate detection still happens in TemplatedFillSelectionVectorBuild through bitmap_build_idx, so duplicates still fall back to the regular join.\",\"NULL build keys: RIGHT joins keep NULL-key rows in the HT with has_null=false. The fill now skips invalid keys, so those rows get no slot and are never marked found, and the existing ScanFullOuter emits them as unmatched. ht.Count() includes NULL rows, which only makes the pre-check more conservative.\",\"Match tracking: the per-slot byte array is written during probe (concurrent writes of the same value 1, which is benign). FlushFoundMatch runs once under the source-state lock in Initialize, before PrepareScanHT, and writes found_match at ht.tuple_size, the same offset join_hashtable.cpp uses. The addresses vector shares its buffer through Reference, so it survives the end of FullScanHashTable. The in-memory HT stays pinned.\",\"The larger 4M range is allowed only for joins that propagate the build side, and only when the build is at least half-dense. That is a generic density heuristic tied to no workload constant, and the memory it uses is comparable to the regular HT it replaces. The external/spill path resets the perfect executor, as before.\",\"Optimizer: computing min/max aggregates for RIGHT joins too is the minimal change needed to reach the gate. No test, benchmark or settings files are touched.\"],\"required_changes\":[]}",
+  "cost_usd": 0.26734739999999996,
+  "seconds": 44.35720872879028,
+  "error": ""
+}

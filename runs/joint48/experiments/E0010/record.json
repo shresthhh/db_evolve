@@ -1,0 +1,40 @@
+{
+  "id": "E0010",
+  "title": "Distinct HT partitioned on group hash",
+  "started": "2026-11-24T06:32:55-05:00",
+  "base": "1a0ec0cc6e10e7b4edfe41edc7ca8936dc782aff",
+  "candidate": "1c9ee8aad4a6d20f3bbd2b4c7de94c46b1aa9133",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q16 -7.4%; needs at least -7.9%)"
+  ],
+  "attempts": 2,
+  "cost_usd": 2.8307092,
+  "summary": "I fixed both review points; the tree builds. The q16 gain is real but noisy: -10.9%, -9.8%, -3.3% and +0.2% across four runs.\n\nWhat changed since the rejected version:\n\n1. **Only the top 4 radix bits come from the group hash.** The distinct hash table now takes bits [44,48) from hash(main groups) instead of all 12. The lower radix bits still come from the full hash(G,x), so repartitioning can still split a heavy group. The stored hash is used consistently, so correctness is unchanged.\n2. **New runtime memory gate.** `RadixPartitionedHashTable::EnablePartitionPrefix(GlobalSinkState&, idx_t)` is called from the `HashAggregateGlobalSinkState` constructor with the child's row estimate. Prefix mode turns on only when estimated rows \u00d7 (row width + 16) \u2264 query memory limit / 16. The existing plan-time setup is kept: grouped aggregates with estimated output \u2265 4096 that have distinct tables. Ungrouped DISTINCT never turns it on.\n\n**Spill check with one dominant group** (90% of rows in one group, 40M distinct x, about 5000 groups, 8 threads, `memory_limit=500MB`):\n- Baseline (feature disabled): 6.42 s.\n- Previous 12-bit version: failed with Out of Memory.\n- 4-bit version without the gate: OOM. A 2-bit version without the gate passed but took 10.5\u201311.3 s (+65%), which is what led to the gate.\n- Final version: 6.55 s, because the gate turns the feature off. Results match.\n\n**In-memory checks, no memory limit:**\n- 4M rows with 90% in the NULL group: 498\u2013543 ms baseline vs 543\u2013573 ms mine, about +7%. This is the remaining cost on an adversarial case.\n- 8M rows spread evenly over 5000 groups: 904 ms baseline vs 801 ms mine, -11%.\n\n**q16:** the best version measured between 174 and 195 ms; mine measured 164\u2013182 ms.\n\n**Full bench:** geomean -0.1%. Nothing outside \u00b15%: q18 and q19 were +4.3%, q02 -4.1%.",
+  "notes": "- The q16 gain is very noisy on this tree: my build is steady at 164\u2013182 ms, while the best version swings between 174 and 195 ms. Per run: -10.9, -3.3, -9.8, +0.2%.\n- Taking all 12 radix bits from the group hash makes a dominant group OOM under a low memory limit. Even 2 bits without a memory gate was 65% slower in the spill case.\n- I could not run the baseline binary directly. Baseline numbers came from rebuilding with the plan gate forced off (`if (false && ...)`), which gives the original code path; that change is reverted in the final tree.\n- Possible follow-up: choose the number of prefix bits from the final radix bits, or measure skew from HLL or a partition histogram before combining. Either would need a global decision before any rows are sunk, because all threads must hash the same way.",
+  "train_ratio": 0.9878549404012846,
+  "val_ratio": 1.0138262865315397,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9416459925892418,
+    "q03": 0.9980232603786193,
+    "q04": 0.9695954032858941,
+    "q05": 1.003893199965906,
+    "q07": 1.0054342829495477,
+    "q08": 1.0098295894147584,
+    "q09": 1.00542516940204,
+    "q13": 0.9782518438051305,
+    "q14": 0.9982251926213207,
+    "q16": 0.9255155381279719,
+    "q17": 0.995344895471194,
+    "q18": 1.0051927512412941,
+    "q19": 1.0068235474256613,
+    "q22": 0.9913050624608115
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T07:09:17-05:00"
+}

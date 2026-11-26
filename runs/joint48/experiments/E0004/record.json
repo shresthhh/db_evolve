@@ -1,0 +1,40 @@
+{
+  "id": "E0004",
+  "title": "Substring prefilter over contiguous string runs for LIKE/contains scan filters",
+  "started": "2026-11-24T04:04:39-05:00",
+  "base": "72de28442d3f7bdce9070be47c48d77e509a2789",
+  "candidate": "6657c993180e892cf72a07d51f1f119af115d4e3",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q13 -7.7%; needs at least -13.8%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.137961,
+  "summary": "I added a substring prefilter to `ColumnData::Filter` in `src/storage/table/column_data.cpp`; it is the only file changed. It builds, and q13 and q09 got faster in every bench run.\n\n**What it does.** It applies when the filter is a top-level EXPRESSION_FILTER of the form `~~`, `!~~` or `contains`, possibly wrapped in one or more NOTs. The column must be a direct column reference of type VARCHAR, the pattern a non-NULL VARCHAR constant, and the result a FLAT vector of at most STANDARD_VECTOR_SIZE rows. For LIKE patterns it only applies when the wildcards are all `%` (no `_` or `\\`); it then takes the longest literal segment. For contains it uses the whole needle. The literal must be at least 2 bytes.\n\nFor each row in the incoming selection:\n- **NULL rows** are dropped.\n- **Inlined strings (12 bytes or less)** become candidates for the normal path.\n- **Longer strings** are grouped into runs where each string's data starts exactly where the previous one ends. Each run is searched once with SSE2: compare the first and last byte, then `memcmp` to confirm. The final block overlaps the previous one instead of falling back to a scalar tail. A short scalar loop covers runs too small for one block and builds without SSE2.\n\nA hit counts only if it lies entirely inside one string. That string becomes a candidate, and the search resumes at the end of that string.\n\nOnly candidates go through the original `ColumnSegment::FilterSelection`, with a smaller selection. Rows without the literal are decided directly: false for positive LIKE/contains, true for negated ones. NULLs are always excluded, and the original row order is kept. The new selection is installed with `sel.Initialize`, so the incoming selection is never written to.\n\n**Correctness checks** (row counts or hash sums, compared with the same filter on `s||''`, which is not pushed down):\n- On orders: NOT LIKE '%unusual%packages%', LIKE, contains, NOT contains, NOT LIKE '%s. %'. All equal.\n- On a temp table with NULLs, inlined and long strings, prefix patterns, and a needle longer than any string: all differences were 0.\n\n**Bench against the current best:**\n\n| Run | q13 | q09 | Other templates |\n|---|---|---|---|\n| q13 + q09 only | 689.6 \u2192 605.5 ms (-12.2%) | 773.2 \u2192 729.1 ms (-5.7%) | \u2013 |\n| Full bench | -6.5% | -8.0% | all within noise except q08 +11.9% |\n| q08 + q13 rerun | -8.3% | \u2013 | q08 +0.4% |\n\nThe full-bench geomean was -0.8%. q08 has no LIKE filter, so the +11.9% looks like noise; the rerun supports that.",
+  "notes": "- **Testing pitfall:** to check NOT LIKE against a filter that blocks pushdown, use `s||''`, not `concat(s,'')`. `concat` turns NULL into `''`, so counts differ by exactly the number of NULLs and look like a bug.\n- **Re-parsing:** the filter expression is re-parsed for every vector. It is cheap, but the result could be cached in the filter state, at the cost of a header change.\n- **Follow-ups:**\n  - Run the full multi-segment LIKE match (each segment in order) inside the run, so candidates never go through the generic matcher.\n  - Choose the rarest segment as the needle rather than the longest.\n  - Extend the prefilter to filters inside CONJUNCTION_AND.\n  - Add a NEON path for ARM.",
+  "train_ratio": 0.9833481258492495,
+  "val_ratio": 0.9956841094002509,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9447544190955635,
+    "q03": 1.0121790045056973,
+    "q04": 1.0172638222229426,
+    "q05": 0.9965109646800474,
+    "q07": 0.9671357580995431,
+    "q08": 0.9700995784454796,
+    "q09": 0.9878791779426095,
+    "q13": 0.9227988786333644,
+    "q14": 0.9975300551585394,
+    "q16": 0.9907404551182728,
+    "q17": 0.9974630757015588,
+    "q18": 0.9952176700608499,
+    "q19": 0.9906067200277479,
+    "q22": 0.9810552693499188
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T04:26:50-05:00"
+}

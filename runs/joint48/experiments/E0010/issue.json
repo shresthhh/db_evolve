@@ -1,0 +1,15 @@
+{
+  "title": "Distinct HT partitioned on group hash",
+  "hypothesis": "q16 does count(DISTINCT ps_suppkey) GROUP BY brand,type,size, with about 64K estimated groups. The distinct radix HT partitions on hash(G,x), so every distinct partition holds pieces of every group. Distinct finalize then re-sinks each partition into the main HT, and each task touches nearly all groups. That is a large re-aggregation plus a combine. A prior run on this codebase spliced hash(G) into the radix bits [36,48) of the distinct HT hash and measured q16 -12..-13% twice, and -11% on a later re-implementation.",
+  "plan": "In radix_partitioned_hashtable.cpp/.hpp add a member (e.g. partition_prefix_count = number of leading group columns) on RadixPartitionedHashTable. In Sink, when it is set, hash the full key, compute hash(first prefix cols), and replace bits [36,48) (the RadixPartitioning MAX_RADIX_BITS mask region) with those bits of the group hash. Call a pre-hashed AddChunk overload and keep the sink_count update inside it, so the adaptivity logic still fires. In physical_hash_aggregate.cpp, when distinct radix tables are built for a grouped aggregate with estimated_cardinality >= 4096, set the prefix count to the number of main group columns, and skip TryAddCompressedGroups in that mode. Distinct finalize is unchanged: each partition now holds whole groups.",
+  "target_files": [
+    "src/execution/radix_partitioned_hashtable.cpp",
+    "src/include/duckdb/execution/radix_partitioned_hashtable.hpp",
+    "src/execution/operator/aggregate/physical_hash_aggregate.cpp"
+  ],
+  "expected_gain": "q16 -10..-13%. Other count(DISTINCT) GROUP BY templates gain a few %.",
+  "generality": "Any grouped aggregate with DISTINCT aggregates over many groups. Ungrouped DISTINCT is unaffected (gated). A skewed group could unbalance partitions, and low-group-count queries are gated off by the estimate.",
+  "risk": "Medium-low. The hash only affects partitioning, so correctness holds as long as the same hash is used consistently for equality probing in the distinct HT: the full hash still decides the slot, only the radix bits are replaced. Test spilling with a low memory_limit.",
+  "status": "open",
+  "filed": "g1r10"
+}

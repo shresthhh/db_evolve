@@ -1,0 +1,13 @@
+{
+  "title": "Faster substring search: rare-pair candidate test + exact multi-literal LIKE in prefilter",
+  "hypothesis": "Orders scan, sum(o_custkey): with NOT LIKE '%special%packages%' 148-166ms; with '%packages%' alone ~155-160ms; with '%zzzqx%' ~110ms; length() only ~95ms. So the cost of finding 'packages' (2.25M/15M rows hit) is ~50ms of wall over decode. FindSubstring (column_segment.cpp:665) matches on the first/last char 'p'/'s', which are common, then calls memcmp per candidate.",
+  "plan": "In FindSubstring, use an 8-byte load+mask compare for needle_len<=9 instead of memcmp, and choose the candidate-pair chars from the needle's rarer bytes. Optionally, for patterns of only '%' wildcards, match all literals in order inside the run so hits are exact and SelectExpression is skipped.",
+  "target_files": [
+    "src/storage/table/column_segment.cpp"
+  ],
+  "expected_gain": "q13 -5..-9% (below its 14% noise threshold alone); small gains on any LIKE scan.",
+  "generality": "All LIKE/contains scan filters on long strings.",
+  "risk": "Low; correctness depends on exact boundary handling.",
+  "status": "open",
+  "filed": "g2r14"
+}

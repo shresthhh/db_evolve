@@ -1,0 +1,40 @@
+{
+  "id": "E0039",
+  "title": "Huge pages for large join tables v2: HJ pointer table >=8MB + perfect-HJ slot arrays",
+  "started": "2026-11-25T12:11:03-05:00",
+  "base": "3c9ef54dba04c4763ba2d3dbbccbdbe12e2b324c",
+  "candidate": "9fc9b440036c6bf24760e655d58cf6636c4bd561",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.8752705999999999,
+  "summary": "Large hash-join pointer tables (8MB or more, which means at least 1M slots) are now backed by transparent huge pages. The tree builds, and in my bench runs q09 was consistently faster (-7.4..-9.7%) with no template reliably slower.\n\nWhat changed:\n- **New header-only helper** `src/include/duckdb/common/huge_page_util.hpp` (`HugePageUtil`). It reads `/sys/kernel/mm/transparent_hugepage/enabled` once and caches whether it is [madvise] or [always]. It provides `Align` (to 2MB), `Advise` (MADV_HUGEPAGE over whole 2MB pages) and `Release` (MADV_DONTNEED then MADV_NOHUGEPAGE). It does nothing on non-Linux systems or when THP is off.\n- **`JoinHashTable`** gains `AllocateHashMap`, `FreeHashMap`, `HashMapCapacity` and a `hash_map_huge_pages` flag. Tables of 8MB or more are allocated through the BufferAllocator with 2MB of slack. `entries` is aligned to 2MB and advised before `InitializePointerTable` first touches it.\n- **Cleanup on free.** `Release` runs in the destructor, in `Reset()` and on the grow path, so memory the allocator recycles does not keep the huge-page setting.\n- **Capacity check.** The reuse check and the assert now use `HashMapCapacity()`, which subtracts the 2MB slack.\n- **Grow path.** It now frees the old table before allocating the new one, which also lowers peak memory.\n\nBench results (best ms \u2192 mine; each run is 2 bindings \u00d7 4 hot runs, under ~5% is noise):\n\n| Run | Result |\n|---|---|\n| q02/q03/q09/q16 | q02 -8.0%, q03 -9.2%, q09 -2.8%, q16 +1.8% |\n| q09/q08/q03 | q09 -8.3%, q03 -5.5%, q08 -2.1% |\n| q04/q09 | q04 -8.7%, q09 -9.3% |\n| Full bench, run 1 | geomean -0.9%; q09 -9.7%, q03 -4.4%, q07 -3.6%; q04 +6.2% |\n| Full bench, run 2 | geomean -2.7%; q09 -7.4%, q07 -8.6%, q05 -7.4%, q22 -6.8%, q14 -6.0%; q04 +3.5%, q13 +1.9% |\n\n- **q04:** its +6.2% in the first full run looks like noise, since q04 alone right after came in at -8.7%.\n- **q16:** never slower than +1.8% across three runs, so I did not add the build-rows \u2265 400K gate.\n- **q02:** not slower in any run, so the free-time cleanup is doing its job.\n\nI left out the perfect hash join part of the plan. `slot_to_row` is only touched at random while the table is built; the gather reads it in order, and the probe reads the dictionary vectors instead. `slot_found_match` is 1 byte per slot, so it stays under 8MB for these key ranges. The gain there would have been small and the diff bigger.",
+  "notes": "- Lowering the threshold from 32MB to 8MB did not regress q16 here: -2.0, -0.7 and +1.8% across three runs.\n- The q09 gain held at -7.4..-9.7% over four runs. That is about the same as v1's harness result (-7%), so it may still sit near q09's noise bar of 8.6%. Some of the gain shows up on other templates instead (q07, q05, q14, q22 at -4..-9% in one full run).\n- Perfect hash join arrays don't need huge pages:\n  - `slot_to_row` is only touched at random during the parallel build.\n  - The probe reads the payload dictionary vectors, which are allocated as Vectors and are not easy to put on huge pages.\n  - `slot_found_match` is 1 byte per slot.\n- If perfect hash join probe locality ever matters, the dictionary vector buffers would be the target, not `slot_to_row`.\n- Possible follow-up: reuse `HugePageUtil` for the radix aggregate hash table's `entries` when it is 8MB or more, with the same free-time Release.",
+  "train_ratio": 0.9792800251697845,
+  "val_ratio": 1.0270566560831262,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.040692890314167,
+    "q03": 0.9401872198867531,
+    "q04": 0.9743067670832851,
+    "q05": 1.0052989511037678,
+    "q07": 0.9761307149784532,
+    "q08": 0.9716624364107946,
+    "q09": 0.889894310618722,
+    "q13": 1.0068350703659228,
+    "q14": 0.961861610619089,
+    "q16": 1.01124390405684,
+    "q17": 0.9533716062022329,
+    "q18": 0.9978853425151507,
+    "q19": 0.9900528631317401,
+    "q22": 0.9997208724695189
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-25T12:22:20-05:00"
+}

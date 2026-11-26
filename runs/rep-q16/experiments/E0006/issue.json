@@ -1,0 +1,15 @@
+{
+  "title": "Exact bitmap BF for dense-int join keys on partsupp-style probes",
+  "hypothesis": "The q16 partsupp scan takes 0.28s for 8M rows with a min/max and BF dynamic filter. It emits 1,236,280 rows, but the join keeps 1,185,556, so about 51k are BF false positives. The build keys are dense ints, with 296k of the 2M range selected. In earlier db_evolve runs an exact bitmap BF over [min,max] gave q09 -9..-14% and q21 -15% on lineitem scans. This tree has no exact bitmap: bloom_filter.hpp only has class BloomFilter.",
+  "plan": "Port the exact dense-int bitmap from earlier runs. When the build key is integral and max-min <= 128*count bits, build a bitmap instead of the hashed BF, and probe with (key-min) bit tests in the scan's BLOOM_FILTER evaluation. Files: src/include/duckdb/planner/filter/bloom_filter.hpp, its .cpp, and the join filter pushdown in physical_hash_join.cpp.",
+  "target_files": [
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/planner/filter/bloom_filter.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "expected_gain": "q16 -3..-6%: no hashing on 8M probes and no FP rows.",
+  "generality": "Joins on dense integer keys (surrogate keys) with a selective build side.",
+  "risk": "Medium. It is a larger diff, and the bitmap size has to be capped.",
+  "status": "open",
+  "filed": "g1r2"
+}

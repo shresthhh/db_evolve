@@ -1,0 +1,14 @@
+{
+  "title": "Group-aligned main-HT sink in distinct finalize",
+  "hypothesis": "After E0001, each distinct radix partition holds whole groups (its partition bits come from hash(G)). Earlier per-phase timers on q16 put the main-HT sink fed by the distinct scan at about 180ms CPU, the largest agg phase after the distinct sink at about 250ms. That sink rehashes G (including the VARCHAR p_type), then partitions and combines again across 8 thread-local sinks, even though each source partition already maps to disjoint groups. If a HashAggregateDistinctFinalizeTask handles one distinct partition at a time and its main local sink is unpartitioned (radix bits 0) and small, groups are cache-resident and the main Combine/Finalize repartition work shrinks.",
+  "plan": "In physical_hash_aggregate.cpp, HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping (around line 665): when the distinct radix table has partition_prefix_count == groups.size(), check that the main table's hash matches hash(G) bits [36,48). Then call Combine on the local sink after each distinct partition is drained, so each local main HT holds only one partition's groups. Also look at RadixPartitionedHashTable::GetData / the source-partition assignment in radix_partitioned_hashtable.cpp, so that each task takes whole partitions. Add temporary timers first to confirm the main sink still costs about 180ms CPU in this tree.",
+  "target_files": [
+    "src/execution/operator/aggregate/physical_hash_aggregate.cpp",
+    "src/execution/radix_partitioned_hashtable.cpp"
+  ],
+  "expected_gain": "q16 -5..-10% if the main sink is really ~20ms of wall time",
+  "generality": "Any GROUP BY with only DISTINCT aggregates and many (G,x) pairs per group set. Queries with few groups or non-distinct aggregates are unchanged.",
+  "risk": "Medium. Must keep correctness with GROUPING SETS, spill, and mixed distinct/non-distinct aggregates. Measure the phase first.",
+  "status": "open",
+  "filed": "g1r4"
+}

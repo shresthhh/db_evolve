@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/include/duckdb/common/huge_page_util.hpp: a general helper with no knowledge of queries. Its only gates are a size threshold (8MB, about the 4KB-page TLB reach), Linux, and whether THP is set to madvise/always. Off Linux, or with THP set to never, it does nothing.",
+      "src/execution/join_hashtable.cpp: every allocation and free of hash_map now goes through AllocateHashMap and FreeHashMap (grep shows no other writer of hash_map or entries). The reuse path keeps the aligned entries pointer. HashMapCapacity subtracts the slack correctly, so the reuse check and the D_ASSERT still hold.",
+      "Release (DONTNEED then NOHUGEPAGE) runs in the destructor, in Reset and on the grow path, before the memory goes back to the allocator. DONTNEED only zeroes the table's own range, which is freed straight afterwards, so recycled memory cannot keep stale contents or the huge-page setting.",
+      "Memory cost: 2MB of slack per table of 8MB or more, counted by the same BufferAllocator, so the rule-3 memory concern does not apply. The grow path now frees the old table before allocating the new one, which lowers peak memory.",
+      "Small leftover: the comment at join_hashtable.hpp:265 still says capacity equals hash_map.GetSize()/sizeof(ht_entry_t). That is now off by the slack, but it does not affect behaviour."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/include/duckdb/common/huge_page_util.hpp: a general helper with no knowledge of queries. Its only gates are a size threshold (8MB, about the 4KB-page TLB reach), Linux, and whether THP is set to madvise/always. Off Linux, or with THP set to never, it does nothing.\",\"src/execution/join_hashtable.cpp: every allocation and free of hash_map now goes through AllocateHashMap and FreeHashMap (grep shows no other writer of hash_map or entries). The reuse path keeps the aligned entries pointer. HashMapCapacity subtracts the slack correctly, so the reuse check and the D_ASSERT still hold.\",\"Release (DONTNEED then NOHUGEPAGE) runs in the destructor, in Reset and on the grow path, before the memory goes back to the allocator. DONTNEED only zeroes the table's own range, which is freed straight afterwards, so recycled memory cannot keep stale contents or the huge-page setting.\",\"Memory cost: 2MB of slack per table of 8MB or more, counted by the same BufferAllocator, so the rule-3 memory concern does not apply. The grow path now frees the old table before allocating the new one, which lowers peak memory.\",\"Small leftover: the comment at join_hashtable.hpp:265 still says capacity equals hash_map.GetSize()/sizeof(ht_entry_t). That is now off by the slack, but it does not affect behaviour.\"],\"required_changes\":[]}",
+  "cost_usd": 0.17547619999999997,
+  "seconds": 22.952067375183105,
+  "error": ""
+}

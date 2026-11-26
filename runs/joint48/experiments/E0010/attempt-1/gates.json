@@ -1,0 +1,27 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "reject",
+    "benchmark_specific": false,
+    "findings": [
+      "src/execution/radix_partitioned_hashtable.cpp Sink (new block ~l.573-593): all 12 radix bits [36,48) are replaced by hash(group prefix). Every row of a given group then lands in one partition at every radix-bit count, so external repartitioning (SetRadixBitsToExternal / Repartition) can no longer split a heavy group.",
+      "Finalize memory: radix_partitioned_hashtable.cpp:692-706 sets the minimum reservation to max_partition_size. Example: `SELECT g, count(DISTINCT x) FROM t GROUP BY g` with ~5000 g values (estimate >= 4096, so the gate fires) where one g value or NULL holds 90% of 1B distinct-x rows, under a low memory_limit. One distinct partition now holds ~90% of the data, giving a huge reservation or an OOM failure where the old hash(G,x) partitioning spread it out. Distinct finalize also collapses to roughly one task.",
+      "physical_hash_aggregate.cpp: the estimated_cardinality >= 4096 gate does not protect against skew, or against estimates of >= 4096 when the true group count is small (common after joins). The spill test used 300K uniform groups, which cannot expose this.",
+      "Correctness is otherwise fine: distinct grouping_set is an ordered std::set with main groups first, and stored hashes are reused consistently for resize, combine and repartition. The sink_count move does not double count. HLL effect is negligible.",
+      "Measured benefit is weak: q16 -2.6%/-7.1%/-10.8% across runs, full-bench geomean 0.0%."
+    ],
+    "required_changes": [
+      "Do not take every radix bit from the group hash. Take only the top k radix bits (e.g. bits [48-k,48) with k around 4-6, matching the initial sink partitioning) from hash(groups), and keep the lower radix bits from the full hash so skewed groups can still be split by external repartitioning. Results do not require each partition to hold whole groups, because distinct finalize re-aggregates into the main HT.",
+      "Add a spilling check with one dominant group (e.g. 90% of rows in one group, high-cardinality distinct column, low memory_limit) and show it neither fails nor regresses badly against the baseline."
+    ]
+  },
+  "failed": "independent review"
+}

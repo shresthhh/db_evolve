@@ -1,0 +1,16 @@
+{
+  "title": "Large radix aggregate slows 17-35% when more base-table blocks are resident",
+  "hypothesis": "Reproduced in ONE process (not a bench artifact): q18 is 505-550ms; after q09 (or after just `SELECT sum(l_extendedprice+l_discount+l_partkey+l_suppkey) FROM lineitem; SELECT sum(ps_supplycost) FROM partsupp; SELECT max(p_name) FROM part`) it becomes 630-720ms and stays slow on every later run. The isolated 15M-group agg `SELECT count(*) FROM (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity)>312)` goes 458/465ms -> 554-654ms. duckdb_memory() BASE_TABLE goes 369MB -> 881-1067MB. A 15M-row probe HJ (orders x lineitem, l_quantity>49) is unaffected (~110ms). SET allocator_flush_threshold / allocator_bulk_deallocation_flush_threshold = 64GB does NOT fix it. memory_limit is 12.2GB, so this is not eviction pressure. TemporaryMemoryManager::UpdateState (temporary_memory_manager.cpp:121-160) does not read used base-table memory, so the reservation is probably not the cause (to verify). This likely explains why E0009/E0013 (q13 large perfect HA) were retired for q18 +8-10%. In the official bench every template runs with lots of columns resident, so q18's 545ms and q13's 2.09s agg likely include this penalty.",
+  "plan": "1) Localize: in one dbe-tool sql call run the agg reproducer 3x, load the extra columns, run 3x again, with EXPLAIN ANALYZE / json profiling before and after. Compare TABLE_SCAN CPU vs HASH_GROUP_BY CPU, and if possible sink vs finalize. Use the InternalException-gated-on-setting trick to dump GetThreadLimit() (radix_partitioned_hashtable.cpp:163), the reservation, the radix bits and whether the agg went external/abandoned (lines 484-519) in both states.\n2) Hypotheses, in order:\n(a) Sink thread limit or radix bits differ (reservation or ComputeReservation depends on state) -> fix the computation.\n(b) BlockAllocator pool (block_allocator.cpp): base-table loads take the 'touched' blocks the agg freed, so the agg's TupleDataCollection blocks land in other pool regions with worse TLB/THP backing. Try madvise(MADV_HUGEPAGE) on the pool mmap in AllocateVirtualMemory (:33, Linux only) and check that OnDeallocation's MADV_DONTNEED isn't splitting huge pages on frequently reused blocks.\n(c) Eviction-queue / pin-unpin cost grows with the number of resident blocks (buffer_pool.cpp AddToEvictionQueue/PurgeQueue).\n3) Land only a mechanism that removes the gap in the reproducer and that does not change behavior under memory pressure.",
+  "target_files": [
+    "src/storage/block_allocator.cpp",
+    "src/execution/radix_partitioned_hashtable.cpp",
+    "src/storage/temporary_memory_manager.cpp",
+    "src/storage/buffer/buffer_pool.cpp"
+  ],
+  "expected_gain": "q18 -10..-15% (its agg dominates). Possibly q13 (2.09s agg CPU) and q16 a few %. Visible geomean -1..-2% if found.",
+  "generality": "Any large hash aggregation on a warm database with many cached columns, which is the normal hot-run state. If the fix is an allocator/THP change, it affects all buffer-managed memory; queries with small memory footprints should be neutral.",
+  "risk": "Medium-high on discovery: the cause may be OS-level and unfixable, and the round may yield nothing. Implementation risk is low once localized. A THP madvise could raise RSS.",
+  "status": "open",
+  "filed": "g2r14"
+}

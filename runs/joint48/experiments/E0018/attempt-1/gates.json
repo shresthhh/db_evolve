@@ -1,0 +1,23 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "The only change is in src/optimizer/compressed_materialization/compress_comparison_join.cpp. It removes the block that compressed single-equality join keys generically with merged stats. All join-condition bindings, and all probe-side bindings, now go into referenced_bindings, so compressed materialization never compresses join keys.",
+      "Nothing in the change refers to a particular query, table, column, literal or data distribution. It applies to every comparison join, so it is not benchmark-specific.",
+      "Correctness risk is lower than before. Without this block, join keys keep their original type, and the merged-stats mutation of statistics_map (lhs_it->second->Merge) no longer happens. No execution code changes, so NULLs, overflow, spilling and parallel execution behave as they did before.",
+      "The tradeoff is real: hash tables with large build sides lose some memory saving from narrower keys. In return, the min/max and Bloom filter join filters can reach probe scans again, which the storage_offset check in physical_hash_join blocked. This is a reasonable general tradeoff, and the author states it.",
+      "There is no dead code or unrelated change, and the comments were updated to match."
+    ],
+    "required_changes": []
+  }
+}

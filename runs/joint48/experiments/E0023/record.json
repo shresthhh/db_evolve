@@ -1,0 +1,40 @@
+{
+  "id": "E0023",
+  "title": "Deliminate selective ANTI delim joins (NOT EXISTS) with simple RHS",
+  "started": "2026-11-24T22:04:07-05:00",
+  "base": "3d2dd57e2ad75df7944533413fe0ca1b57eecb8c",
+  "candidate": "eaec16e1b34486da55a3945138b35dc66e2b8daf",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.6405179999999999,
+  "summary": "In src/optimizer/deliminator.cpp, the SelectionIsReplaceableByJoinFilter gate now accepts ANTI delim joins as well as SEMI ones. All other guards are unchanged: one DelimGet, one INNER/SEMI child join with only colref = colref conditions, and a SubqueryIsSimple RHS. Two comments were updated. With this change, a NOT EXISTS with a simple equality correlation and a filtered outer query becomes a plain RIGHT_ANTI hash join. The NDF condition is converted to =, so runtime min/max + BF filters reach the RHS scan. The q22 profile confirms that the DELIM_JOIN, the inner HJ with the delim keys and the DISTINCT are gone, and the orders scan still has min/max + BF dynamic filters. Bench: q22 150.3\u2192106.9ms (-28.9%), then -21.5% and -23.1% on reruns. Full-run geomean -4.2%. The other templates have no NOT EXISTS and their changes are noise. q14 showed a one-off +30.3%, then +4.3% on rerun; its plan can't change.",
+  "notes": "NULL semantics checked:\n- RIGHT_ANTI keeps NULL build keys, because PrepareKeys skips null filtering when PropagatesBuildSide is true. NULL-key LHS rows are therefore still emitted by the unmatched-build scan.\n- Plain ANTI gets no join filters (GenerateJoinFilters skips ANTI), and a NULL probe key with = never matches, so the row is emitted.\n- The IS NOT NULL filter on the RHS replacing column makes NDF\u2192= exact.\n\nChecked on temp tables with NULL keys on both sides, in both build orientations (small outer and large outer), plus a correlated `<>` extra predicate. Every result matched `SET disabled_optimizers='deliminator'`.\n\nPossible follow-up: MARK delim joins (IN / EXISTS in disjunctions) could use the same treatment, but MARK NULL semantics differ and would need their own check.",
+  "train_ratio": 0.9722997213183302,
+  "val_ratio": 1.0063849342837585,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0088659713480248,
+    "q03": 1.014458199391781,
+    "q04": 1.0124153975280887,
+    "q05": 0.9908416950146324,
+    "q07": 0.9690642762518035,
+    "q08": 0.9939361648234971,
+    "q09": 0.9880604537377722,
+    "q13": 0.9948174970810937,
+    "q14": 1.0015739344951051,
+    "q16": 0.9798159956190801,
+    "q17": 1.0015082526573194,
+    "q18": 1.0012440967867344,
+    "q19": 0.9701876653178495,
+    "q22": 0.7272032554081271
+  },
+  "improved": [
+    "q22"
+  ],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-24T22:20:17-05:00"
+}

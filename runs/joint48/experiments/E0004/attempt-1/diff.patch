@@ -1,0 +1,275 @@
+diff --git a/src/storage/table/column_data.cpp b/src/storage/table/column_data.cpp
+index d32d2d2..0bbb26e 100644
+--- a/src/storage/table/column_data.cpp
++++ b/src/storage/table/column_data.cpp
+@@ -18,6 +18,17 @@
+ #include "duckdb/common/serializer/serializer.hpp"
+ #include "duckdb/function/variant/variant_shredding.hpp"
+ #include "duckdb/storage/table/geo_column_data.hpp"
++#include "duckdb/storage/table/column_segment.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/table_filter_state.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
++#include "duckdb/planner/expression/bound_operator_expression.hpp"
++
++#include <cstring>
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ 
+ namespace duckdb {
+ 
+@@ -345,11 +356,252 @@ idx_t ColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t scan_c
+ 	return ScanVector(state, result, scan_count, ScanVectorType::SCAN_FLAT_VECTOR, result_offset);
+ }
+ 
++namespace {
++
++//! A literal that must occur in every string accepted by a substring-style filter (LIKE with only '%' wildcards,
++//! or contains). "negated" means the filter is the NOT of such a predicate.
++struct SubstringPrefilter {
++	string literal;
++	bool negated = false;
++};
++
++bool ExtractSubstringPrefilter(const Expression &expr, SubstringPrefilter &result) {
++	const Expression *current = &expr;
++	bool negated = false;
++	while (current->GetExpressionType() == ExpressionType::OPERATOR_NOT) {
++		auto &op = current->Cast<BoundOperatorExpression>();
++		if (op.children.size() != 1) {
++			return false;
++		}
++		negated = !negated;
++		current = op.children[0].get();
++	}
++	if (current->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return false;
++	}
++	auto &func = current->Cast<BoundFunctionExpression>();
++	if (func.children.size() != 2 || func.children[0]->GetExpressionType() != ExpressionType::BOUND_REF ||
++	    func.children[1]->GetExpressionType() != ExpressionType::VALUE_CONSTANT ||
++	    func.children[0]->return_type.id() != LogicalTypeId::VARCHAR) {
++		return false;
++	}
++	auto &constant = func.children[1]->Cast<BoundConstantExpression>().value;
++	if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
++		return false;
++	}
++	auto &pattern = StringValue::Get(constant);
++	auto &name = func.function.name;
++	if (name == "contains") {
++		result.literal = pattern;
++	} else if (name == "~~" || name == "!~~") {
++		if (name == "!~~") {
++			negated = !negated;
++		}
++		// only '%' wildcards: every segment between them must occur literally
++		idx_t best_start = 0, best_len = 0, seg_start = 0;
++		for (idx_t i = 0; i <= pattern.size(); i++) {
++			if (i < pattern.size()) {
++				auto c = pattern[i];
++				if (c == '_' || c == '\\') {
++					return false;
++				}
++				if (c != '%') {
++					continue;
++				}
++			}
++			if (i - seg_start > best_len) {
++				best_start = seg_start;
++				best_len = i - seg_start;
++			}
++			seg_start = i + 1;
++		}
++		result.literal = pattern.substr(best_start, best_len);
++	} else {
++		return false;
++	}
++	result.negated = negated;
++	return result.literal.size() >= 2;
++}
++
++//! Searches buf[0, len) for needle; on_hit(pos) is called for each match and returns the position to resume from
++template <class ON_HIT>
++void SearchLiteral(const char *buf, idx_t len, const char *needle, idx_t n, ON_HIT &&on_hit) {
++	if (len < n) {
++		return;
++	}
++	const idx_t last_pos = len - n;
++	idx_t pos = 0;
++#if defined(__SSE2__)
++	const __m128i first = _mm_set1_epi8(needle[0]);
++	const __m128i last = _mm_set1_epi8(needle[n - 1]);
++	while (pos <= last_pos) {
++		idx_t block;
++		if (last_pos - pos >= 15) {
++			block = pos;
++		} else if (last_pos >= 15) {
++			// overlapping final block instead of a scalar tail
++			block = last_pos - 15;
++		} else {
++			break;
++		}
++		auto f = _mm_loadu_si128(reinterpret_cast<const __m128i *>(buf + block));
++		auto l = _mm_loadu_si128(reinterpret_cast<const __m128i *>(buf + block + n - 1));
++		auto eq = _mm_and_si128(_mm_cmpeq_epi8(f, first), _mm_cmpeq_epi8(l, last));
++		uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(eq));
++		mask &= ~0u << (pos - block);
++		const idx_t block_end = block + 16;
++		pos = block_end;
++		while (mask) {
++			idx_t p = block + static_cast<idx_t>(__builtin_ctz(mask));
++			mask &= mask - 1;
++			if (memcmp(buf + p + 1, needle + 1, n - 2) != 0) {
++				continue;
++			}
++			idx_t resume = on_hit(p);
++			if (resume >= block_end) {
++				pos = resume;
++				break;
++			}
++			mask &= ~0u << (resume - block);
++		}
++	}
++#endif
++	while (pos <= last_pos) {
++		if (buf[pos] == needle[0] && buf[pos + n - 1] == needle[n - 1] &&
++		    memcmp(buf + pos + 1, needle + 1, n - 2) == 0) {
++			pos = on_hit(pos);
++		} else {
++			pos++;
++		}
++	}
++}
++
++//! Pre-filters rows of a flat VARCHAR vector for a substring-style expression filter: rows whose string does not
++//! contain the required literal are decided without evaluating the expression. Non-inlined strings stored back to
++//! back in memory are searched as one run. Returns false if the fast path does not apply.
++bool SubstringPrefilterSelection(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &s_count,
++                                 const TableFilter &filter, TableFilterState &filter_state) {
++	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER || s_count == 0 ||
++	    result.GetVectorType() != VectorType::FLAT_VECTOR || result.GetType().InternalType() != PhysicalType::VARCHAR ||
++	    scan_count > STANDARD_VECTOR_SIZE || s_count > STANDARD_VECTOR_SIZE) {
++		return false;
++	}
++	SubstringPrefilter prefilter;
++	if (!ExtractSubstringPrefilter(*filter.Cast<ExpressionFilter>().expr, prefilter)) {
++		return false;
++	}
++	auto strings = FlatVector::GetData<string_t>(result);
++	auto &validity = FlatVector::Validity(result);
++
++	// 0 = NULL (never passes), 1 = needs evaluation, 2 = literal absent
++	uint8_t row_state[STANDARD_VECTOR_SIZE];
++	// non-inlined strings in selection order: position in sel and end offset within its run
++	uint32_t long_pos[STANDARD_VECTOR_SIZE];
++	uint32_t long_end[STANDARD_VECTOR_SIZE];
++	idx_t long_count = 0;
++	const char *run_base = nullptr;
++	const char *run_end = nullptr;
++	idx_t run_first = 0;
++
++	const char *needle = prefilter.literal.c_str();
++	const idx_t n = prefilter.literal.size();
++	auto search_run = [&](idx_t first, idx_t end) {
++		if (first >= end) {
++			return;
++		}
++		idx_t cur = first;
++		SearchLiteral(run_base, long_end[end - 1], needle, n, [&](idx_t p) -> idx_t {
++			while (long_end[cur] <= p) {
++				cur++;
++			}
++			idx_t str_end = long_end[cur];
++			if (p + n <= str_end) {
++				// match lies fully inside this string
++				row_state[long_pos[cur]] = 1;
++				cur++;
++				return str_end;
++			}
++			return p + 1;
++		});
++	};
++
++	for (idx_t i = 0; i < s_count; i++) {
++		auto idx = sel.get_index(i);
++		if (!validity.RowIsValid(idx)) {
++			row_state[i] = 0;
++			continue;
++		}
++		auto &str = strings[idx];
++		if (str.IsInlined()) {
++			row_state[i] = 1;
++			continue;
++		}
++		row_state[i] = 2;
++		auto data = str.GetData();
++		auto size = str.GetSize();
++		if (data != run_end || !run_base || idx_t(run_end - run_base) + size > NumericLimits<uint32_t>::Maximum()) {
++			search_run(run_first, long_count);
++			run_base = data;
++			run_first = long_count;
++		}
++		run_end = data + size;
++		long_pos[long_count] = UnsafeNumericCast<uint32_t>(i);
++		long_end[long_count] = UnsafeNumericCast<uint32_t>(run_end - run_base);
++		long_count++;
++	}
++	search_run(run_first, long_count);
++
++	// evaluate the expression only on the rows that may contain the literal
++	SelectionVector candidate_sel(s_count);
++	idx_t candidate_count = 0;
++	for (idx_t i = 0; i < s_count; i++) {
++		if (row_state[i] == 1) {
++			candidate_sel.set_index(candidate_count++, sel.get_index(i));
++		}
++	}
++	idx_t passed_count = candidate_count;
++	if (candidate_count > 0) {
++		UnifiedVectorFormat vdata;
++		result.ToUnifiedFormat(scan_count, vdata);
++		ColumnSegment::FilterSelection(candidate_sel, result, vdata, filter, filter_state, scan_count, passed_count);
++	}
++	if (!prefilter.negated) {
++		// rows without the literal never pass
++		sel.Initialize(candidate_sel);
++		s_count = passed_count;
++		return true;
++	}
++	// negated: rows without the literal pass (unless NULL); candidates pass if the expression accepted them
++	SelectionVector out_sel(s_count);
++	idx_t passed_idx = 0;
++	idx_t out_count = 0;
++	for (idx_t i = 0; i < s_count; i++) {
++		auto idx = sel.get_index(i);
++		if (row_state[i] == 2) {
++			out_sel.set_index(out_count++, idx);
++		} else if (row_state[i] == 1) {
++			if (passed_idx < passed_count && candidate_sel.get_index(passed_idx) == idx) {
++				passed_idx++;
++				out_sel.set_index(out_count++, idx);
++			}
++		}
++	}
++	sel.Initialize(out_sel);
++	s_count = out_count;
++	return true;
++}
++
++} // namespace
++
+ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
+                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
+                         TableFilterState &filter_state) {
+ 	idx_t scan_count = Scan(transaction, vector_index, state, result);
+ 
++	if (SubstringPrefilterSelection(result, scan_count, sel, s_count, filter, filter_state)) {
++		return;
++	}
++
+ 	UnifiedVectorFormat vdata;
+ 	result.ToUnifiedFormat(scan_count, vdata);
+ 	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);

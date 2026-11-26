@@ -1,0 +1,40 @@
+{
+  "id": "E0021",
+  "title": "Bundle: deliminate selective SEMI (E0019) + exact BF through CM offset (E0020)",
+  "started": "2026-11-24T21:17:51-05:00",
+  "base": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "candidate": "2be9455ffdefd50e9428320e500c9fbf4a7ac631",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 3.3403085999999997,
+  "summary": "I rebuilt both retired changes (E0019 and E0020) from their ledger descriptions, because their diffs were not in the tree. The tree builds. The Bloom filter now reaches the probe through the compression offset: in q04, the lineitem scan output drops from 37.9M rows to 2.29M (EXPLAIN ANALYZE). The plan is now a RIGHT_SEMI hash join with min/max and Bloom filter (BF) dynamic filters.\n\nBench (my build vs current best):\n- q04: -26.2%, -34.6%, -28.1%, -29.3% (about 240 \u2192 170 ms)\n- q09: -10.8%, -13.2%, -12.8% (about 510 \u2192 450 ms)\n- Full-bench geomean: -2.6% and -3.8%\n- q07: +12.4%, +4.7%, +8.2%, +3.7%, +4.2%. This is a real risk, see notes.\n- Everything else was within \u00b15% except one q05 -10.4% and one q17 +5.0%, both of which went the other way in another run.\n\nChanges:\n1) deliminator.cpp: SelectionIsReplaceableByJoinFilter lets a SEMI delim join drop its DelimGet join even when the outer side has a selection. It applies only when:\n   - there is exactly one DelimGet and one join with it;\n   - that join is INNER or SEMI, with only `=` conditions between column refs;\n   - the subquery side contains only projections, filters, table scans, DelimGets and INNER/SEMI comparison joins.\n   When all joins are removed, ConvertNotDistinctToEqual turns `IS NOT DISTINCT FROM` into `=` if the right side traces, through projections and filters, to a column that just got an IS NOT NULL filter. Without this step no join filters are generated at all.\n2) join_filter_pushdown_optimizer.cpp: removed RIGHT_SEMI and RIGHT_ANTI from the join-type bail-out. Both output only build rows, so probe rows that cannot match can be dropped.\n3) bloom_filter.hpp/.cpp: BFTableFilter has a new key_offset (copied, serialized as property 203 with default 0). The exact-mode Filter, FilterValue and CheckStatistics paths subtract it modulo 2^64. CheckStatisticsExact first checks that the shifted key range round-trips into the column type and is ordered; otherwise it returns NO_PRUNING_POSSIBLE.\n4) physical_hash_join.cpp FinalizeFilters: a new branch for an integral probe column with storage_offset, on condition 0, that passes CanUseBloomFilter. It calls TrySetExactBloomFilter with the raw min/max (before the offset is applied) and defers the push only if the filter really is exact; a hashed filter is never pushed through an offset. PushBloomFilter sets key_type to the probe storage type and key_offset to the offset's low 64 bits.\n\nCorrectness: every check matched SET disabled_optimizers='join_filter_pushdown,deliminator':\n- q04-style EXISTS with new dates\n- NOT EXISTS\n- IN over customer/orders\n- EXISTS over a two-table join inside the subquery\n- EXISTS whose correlation key is sometimes NULL\n- generated data with NULLs on both sides (EXISTS, IN, NOT EXISTS, NOT IN)\n- shifted keys (`l_orderkey + 3`, `o_orderkey - 100`, `o_orderkey * 2`) through the offset BF\n- the q07 results\n\nbench's result check passed on all visible templates.",
+  "notes": "The risk is q07. In 5 bench runs it was +12.4, +4.7, +8.2, +3.7 and +4.2%. The offset BF now also fires on q07's orders scan: an orderkey BF built from the lineitem join takes the scan from 15M rows to 100k, but a custkey BF had already cut it to 1.2M.\n\nWhat I measured:\n- With the offset branch fully disabled, q07 was -4.4%.\n- With the exact BF built but not pushed, q07 was +1.1%. So the build cost is small, and the extra cost comes from pushing the filter to the scan.\n- Direct sql timings contradict this. At threads=1, q07 took 970 ms with the push vs 1015 ms without. At 8 threads it was 188 vs 206 ms. The profile also shows lower CPU in both the orders scan and the join.\n\nI could not explain why bench and direct timing disagree. If the judge flags q07, the next step is to look at how the scan's adaptive filter orders two BF-filtered columns, or to gate the offset BF when the probe scan already has another selective BF.\n\nThe E0019 helper conditions were rebuilt from the ledger description, since the original diff was not in the tree.",
+  "train_ratio": 0.9625397984159898,
+  "val_ratio": 0.9811834243704275,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9796629881656478,
+    "q03": 0.9894550315128672,
+    "q04": 0.6963320661086265,
+    "q05": 0.99359325275494,
+    "q07": 1.0404711392314858,
+    "q08": 0.9967213569069113,
+    "q09": 0.9191140716321892,
+    "q13": 1.0060447951291938,
+    "q14": 1.0174702285229584,
+    "q16": 0.9663506691111758,
+    "q17": 1.0016994006055258,
+    "q18": 0.9941651552951128,
+    "q19": 0.9386727460875972,
+    "q22": 0.9913038385533339
+  },
+  "improved": [
+    "q04"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T21:43:21-05:00"
+}

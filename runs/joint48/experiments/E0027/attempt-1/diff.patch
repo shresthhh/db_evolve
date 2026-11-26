@@ -1,0 +1,169 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index b84de7d..ca515ef 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -966,6 +966,8 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
+ static constexpr idx_t EXACT_BF_MAX_BITS_PER_KEY = 128;
+ static constexpr idx_t EXACT_BF_MAX_RANGE = idx_t(1) << 32;
+ static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;
++static constexpr idx_t EXACT_BF_MEDIUM_RANGE = idx_t(1) << 27;
++static constexpr idx_t EXACT_BF_MEDIUM_BITS_PER_KEY = 1024;
+ 
+ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJoin &op, const Value &min_val,
+                                    const Value &max_val) {
+@@ -1011,6 +1013,11 @@ static void TrySetExactBloomFilter(JoinHashTable &ht, const PhysicalComparisonJo
+ 	auto key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY;
+ 	// small ranges always qualify regardless of the key count: the bitmap is at most 512KB
+ 	key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE);
++	// medium ranges (bitmap at most 16MB) qualify with a denser per-key budget
++	auto medium_cap = ht.Count() >= EXACT_BF_MEDIUM_RANGE / EXACT_BF_MEDIUM_BITS_PER_KEY
++	                      ? EXACT_BF_MEDIUM_RANGE
++	                      : ht.Count() * EXACT_BF_MEDIUM_BITS_PER_KEY;
++	key_cap = MaxValue<idx_t>(key_cap, medium_cap);
+ 	if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) {
+ 		return;
+ 	}
+diff --git a/src/storage/compression/bitpacking.cpp b/src/storage/compression/bitpacking.cpp
+index b9bada0..4c7b4dd 100644
+--- a/src/storage/compression/bitpacking.cpp
++++ b/src/storage/compression/bitpacking.cpp
+@@ -867,6 +867,131 @@ void BitpackingScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_c
+ 	BitpackingScanPartial<T>(segment, state, scan_count, result, 0);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Select
++//===--------------------------------------------------------------------===//
++//! Extracts value "idx_in_block" of a packed algorithm group directly from the bitstream. The fastpforlib layout
++//! stores the values of a group LSB-first in consecutive little-endian 32-bit words, i.e. value j occupies bits
++//! [j * width, (j + 1) * width) of the group. Only valid for width <= 56 so that the value fits in 8 loaded bytes.
++static inline uint64_t BitpackingExtractValue(data_ptr_t block_start, idx_t idx_in_block, bitpacking_width_t width) {
++	idx_t bit_offset = idx_in_block * width;
++	idx_t shift = bit_offset % 8;
++	idx_t byte_count = (shift + width + 7) / 8;
++	uint64_t bits = 0;
++	memcpy(&bits, block_start + bit_offset / 8, byte_count);
++	return (bits >> shift) & ((uint64_t(1) << width) - 1);
++}
++
++template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
++void BitpackingSelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
++                      const SelectionVector &sel, idx_t sel_count) {
++	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
++	T *result_data = FlatVector::GetData<T>(result);
++	if (sel_count * 4 > vector_count) {
++		// dense selection: decoding the full vector is cheaper - decode and compact in place (sel is ascending)
++		BitpackingScanPartial<T>(segment, state, vector_count, result, 0);
++		for (idx_t i = 0; i < sel_count; i++) {
++			auto source_idx = sel.get_index(i);
++			D_ASSERT(source_idx >= i);
++			result_data[i] = result_data[source_idx];
++		}
++		return;
++	}
++	result.SetVectorType(VectorType::FLAT_VECTOR);
++
++	static constexpr idx_t ALGORITHM_GROUP_SIZE = BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE;
++	const bool direct_extract = sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t);
++	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
++	bool skip_sign_extend = true;
++
++	idx_t base = 0;
++	idx_t sel_idx = 0;
++	while (base < vector_count) {
++		if (scan_state.current_group_offset == BITPACKING_METADATA_GROUP_SIZE) {
++			scan_state.LoadNextGroup();
++		}
++		idx_t group_start = scan_state.current_group_offset;
++		idx_t in_group = MinValue(vector_count - base, BITPACKING_METADATA_GROUP_SIZE - group_start);
++		idx_t end = base + in_group;
++		switch (scan_state.current_group.mode) {
++		case BitpackingMode::CONSTANT:
++			for (; sel_idx < sel_count && sel.get_index(sel_idx) < end; sel_idx++) {
++				result_data[sel_idx] = scan_state.current_constant;
++			}
++			break;
++		case BitpackingMode::CONSTANT_DELTA:
++			for (; sel_idx < sel_count && sel.get_index(sel_idx) < end; sel_idx++) {
++				idx_t multiplier = group_start + (sel.get_index(sel_idx) - base);
++				// intended static casts to unsigned and back for defined wrapping of integers
++				result_data[sel_idx] = static_cast<T>((static_cast<T_U>(scan_state.current_constant) * multiplier) +
++				                                      static_cast<T_U>(scan_state.current_frame_of_reference));
++			}
++			break;
++		case BitpackingMode::FOR: {
++			auto width = scan_state.current_width;
++			auto frame_of_reference = static_cast<T_U>(scan_state.current_frame_of_reference);
++			if (direct_extract && width <= 56) {
++				for (; sel_idx < sel_count && sel.get_index(sel_idx) < end; sel_idx++) {
++					idx_t group_pos = group_start + (sel.get_index(sel_idx) - base);
++					idx_t idx_in_block = group_pos % ALGORITHM_GROUP_SIZE;
++					data_ptr_t block_start = scan_state.current_group_ptr + (group_pos - idx_in_block) * width / 8;
++					auto value = static_cast<T_U>(BitpackingExtractValue(block_start, idx_in_block, width));
++					result_data[sel_idx] = static_cast<T>(value + frame_of_reference);
++				}
++			} else {
++				// unpack each algorithm group that contains a selected row
++				idx_t decoded_block = DConstants::INVALID_INDEX;
++				auto buffer = reinterpret_cast<T_U *>(scan_state.decompression_buffer);
++				for (; sel_idx < sel_count && sel.get_index(sel_idx) < end; sel_idx++) {
++					idx_t group_pos = group_start + (sel.get_index(sel_idx) - base);
++					idx_t idx_in_block = group_pos % ALGORITHM_GROUP_SIZE;
++					idx_t block_offset = group_pos - idx_in_block;
++					if (block_offset != decoded_block) {
++						BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
++						                                     scan_state.current_group_ptr + block_offset * width / 8,
++						                                     width, skip_sign_extend);
++						decoded_block = block_offset;
++					}
++					result_data[sel_idx] = static_cast<T>(buffer[idx_in_block] + frame_of_reference);
++				}
++			}
++			break;
++		}
++		case BitpackingMode::DELTA_FOR: {
++			// delta decoding requires decoding every row of the group up to the last row we consume
++			idx_t group_pos = group_start;
++			idx_t group_end = group_start + in_group;
++			while (group_pos < group_end) {
++				idx_t offset_in_compression_group = group_pos % ALGORITHM_GROUP_SIZE;
++				idx_t to_scan = MinValue(group_end - group_pos, ALGORITHM_GROUP_SIZE - offset_in_compression_group);
++				BitpackingPrimitives::UnPackBlock<T>(
++				    data_ptr_cast(scan_state.decompression_buffer),
++				    scan_state.current_group_ptr + (group_pos - offset_in_compression_group) * scan_state.current_width / 8,
++				    scan_state.current_width, skip_sign_extend);
++				T *decompression_ptr = scan_state.decompression_buffer + offset_in_compression_group;
++				ApplyFrameOfReference<T_S>(reinterpret_cast<T_S *>(decompression_ptr),
++				                           static_cast<T_S>(scan_state.current_frame_of_reference), to_scan);
++				DeltaDecode<T_S>(reinterpret_cast<T_S *>(decompression_ptr),
++				                 static_cast<T_S>(scan_state.current_delta_offset), to_scan);
++				scan_state.current_delta_offset = decompression_ptr[to_scan - 1];
++				idx_t block_end = base + (group_pos + to_scan - group_start);
++				for (; sel_idx < sel_count && sel.get_index(sel_idx) < block_end; sel_idx++) {
++					idx_t pos = group_start + (sel.get_index(sel_idx) - base);
++					result_data[sel_idx] = scan_state.decompression_buffer[pos % ALGORITHM_GROUP_SIZE];
++				}
++				group_pos += to_scan;
++			}
++			break;
++		}
++		default:
++			throw InternalException("Invalid bitpacking mode");
++		}
++		scan_state.current_group_offset += in_group;
++		base = end;
++	}
++	D_ASSERT(sel_idx == sel_count);
++}
++
+ //===--------------------------------------------------------------------===//
+ // Fetch
+ //===--------------------------------------------------------------------===//
+@@ -968,6 +1093,7 @@ CompressionFunction GetBitpackingFunction(PhysicalType data_type) {
+ 	    BitpackingCompress<T, WRITE_STATISTICS>, BitpackingFinalizeCompress<T, WRITE_STATISTICS>, BitpackingInitScan<T>,
+ 	    BitpackingScan<T>, BitpackingScanPartial<T>, BitpackingFetchRow<T>, BitpackingSkip<T>);
+ 	bitpacking.get_segment_info = BitpackingGetSegmentInfo<T>;
++	bitpacking.select = BitpackingSelect<T>;
+ 	return bitpacking;
+ }
+ 

@@ -1,0 +1,13 @@
+{
+  "title": "Run JoinDependentFilterRule before DistributivityRule",
+  "hypothesis": "In q19 the whole OR-of-ANDs predicate is evaluated in a FILTER above the lineitem\u22c8part HASH_JOIN (0.42s). The join emits 2.14M rows (0.68s), but only 1,170 survive. JoinDependentFilterRule derives per-table OR filters (for example (p_brand='Brand#45' AND ...) OR (...) on part, and the l_quantity range OR on lineitem). It only fires on a root OR, though. DistributivityRule is registered earlier (optimizer.cpp:52 vs :69) and factors the common p_partkey=l_partkey term out first, so the root becomes an AND and nothing is derived. A previous evolve run measured the reordered version: q19 336->157ms (-53%), join output 2.14M->2.7K rows.",
+  "plan": "In src/optimizer/optimizer.cpp, move `rewriter.rules.push_back(make_uniq<JoinDependentFilterRule>(rewriter));` (line 69) to just before the DistributivityRule push_back (line 52). Nothing else changes. Check that the q19 plan now shows derived filters on the part scan and the lineitem side, and that the result is unchanged. Run the unit tests for the optimizer and filter pushdown (test/optimizer/*, any test that mentions join_dependent).",
+  "target_files": [
+    "src/optimizer/optimizer.cpp"
+  ],
+  "expected_gain": "q19 -40..-55%, so roughly -4..-5% on the visible geomean. It may also help other disjunctive join predicates in hidden templates (TPC-H q07-style nation pairs).",
+  "generality": "Applies to any WHERE clause written as an OR of conjunctions that each touch several tables and repeat a join key, which is common in BI-generated SQL and in TPC-H q07/q19 patterns. The derived filters are redundant and implied, so correctness holds. The worst case is a little extra evaluation of the derived OR filters when they are not selective.",
+  "risk": "Low. Only the rule order changes. The expression rewriter runs the rules to a fixpoint, so Distributivity still runs afterwards. Check that no infinite rewrite loop appears (derived filters must not be re-derived) and that no plan-snapshot tests break.",
+  "status": "open",
+  "filed": "g1r1"
+}

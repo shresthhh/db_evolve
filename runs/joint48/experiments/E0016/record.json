@@ -1,0 +1,41 @@
+{
+  "id": "E0016",
+  "title": "Rerun: BF for hash joins whose build side is a DELIM_GET",
+  "started": "2026-11-24T11:10:54-05:00",
+  "base": "8a8ce6c57e762a480be012364d746e586a51307d",
+  "candidate": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.23688720000000002,
+  "summary": "I reapplied the E0015 one-line change. In `src/optimizer/join_filter_pushdown_optimizer.cpp` (around line 331), when a hash join's build child is a LOGICAL_DELIM_GET, `build_side_has_filter` is now set to true. Before, it ran IsFiltering on the probe side (children[0]), so a join whose build side is a DELIM_GET never got a Bloom filter. All other cases still use the existing IsFiltering check, and the runtime gates (CanUseBloomFilter, the selectivity auto-disable) are untouched. The build passed. Two full bench runs both passed the result check. q22 went from 173.9 to 133.7 ms (-23.1%) in run 1 and from 165.1 to 132.4 ms (-19.9%) in run 2. Visible geomean was -1.7% and -2.0%. Other templates moved both ways between the runs, which looks like noise: q14 was +9.5% then +0.4%, q03 -0.6% then +10.7%, q16 +7.1% then -0.3%, q08 -18.9% then +2.7%. EXPLAIN for q14.m0 shows its plan is a single INNER HASH_JOIN of lineitem and part through compress projections. It has no DELIM join or DELIM_GET, so this change cannot alter its plan. I did not separately compare q22 against SET disabled_optimizers='join_filter_pushdown' as the plan asked; correctness rests on the bench's result check.",
+  "notes": "The only risk is bench noise. Untouched templates swung by up to \u00b110..19% between the two runs, while q22 stayed at -20..-23% in both. q14's EXPLAIN confirms it has no DELIM join, so any q14 regression the harness reports is noise.",
+  "train_ratio": 0.9676023912281478,
+  "val_ratio": 0.9560308090352111,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9677623712736376,
+    "q03": 1.0989252491673993,
+    "q04": 0.9494560190464458,
+    "q05": 1.0186426253768697,
+    "q07": 0.9762626018750744,
+    "q08": 0.9863075078015149,
+    "q09": 0.9556710916303076,
+    "q13": 0.9828678725534339,
+    "q14": 0.9069842774491018,
+    "q16": 0.9758668283741843,
+    "q17": 0.9894659637182809,
+    "q18": 0.9980099060259087,
+    "q19": 0.9755290564649146,
+    "q22": 0.7950137946226156
+  },
+  "improved": [
+    "q14",
+    "q22"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T11:21:48-05:00"
+}

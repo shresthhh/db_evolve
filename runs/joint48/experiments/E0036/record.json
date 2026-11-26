@@ -1,0 +1,40 @@
+{
+  "id": "E0036",
+  "title": "Streaming run aggregation for interior rows of clustered-key radix agg",
+  "started": "2026-11-25T08:12:05-05:00",
+  "base": "f58ee71c46a2c1c9d4623388d87b7c1c7d25f25a",
+  "candidate": "3c9ef54dba04c4763ba2d3dbbccbdbe12e2b324c",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 4.0747577999999995,
+  "summary": "I added streaming run aggregation for the interior rows of the clustered-key radix aggregate (E0033 path). Only src/execution/radix_partitioned_hashtable.cpp changed; the header is untouched. Measured result: q18 is 45\u201354% faster (469\u2192240ms, 445\u2192237, 524\u2192239 across bench runs). Every other template stayed within noise; full-bench geomean was -1.1%, -5.1%, -5.2% and -6.5% over four runs.\n\nHow it works:\n- **Sink (SinkClustered, interior slice [first_end, last_start)):** a linear scan of the sorted key finds the run heads. Each run gets one aggregate-state block from a per-thread ArenaAllocator. The blocks are addressed through a fake row pointer (states minus aggr_offset), so InitializeStates, UpdateStates, CombineStates and FinalizeStates work on them unchanged. A per-row state-pointer vector feeds the aggregates' normal update callbacks, in the same loop as UpdateAggregates. The run-head group values plus the row pointer (stored as UBIGINT) go into a per-thread, buffer-managed ColumnDataCollection, the \"run store\".\n- **Finalize, proof succeeds:** the existing ClusteredIntervalsDisjoint check passes, and each run store becomes an extra READY_TO_SCAN AggregatePartition. The source scans it in parallel: one partition per thread store, states finalized chunk by chunk. Output goes through the same mapping code as HT partitions (factored into Output()).\n- **Finalize, proof fails:** MergeRunStores appends every run as a row through a SkipLookups HT with the same radix bits. It moves the states with CombineStates and combines the result into uncombined_data. The normal partition finalize then merges duplicates.\n- **Early overlap detection:** threads register each streamed interval in a global std::map under its own mutex. On the first overlap, all threads stop streaming. Without this, q03 was +5\u201313%: its proof fails (it already failed under E0033), because sparse join output is packed into chunks whose key ranges span many row groups, and the serial merge cost extra. With it, q03 is back to noise (-1.4%, +1.3%).\n\nGates: everything E0033 already requires, plus no FILTER aggregates, no state destructors, and a combine callback present. That rules out ORDER BY aggregates, DISTINCT, varchar min/max and string_agg. Any other group columns must not be FLOAT, DOUBLE or nested. They also must change only at key-run heads (checked with DistinctFrom), or that chunk's interior goes to the HT as before.\n\nCorrectness checks, each run on 8 threads and on 1 thread with identical results:\n- sum, avg, min, max, count, count(*), list (order included), first, decimal sum/avg, string_agg, list ORDER BY\n- ROLLUP, multi-column keys that vary inside a key run, and GROUP BY with no aggregates\n- NULL keys, NULL payloads, empty input\n- the reverse-block overlapping table (fallback merge), and a single-key chunk lying inside another chunk's interior (boundary-key fallback)\n- memory_limit=200MB\n\nOn the overlapping table, list order and first() across non-adjacent row groups differ between 8 threads and 1 thread. That ordering isn't deterministic under parallelism in the base engine either, so those were compared order-independently.",
+  "notes": "- **q03's clustered proof fails**, and did under E0033 as well. Sparse join output is packed into 2048-row chunks whose key ranges span many row groups, so intervals from different threads overlap. Any future clustered-path idea will not help q03 unless it deals with that (for example, per-thread proofs or a different interval granularity).\n- **Run stores are not counted in the aggregate's temporary_memory_state during sink.** The ColumnDataCollection is buffer-managed and can spill; the states live in the arena, as in the HT. A 200MB memory_limit test passed.\n- **Follow-ups:** the serial MergeRunStores fallback could be parallelized if it ever matters. q18's remaining time is mostly outside the subquery agg now; profile again before going further.\n- Full-bench noise is \u00b18% on single templates (q04, q14, q19 each showed +5..+29% once in a full run and noise when run alone). Rerun alone before acting on a single full-bench outlier.",
+  "train_ratio": 0.9566600357134633,
+  "val_ratio": 1.0255047745687798,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9878984160938402,
+    "q03": 0.9992581726863575,
+    "q04": 0.9606456925006674,
+    "q05": 0.9920993397077054,
+    "q07": 1.04670343454489,
+    "q08": 0.9404628997988101,
+    "q09": 1.0299076601986492,
+    "q13": 0.9935777609988428,
+    "q14": 1.027109715333381,
+    "q16": 1.0311419006338267,
+    "q17": 0.9549745008464143,
+    "q18": 0.5194172251820456,
+    "q19": 1.0530534574646928,
+    "q22": 1.0257444248516234
+  },
+  "improved": [
+    "q18"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-25T11:27:51-05:00"
+}

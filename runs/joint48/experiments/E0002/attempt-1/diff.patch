@@ -1,0 +1,76 @@
+diff --git a/src/optimizer/join_order/relation_statistics_helper.cpp b/src/optimizer/join_order/relation_statistics_helper.cpp
+index b783412..e27cfda 100644
+--- a/src/optimizer/join_order/relation_statistics_helper.cpp
++++ b/src/optimizer/join_order/relation_statistics_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
+ 
+ #include <math.h>
+ 
+@@ -443,6 +444,8 @@ RelationStats RelationStatisticsHelper::ExtractEmptyResultStats(LogicalEmptyResu
+ 	return stats;
+ }
+ 
++static double EstimateStringMatchSelectivity(const Expression &expr);
++
+ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t column_index, const TableFilter &filter,
+                                                    BaseStatistics &base_stats) {
+ 	auto cardinality_after_filters = cardinality;
+@@ -468,11 +471,54 @@ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t colu
+ 		}
+ 		return cardinality_after_filters;
+ 	}
++	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr_filter = filter.Cast<ExpressionFilter>();
++		auto selectivity = EstimateStringMatchSelectivity(*expr_filter.expr);
++		if (selectivity < 0) {
++			return cardinality_after_filters;
++		}
++		return MaxValue<idx_t>(LossyNumericCast<idx_t>(double(cardinality) * selectivity), 1U);
++	}
+ 	default:
+ 		return cardinality_after_filters;
+ 	}
+ }
+ 
++//! Estimate the selectivity of a positive substring / pattern match against a constant string
++//! (contains, LIKE, prefix, suffix). Longer literals are assumed to be more selective.
++//! Returns a negative value if the expression is not such a match.
++static double EstimateStringMatchSelectivity(const Expression &expr) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
++		return -1;
++	}
++	auto &func = expr.Cast<BoundFunctionExpression>();
++	auto &name = func.function.name;
++	bool is_like = name == "~~" || name == "like_escape";
++	bool is_substring = name == "contains" || name == "prefix" || name == "suffix";
++	if (!is_like && !is_substring) {
++		return -1;
++	}
++	if (func.children.size() < 2 || func.children[0]->IsFoldable() ||
++	    func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return -1;
++	}
++	auto &constant = func.children[1]->Cast<BoundConstantExpression>().value;
++	if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
++		return -1;
++	}
++	auto &pattern = StringValue::Get(constant);
++	idx_t literal_length = 0;
++	for (auto c : pattern) {
++		if (is_like && (c == '%' || c == '_')) {
++			continue;
++		}
++		literal_length++;
++	}
++	double selectivity = RelationStatisticsHelper::DEFAULT_SELECTIVITY *
++	                     std::pow(0.75, double(MinValue<idx_t>(literal_length, 64)));
++	return MaxValue<double>(selectivity, 0.01);
++}
++
+ // TODO: Currently only simple AND filters are pushed into table scans.
+ //  When OR filters are pushed this function can be added
+ // idx_t RelationStatisticsHelper::InspectConjunctionOR(idx_t cardinality, idx_t column_index, ConjunctionOrFilter

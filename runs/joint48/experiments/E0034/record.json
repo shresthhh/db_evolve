@@ -1,0 +1,41 @@
+{
+  "id": "E0034",
+  "title": "Partition-staged sink for large perfect hash aggregate",
+  "started": "2026-11-25T07:32:25-05:00",
+  "base": "a6719babc07ae26c30f7906b01fbb89b61303cc3",
+  "candidate": "95b3104ecc4ac63ef6508038d38e362d3e9c1ddb",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.9720176,
+  "summary": "I added a staged sink for the large (lazy-init) perfect hash aggregate. In AddChunkLazy, once the slot indices are computed and bounds-checked, rows are counting-sorted by stripe (2^16 slots per stripe). They are then appended to per-stripe staging buffers: up to 4 chunks of STANDARD_VECTOR_SIZE per stripe, filled with VectorOperations::Copy so validity is kept, plus a slot array. A full stripe is flushed in one go through the existing lazy-update body, now factored out as UpdateLazy.\n\nThe plan's private-table version only gave a modest gain. HA CPU on `count GROUP BY o_custkey`-style micro query went 1.10s\u21920.92s with 1 chunk/stripe and 0.78s with 4; 8 was worse. q13 improved only -5.7%. The reason: a flush of 8K rows still touches about 9K cache lines in a stripe, so misses barely drop.\n\nThe step that pays off is flushing each stripe straight into the shared global hash table. The flush holds the existing per-stripe combine lock (`SetStageTarget`, set on first Sink). The 8 private 18MB tables are then never written, and the striped combine is skipped. State memory comes from arenas owned by the global sink state; they are declared before the hash table so they outlive it.\n\nResults:\n- Micro query, 8 threads: 117ms\u219257-76ms wall; HA CPU 1.10s\u21920.50s.\n- Micro query, 1 thread: unchanged (~263ms both ways).\n- Sparse input (15K rows into a 2M-slot table): 45-49ms with staging off vs 36-42ms with it on.\n- Bench: q13 -15.2% and -17.4% on two runs; other templates within noise.\n- q09 showed +8.5..+11% on four bench runs, but its plan has no perfect HA and no other code uses this hash table. It looks like layout or noise.\n\nCorrectness, A/B against `SET perfect_ht_threshold=8` (radix path), all identical:\n- LEFT JOIN count/sum/min/max with NULL payloads, plus two FILTER aggregates\n- NULL group keys (999,983 groups)\n- two-column groups (l_suppkey, l_linenumber)\n- avg over DOUBLE, rounded to 6 digits\n- list_sort(list()) on 8 threads\n- quantile_disc\n- list/first/quantile on 1 thread (order-sensitive), empty input, sparse input",
+  "notes": "- Dead end: staging into private per-thread tables gave only -29% HA CPU and q13 -5.7%. Going from 4 to 8 chunks per stripe made it slower. The real cost is having 8 copies of the table, not just the random access pattern.\n- Follow-up: each local table still allocates its unused 18MB table and zeroes a 2MB is_set array. That allocation could be skipped when the shared sink is active.\n- Lock contention on the stripe locks was not a problem at 8 threads.\n- q09 regularly shows about +8% in quick bench runs even though its plan has no perfect HA. Treat that as noise.",
+  "train_ratio": 0.9808207710557615,
+  "val_ratio": 0.9912275127953517,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9875947179092702,
+    "q03": 0.9850503475193568,
+    "q04": 1.0075481434578675,
+    "q05": 0.9719872808676223,
+    "q07": 1.001951418620975,
+    "q08": 1.0202275443520816,
+    "q09": 1.0132321188490714,
+    "q13": 0.8417536371780496,
+    "q14": 0.9431988179286018,
+    "q16": 0.9944418826881017,
+    "q17": 1.00146056154124,
+    "q18": 1.0079739434731965,
+    "q19": 0.9870758454198327,
+    "q22": 0.9822851781084808
+  },
+  "improved": [
+    "q13",
+    "q14"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-25T07:55:43-05:00"
+}

@@ -1,0 +1,40 @@
+{
+  "id": "E0005",
+  "title": "Bloom filter on first key of multi-key hash joins",
+  "started": "2026-11-24T04:28:40-05:00",
+  "base": "72de28442d3f7bdce9070be47c48d77e509a2789",
+  "candidate": "6709876b091b65a0799bc8360a364b72c9f97eb4",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 1.0219630000000002,
+  "summary": "Hash joins with more than one equality key can now get a Bloom filter (BF) on their first key; before, they got none. Measured q09 at -18..-22% across four bench runs (best run 767.9\u2192594.8ms). Last full bench: geomean -3.0%. Other templates moved within \u00b18% between runs, which is noise.\n\nChanges:\n- `src/execution/operator/join/physical_hash_join.cpp`: `CanUseBloomFilter` no longer requires `conditions.size()==1`. In `FinalizeFilters`, the BF is only considered for the filter where `join_condition[filter_idx]==0`. `PushBloomFilter` already uses condition 0's key name, type and null handling.\n- `src/execution/join_hashtable.cpp`: the hash table's own hash combines all equality keys, so it doesn't match what the probe side computes for a single column. When the BF is set up and there is more than one equality key, `Finalize` now gathers key column 0 from the row locations (new static helper `InsertFirstKeyIntoBloomFilter`), hashes it alone with `VectorOperations::Hash` (the same call `BFTableFilter` uses on the probe side) and inserts that into the BF. `InsertHashes` only inserts the combined hash into the BF for single-key joins. The single-key path is unchanged.\n\nCorrectness spot-checks: a two-int-key join gave the same count with and without pushdown (pushdown blocked with `col+0` keys): 295319. A NULL-able first key with IS NOT DISTINCT FROM also matched: 196595 both ways. A VARCHAR first key and a join mixing equality and non-equality conditions both ran without errors. Bench result checks passed on all visible templates.",
+  "notes": "q04 sometimes showed +7..+15% in bench runs. I don't think the change causes it:\n- q04 has only single-key joins, so the new code never runs for it.\n- It stayed at +15% with the feature fully disabled (the `size()==1` gate restored).\n- Run alone it came out -6.3%, and in the final full bench -2.3%.\n\nIt looks like noise that depends on run order, or code layout in `join_hashtable.cpp`, where the hot probe loops live. Moving the BF code out of `InsertHashes` into `Finalize` (the shipped version) did not change it.\n\nFollow-up idea: build the BF on whichever equality key is most selective instead of always key 0, or push one BF per key, each with its own single-column hash.",
+  "train_ratio": 0.9862598831784215,
+  "val_ratio": 0.9931739445749651,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9747300658159372,
+    "q03": 0.9923567539205972,
+    "q04": 1.0080326151808685,
+    "q05": 1.0100886368129312,
+    "q07": 0.9701381206885238,
+    "q08": 0.9769756368448712,
+    "q09": 0.8175631807340035,
+    "q13": 0.9905758835947432,
+    "q14": 1.0099529226375794,
+    "q16": 1.0016480930351752,
+    "q17": 1.0114869050650246,
+    "q18": 1.0285943641015247,
+    "q19": 1.018603581903023,
+    "q22": 1.0165777781083407
+  },
+  "improved": [
+    "q09"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T04:51:13-05:00"
+}

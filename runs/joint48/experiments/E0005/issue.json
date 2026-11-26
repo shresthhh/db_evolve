@@ -1,0 +1,14 @@
+{
+  "title": "Bloom filter on first key of multi-key hash joins",
+  "hypothesis": "In q09 (799ms, the largest template) the lineitem-partsupp join has 2 keys (ps_suppkey, ps_partkey). CanUseBloomFilter requires conditions.size()==1, so this join gets no BF. A prior run measured q09 -21% by building the BF on key 0 only.",
+  "plan": "In src/execution/join_hashtable.cpp InsertHashes, gather join key column 0 and hash it on its own for the BF. In physical_hash_join.cpp CanUseBloomFilter / FinalizeFilters, allow multiple conditions and push the BF only for the filter on join_condition 0.",
+  "target_files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "expected_gain": "q09 -15..-21%",
+  "generality": "Composite-key FK joins (partsupp-style bridge tables).",
+  "risk": "Medium. The BF hash has to match the probe-side hashing.",
+  "status": "open",
+  "filed": "g1r4"
+}

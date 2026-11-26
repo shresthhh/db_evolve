@@ -1,0 +1,274 @@
+diff --git a/src/execution/operator/join/physical_hash_join.cpp b/src/execution/operator/join/physical_hash_join.cpp
+index a9af468..dc6e032 100644
+--- a/src/execution/operator/join/physical_hash_join.cpp
++++ b/src/execution/operator/join/physical_hash_join.cpp
+@@ -17,6 +17,7 @@
+ #include "duckdb/parallel/thread_context.hpp"
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
+ #include "duckdb/planner/filter/constant_filter.hpp"
+ #include "duckdb/planner/filter/in_filter.hpp"
+ #include "duckdb/planner/filter/optional_filter.hpp"
+@@ -711,6 +712,110 @@ public:
+ 	}
+ };
+ 
++//! Convert a join key value to the value stored in the probe-side column: apply the compression offset (if any),
++//! then cast to the storage type. Returns false if the value cannot be represented in storage.
++static bool JoinFilterValueToStorage(Value &value, const JoinFilterPushdownColumn &column) {
++	if (!value.IsNull() && !column.storage_offset.IsNull()) {
++		Value offset = column.storage_offset;
++		if (!value.DefaultTryCastAs(LogicalType::HUGEINT) || !offset.DefaultTryCastAs(LogicalType::HUGEINT)) {
++			return false;
++		}
++		auto result = HugeIntValue::Get(value);
++		if (!Hugeint::TryAddInPlace(result, HugeIntValue::Get(offset))) {
++			return false;
++		}
++		value = Value::HUGEINT(result);
++	}
++	if (column.storage_type.IsValid() && !value.DefaultTryCastAs(column.storage_type)) {
++		return false;
++	}
++	return true;
++}
++
++//! For equality joins with a moderate number of build keys (too many for an IN-list), push a zonemap-only filter
++//! that is an OR of at most "max_ranges" ranges covering all keys, split at the largest gaps between the keys.
++//! This prunes row groups (and segments) whose min/max fall between the build keys.
++static constexpr idx_t RANGE_SET_MAX_KEYS_PER_RANGE = 64;
++
++static void PushRangeSetFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
++                               idx_t build_idx, const JoinFilterPushdownColumn &column, idx_t filter_col_idx,
++                               idx_t max_ranges) {
++	auto &storage_type = column.storage_type;
++	if (max_ranges < 2 || !storage_type.IsValid() || !storage_type.IsIntegral() ||
++	    storage_type.InternalType() == PhysicalType::INT128 || storage_type.InternalType() == PhysicalType::UINT128) {
++		return;
++	}
++	Vector tuples_addresses(LogicalType::POINTER, ht.Count());
++	Vector build_vector(ht.layout_ptr->GetTypes()[build_idx], ht.Count());
++	auto key_count = ht.ScanKeyColumn(tuples_addresses, build_vector, build_idx);
++	if (key_count == 0) {
++		return;
++	}
++	vector<hugeint_t> keys;
++	keys.reserve(key_count);
++	for (idx_t k = 0; k < key_count; k++) {
++		auto value = build_vector.GetValue(k);
++		if (value.IsNull()) {
++			// NULL keys never match an equality
++			continue;
++		}
++		if (!JoinFilterValueToStorage(value, column) || !value.DefaultTryCastAs(LogicalType::HUGEINT)) {
++			return;
++		}
++		keys.push_back(HugeIntValue::Get(value));
++	}
++	std::sort(keys.begin(), keys.end());
++	keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
++	if (keys.size() < 2) {
++		// the min/max filter is exact already
++		return;
++	}
++
++	// find the (max_ranges - 1) largest gaps between consecutive keys and split the ranges there
++	vector<bool> split_after(keys.size(), false);
++	if (keys.size() <= max_ranges) {
++		std::fill(split_after.begin(), split_after.end(), true);
++	} else {
++		vector<pair<hugeint_t, idx_t>> gaps;
++		gaps.reserve(keys.size() - 1);
++		for (idx_t i = 0; i + 1 < keys.size(); i++) {
++			gaps.emplace_back(keys[i + 1] - keys[i], i);
++		}
++		const auto split_count = max_ranges - 1;
++		std::nth_element(gaps.begin(), gaps.begin() + NumericCast<int64_t>(split_count), gaps.end(),
++		                 [](const pair<hugeint_t, idx_t> &a, const pair<hugeint_t, idx_t> &b) {
++			                 return a.first > b.first || (a.first == b.first && a.second < b.second);
++		                 });
++		for (idx_t i = 0; i < split_count; i++) {
++			split_after[gaps[i].second] = true;
++		}
++	}
++
++	auto or_filter = make_uniq<ConjunctionOrFilter>();
++	idx_t range_start = 0;
++	for (idx_t i = 0; i < keys.size(); i++) {
++		if (!split_after[i] && i + 1 < keys.size()) {
++			continue;
++		}
++		auto lower = Value::HUGEINT(keys[range_start]).DefaultCastAs(storage_type);
++		if (range_start == i) {
++			or_filter->child_filters.push_back(make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, lower));
++		} else {
++			auto upper = Value::HUGEINT(keys[i]).DefaultCastAs(storage_type);
++			auto and_filter = make_uniq<ConjunctionAndFilter>();
++			and_filter->child_filters.push_back(
++			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lower));
++			and_filter->child_filters.push_back(
++			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, upper));
++			or_filter->child_filters.push_back(std::move(and_filter));
++		}
++		range_start = i + 1;
++	}
++	// zonemap pruning only: evaluating the OR per row would be expensive
++	auto filter = make_uniq<OptionalFilter>(std::move(or_filter));
++	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
++}
++
+ bool JoinFilterPushdownInfo::CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+                                             const ExpressionType &cmp) const {
+ 	auto dynamic_or_filter_threshold = Settings::Get<DynamicOrFilterThresholdSetting>(context);
+@@ -734,8 +839,7 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info,
+ 	for (idx_t k = 0; k < key_count; k++) {
+ 		// Cast to storage type, only insert if it succeeds
+ 		auto value = build_vector.GetValue(k);
+-		if (info.columns[filter_idx].storage_type.IsValid() &&
+-		    !value.DefaultTryCastAs(info.columns[filter_idx].storage_type)) {
++		if (!JoinFilterValueToStorage(value, info.columns[filter_idx])) {
+ 			return; // it's all or nothing sadly
+ 		}
+ 		unique_ht_values.insert(value);
+@@ -832,13 +936,9 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			auto max_val = final_min_max->data[max_idx].GetValue(0);
+ 
+ 			// Cast to storage type, skip if fails
+-			if (pushdown_column.storage_type.IsValid()) {
+-				if (!min_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
+-				if (!max_val.DefaultTryCastAs(pushdown_column.storage_type)) {
+-					continue;
+-				}
++			if (!JoinFilterValueToStorage(min_val, pushdown_column) ||
++			    !JoinFilterValueToStorage(max_val, pushdown_column)) {
++				continue;
+ 			}
+ 
+ 			if (min_val.IsNull() || max_val.IsNull()) {
+@@ -851,6 +951,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 			// but only if the join condition is equality.
+ 			if (ht && CanUseInFilter(context, ht, cmp)) {
+ 				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
++			} else if (ht && cmp == ExpressionType::COMPARE_EQUAL) {
++				// too many keys for an IN-list: push a set of ranges for zonemap pruning instead
++				const auto threshold = Settings::Get<DynamicOrFilterThresholdSetting>(context);
++				if (ht->Count() > threshold && ht->Count() <= threshold * RANGE_SET_MAX_KEYS_PER_RANGE) {
++					PushRangeSetFilter(info, *ht, op, join_condition[filter_idx], pushdown_column, filter_col_idx,
++					                   threshold * 4);
++				}
+ 			}
+ 			if (Value::NotDistinctFrom(min_val, max_val)) {
+ 				// min = max - single value
+@@ -896,7 +1003,7 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(
+ 
+ 				auto condition_type = op.conditions[join_condition[filter_idx]].left->return_type;
+ 				bool has_cast = condition_type != pushdown_column.storage_type;
+-				if (!has_cast && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
++				if (!has_cast && pushdown_column.storage_offset.IsNull() && ht &&join_condition[filter_idx] == 0 && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+ 					if (deferred_bloom_filters) {
+ 						// Defer the push until HashJoinFinalizeEvent::FinishEvent so the scan
+ 						// only sees the filter once the bloom filter is fully populated.
+diff --git a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+index d47315b..8e6b1a3 100644
+--- a/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
++++ b/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
+@@ -27,6 +27,9 @@ struct JoinFilterPushdownColumn {
+ 	ColumnBinding probe_column_index;
+ 	//! The type of the value in storage (LogicalGet)
+ 	LogicalType storage_type;
++	//! If not NULL: the probe value is (storage value - storage_offset), introduced by an integral compression
++	//! projection. Filter constants must have this offset added before they are applied to the storage column.
++	Value storage_offset;
+ };
+ 
+ struct JoinFilterGlobalState {
+diff --git a/src/optimizer/join_filter_pushdown_optimizer.cpp b/src/optimizer/join_filter_pushdown_optimizer.cpp
+index 716a2ad..ba431cc 100644
+--- a/src/optimizer/join_filter_pushdown_optimizer.cpp
++++ b/src/optimizer/join_filter_pushdown_optimizer.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
+ 
++#include "duckdb/common/string_util.hpp"
+ #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
+ #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
+ #include "duckdb/function/aggregate/distributive_function_utils.hpp"
+@@ -8,6 +9,8 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -50,6 +53,28 @@ bool PushdownJoinFilterExpression(Expression &expr, JoinFilterPushdownColumn &fi
+ 		}
+ 		return PushdownJoinFilterExpression(*bound_cast.child, filter);
+ 	}
++	case ExpressionClass::BOUND_FUNCTION: {
++		// integral compression (compressed materialization): result = input - offset
++		// we can push through it if we remember the offset, so filter constants can be shifted back
++		auto &func = expr.Cast<BoundFunctionExpression>();
++		if (!StringUtil::StartsWith(func.function.name, "__internal_compress_integral_") ||
++		    func.children.size() != 2 || func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &offset = func.children[1]->Cast<BoundConstantExpression>().value;
++		const auto offset_type = offset.type().InternalType();
++		if (offset.IsNull() || offset_type == PhysicalType::UINT128 || !TypeIsIntegral(offset_type) ||
++		    !expr.return_type.IsIntegral()) {
++			return false;
++		}
++		if (!filter.storage_offset.IsNull() || !PushdownJoinFilterExpression(*func.children[0], filter) ||
++		    !filter.storage_offset.IsNull()) {
++			// only a single offset is supported
++			return false;
++		}
++		filter.storage_offset = offset;
++		return true;
++	}
+ 	default:
+ 		return false;
+ 	}
+@@ -103,6 +128,7 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
+ 			for (auto &child_column : columns) {
+ 				JoinFilterPushdownColumn new_col;
+ 				new_col.probe_column_index = child_bindings[child_column.probe_column_index.column_index];
++				new_col.storage_offset = child_column.storage_offset;
+ 				child_columns.push_back(new_col);
+ 			}
+ 			// then recurse into the child
+diff --git a/src/optimizer/row_group_pruner.cpp b/src/optimizer/row_group_pruner.cpp
+index 95d15c6..a6fa179 100644
+--- a/src/optimizer/row_group_pruner.cpp
++++ b/src/optimizer/row_group_pruner.cpp
+@@ -136,7 +136,7 @@ optional_ptr<LogicalGet> RowGroupPruner::FindLogicalGet(const LogicalOrder &logi
+ 	JoinFilterPushdownOptimizer::GetPushdownFilterTargets(*logical_order.children[0], std::move(columns),
+ 	                                                      pushdown_targets);
+ 
+-	if (pushdown_targets.empty()) {
++	if (pushdown_targets.empty() || !pushdown_targets.front().columns[0].storage_offset.IsNull()) {
+ 		return nullptr;
+ 	}
+ 
+diff --git a/src/optimizer/topn_optimizer.cpp b/src/optimizer/topn_optimizer.cpp
+index 929f5eb..1dd6655 100644
+--- a/src/optimizer/topn_optimizer.cpp
++++ b/src/optimizer/topn_optimizer.cpp
+@@ -91,6 +91,12 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
+ 		// no pushdown targets
+ 		return;
+ 	}
++	for (auto &target : pushdown_targets) {
++		if (!target.columns[0].storage_offset.IsNull()) {
++			// the top-n boundary cannot be shifted by a compression offset
++			return;
++		}
++	}
+ 	// found pushdown targets! generate dynamic filters
+ 	ExpressionType comparison_type;
+ 	if (op.orders[0].type == OrderType::ASCENDING) {

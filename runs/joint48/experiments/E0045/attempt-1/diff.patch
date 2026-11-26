@@ -1,0 +1,240 @@
+diff --git a/src/execution/radix_partitioned_hashtable.cpp b/src/execution/radix_partitioned_hashtable.cpp
+index 56aa467..883a9cd 100644
+--- a/src/execution/radix_partitioned_hashtable.cpp
++++ b/src/execution/radix_partitioned_hashtable.cpp
+@@ -479,7 +479,9 @@ public:
+ 	unique_ptr<TupleDataLayout> runs_layout;
+ 	ColumnDataAppendState runs_append;
+ 	DataChunk runs_chunk;
++	//! Starts of all runs of equal keys of the current split chunk, and the run index of every row
+ 	SelectionVector run_heads;
++	unsafe_unique_array<sel_t> run_ids;
+ 	SelectionVector run_distinct_sel;
+ 	Vector run_rows;
+ 	Vector run_addresses;
+@@ -657,11 +659,38 @@ static uint64_t ClusteredOrderKey(const T value) {
+ 	return static_cast<uint64_t>(value);
+ }
+ 
+-//! Checks that the key column is non-NULL and non-decreasing, and finds the end of the first run of equal keys and the
+-//! start of the last run (first_end == count if all keys are equal)
++//! Branch-free single pass over the keys: records the start of every run of equal keys in heads (heads[0] == 0) and the
++//! run index of every row in run_ids, and returns whether the keys are non-decreasing. Runs are often short, so
++//! branching on key changes would mispredict on most rows
++template <class T, bool HAS_SEL>
++static bool FindRunsInternal(const T *__restrict data, const SelectionVector &sel, const idx_t count,
++                             sel_t *__restrict heads, sel_t *__restrict run_ids, idx_t &run_count, T &last) {
++	T prev = data[HAS_SEL ? sel.get_index(0) : 0];
++	heads[0] = 0;
++	run_ids[0] = 0;
++	idx_t n = 1;
++	bool decreasing = false;
++	for (idx_t i = 1; i < count; i++) {
++		const T cur = data[HAS_SEL ? sel.get_index(i) : i];
++		// Writes the candidate head at n, which is only kept (n advances) if the key changes
++		heads[n] = UnsafeNumericCast<sel_t>(i);
++		n += cur != prev;
++		decreasing |= cur < prev;
++		run_ids[i] = UnsafeNumericCast<sel_t>(n - 1);
++		prev = cur;
++	}
++	run_count = n;
++	last = prev;
++	return !decreasing;
++}
++
++//! Checks that the key column is non-NULL and non-decreasing, and finds the starts of all runs of equal keys (in
++//! heads/run_ids, see FindRunsInternal), the end of the first run and the start of the last run (first_end == count if
++//! all keys are equal)
+ template <class T>
+-static bool FindClusteredRuns(const UnifiedVectorFormat &format, const idx_t count, idx_t &first_end,
+-                              idx_t &last_start, uint64_t &min_key, uint64_t &max_key) {
++static bool FindClusteredRuns(const UnifiedVectorFormat &format, const idx_t count, sel_t *heads, sel_t *run_ids,
++                              idx_t &run_count, idx_t &first_end, idx_t &last_start, uint64_t &min_key,
++                              uint64_t &max_key) {
+ 	const auto data = UnifiedVectorFormat::GetData<T>(format);
+ 	const auto &sel = *format.sel;
+ 	if (!format.validity.AllValid()) {
+@@ -671,83 +700,31 @@ static bool FindClusteredRuns(const UnifiedVectorFormat &format, const idx_t cou
+ 			}
+ 		}
+ 	}
+-	const T first = data[sel.get_index(0)];
+-	T prev = first;
+-	first_end = count;
+-	last_start = 0;
+-	for (idx_t i = 1; i < count; i++) {
+-		const T cur = data[sel.get_index(i)];
+-		if (cur != prev) {
+-			if (cur < prev) {
+-				return false;
+-			}
+-			if (first_end == count) {
+-				first_end = i;
+-			}
+-			last_start = i;
+-			prev = cur;
+-		}
++	T last;
++	const bool sorted = sel.IsSet() ? FindRunsInternal<T, true>(data, sel, count, heads, run_ids, run_count, last)
++	                                : FindRunsInternal<T, false>(data, sel, count, heads, run_ids, run_count, last);
++	if (!sorted) {
++		return false;
+ 	}
+-	min_key = ClusteredOrderKey<T>(first);
+-	max_key = ClusteredOrderKey<T>(prev);
++	first_end = run_count > 1 ? heads[1] : count;
++	last_start = run_count > 1 ? heads[run_count - 1] : 0;
++	min_key = ClusteredOrderKey<T>(data[sel.get_index(0)]);
++	max_key = ClusteredOrderKey<T>(last);
+ 	return true;
+ }
+ 
+-//! Finds the starts of the runs of equal keys in [begin, end) of a sorted, non-NULL key column
+-template <class T>
+-static idx_t FindRunHeads(const UnifiedVectorFormat &format, const idx_t begin, const idx_t end,
+-                          SelectionVector &heads) {
+-	const auto data = UnifiedVectorFormat::GetData<T>(format);
+-	const auto &sel = *format.sel;
+-	idx_t run_count = 0;
+-	T prev = data[sel.get_index(begin)];
+-	heads.set_index(run_count++, begin);
+-	for (idx_t i = begin + 1; i < end; i++) {
+-		const T cur = data[sel.get_index(i)];
+-		if (cur != prev) {
+-			heads.set_index(run_count++, i);
+-			prev = cur;
+-		}
+-	}
+-	return run_count;
+-}
+-
+ //! Aggregates the interior rows [begin, end) of a split chunk without the HT: every run of equal keys is a complete
+ //! group (see ClusteredIntervalsDisjoint), so it gets a single aggregate state, and its head row is appended to the
+ //! run store. Returns false (and sinks nothing) if the other group columns are not constant within the key runs
+ static bool SinkInteriorRuns(ClientContext &context, const RadixPartitionedHashTable &radix_ht,
+                              RadixHTLocalSinkState &lstate, DataChunk &group_chunk, DataChunk &payload_input,
+-                             const unsafe_vector<idx_t> &filter, const idx_t begin, const idx_t end) {
+-	auto &heads = lstate.run_heads;
+-	idx_t run_count;
+-	switch (group_chunk.data[0].GetType().InternalType()) {
+-	case PhysicalType::INT8:
+-		run_count = FindRunHeads<int8_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::INT16:
+-		run_count = FindRunHeads<int16_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::INT32:
+-		run_count = FindRunHeads<int32_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::INT64:
+-		run_count = FindRunHeads<int64_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::UINT8:
+-		run_count = FindRunHeads<uint8_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::UINT16:
+-		run_count = FindRunHeads<uint16_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::UINT32:
+-		run_count = FindRunHeads<uint32_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	case PhysicalType::UINT64:
+-		run_count = FindRunHeads<uint64_t>(lstate.key_format, begin, end, heads);
+-		break;
+-	default:
+-		return false;
+-	}
++                             const unsafe_vector<idx_t> &filter, const idx_t begin, const idx_t end,
++                             const idx_t chunk_run_count) {
++	// The interior runs are all runs of the chunk except the first and the last one (heads[chunk_run_count - 1] is end)
++	D_ASSERT(chunk_run_count >= 3);
++	const SelectionVector heads(lstate.run_heads.data() + 1);
++	const idx_t run_count = chunk_run_count - 2;
++	D_ASSERT(heads.get_index(0) == begin && heads.get_index(run_count) == end);
+ 	const auto count = end - begin;
+ 
+ 	// The other group columns may only change where the key changes (otherwise a group could occur in several runs)
+@@ -789,12 +766,12 @@ static bool SinkInteriorRuns(ClientContext &context, const RadixPartitionedHashT
+ 	const auto rows = FlatVector::GetData<data_ptr_t>(lstate.run_rows);
+ 	const auto addresses = FlatVector::GetData<data_ptr_t>(lstate.run_addresses);
+ 	for (idx_t r = 0; r < run_count; r++) {
+-		const auto run_states = states + r * stride;
+-		rows[r] = run_states - aggr_offset;
+-		const auto run_end = r + 1 < run_count ? heads.get_index(r + 1) : end;
+-		for (idx_t i = heads.get_index(r); i < run_end; i++) {
+-			addresses[i - begin] = run_states;
+-		}
++		rows[r] = states + r * stride - aggr_offset;
++	}
++	// Row i belongs to chunk run run_ids[i], i.e., to interior run run_ids[i] - 1
++	const auto run_ids = lstate.run_ids.get();
++	for (idx_t i = begin; i < end; i++) {
++		addresses[i - begin] = states + (static_cast<idx_t>(run_ids[i]) - 1) * stride;
+ 	}
+ 	RowOperations::InitializeStates(layout, lstate.run_rows, *FlatVector::IncrementalSelectionVector(), run_count);
+ 
+@@ -874,31 +851,45 @@ static bool SinkClustered(ClientContext &context, const RadixPartitionedHashTabl
+ 	idx_t last_start;
+ 	uint64_t min_key;
+ 	uint64_t max_key;
++	idx_t run_count;
++	if (!lstate.run_ids) {
++		lstate.run_ids = make_unsafe_uniq_array_uninitialized<sel_t>(STANDARD_VECTOR_SIZE);
++	}
++	auto heads = lstate.run_heads.data();
++	auto run_ids = lstate.run_ids.get();
+ 	bool sorted;
+ 	switch (key.GetType().InternalType()) {
+ 	case PhysicalType::INT8:
+-		sorted = FindClusteredRuns<int8_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<int8_t>(lstate.key_format, count, heads, run_ids, run_count, first_end, last_start,
++		                                   min_key, max_key);
+ 		break;
+ 	case PhysicalType::INT16:
+-		sorted = FindClusteredRuns<int16_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<int16_t>(lstate.key_format, count, heads, run_ids, run_count, first_end, last_start,
++		                                    min_key, max_key);
+ 		break;
+ 	case PhysicalType::INT32:
+-		sorted = FindClusteredRuns<int32_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<int32_t>(lstate.key_format, count, heads, run_ids, run_count, first_end, last_start,
++		                                    min_key, max_key);
+ 		break;
+ 	case PhysicalType::INT64:
+-		sorted = FindClusteredRuns<int64_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<int64_t>(lstate.key_format, count, heads, run_ids, run_count, first_end, last_start,
++		                                    min_key, max_key);
+ 		break;
+ 	case PhysicalType::UINT8:
+-		sorted = FindClusteredRuns<uint8_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<uint8_t>(lstate.key_format, count, heads, run_ids, run_count, first_end, last_start,
++		                                    min_key, max_key);
+ 		break;
+ 	case PhysicalType::UINT16:
+-		sorted = FindClusteredRuns<uint16_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<uint16_t>(lstate.key_format, count, heads, run_ids, run_count, first_end,
++		                                     last_start, min_key, max_key);
+ 		break;
+ 	case PhysicalType::UINT32:
+-		sorted = FindClusteredRuns<uint32_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<uint32_t>(lstate.key_format, count, heads, run_ids, run_count, first_end,
++		                                     last_start, min_key, max_key);
+ 		break;
+ 	case PhysicalType::UINT64:
+-		sorted = FindClusteredRuns<uint64_t>(lstate.key_format, count, first_end, last_start, min_key, max_key);
++		sorted = FindClusteredRuns<uint64_t>(lstate.key_format, count, heads, run_ids, run_count, first_end,
++		                                     last_start, min_key, max_key);
+ 		break;
+ 	default:
+ 		return false;
+@@ -944,7 +935,8 @@ static bool SinkClustered(ClientContext &context, const RadixPartitionedHashTabl
+ 			lstate.stream_runs = false;
+ 		}
+ 		if (lstate.stream_runs &&
+-		    SinkInteriorRuns(context, radix_ht, lstate, group_chunk, payload_input, filter, first_end, last_start)) {
++		    SinkInteriorRuns(context, radix_ht, lstate, group_chunk, payload_input, filter, first_end, last_start,
++		                     run_count)) {
+ 			lstate.intervals.emplace_back(min_key, max_key);
+ 			return true;
+ 		}

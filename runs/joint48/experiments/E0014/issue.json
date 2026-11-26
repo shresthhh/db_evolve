@@ -1,0 +1,15 @@
+{
+  "title": "FSST batched decode + substring prefilter bundle (q13)",
+  "hypothesis": "q13 (~638ms, 2nd largest) spends its scan time decoding FSST o_comment strings one at a time and then evaluating NOT LIKE '%special%requests%'. Two prior measurements: FSST batched decode (one shared allocation, remaining-space bound, used only via DecompressVector) gave q13 -4..-7%; the substring prefilter over contiguous decoded runs (E0004) gave -7.7%. Each alone is under q13's ~14% noise bar. Combined they should be about -12..-15%.",
+  "plan": "1) In src/storage/compression/fsst.cpp, in the scan/DecompressVector path, decode a whole vector's strings into one shared string-heap buffer, bounding writes by the remaining space instead of a per-string worst case. 2) Re-apply the E0004 approach in ColumnData::Filter / ColumnSegment::FilterSelection: for a contains/LIKE ExpressionFilter with a constant literal, search the literal over back-to-back decoded strings with memchr/memmem, and map each hit to its row. Keep the fallback for all other cases.",
+  "target_files": [
+    "src/storage/compression/fsst.cpp",
+    "src/storage/table/column_data.cpp",
+    "src/storage/table/column_segment.cpp"
+  ],
+  "expected_gain": "q13 -12..-15%; small gains on other templates with LIKE over FSST columns (q09 p_name, q16 s_comment)",
+  "generality": "Any scan of FSST-compressed strings, and any substring filter on string columns.",
+  "risk": "Medium: string lifetime and heap ownership in the batched decode, and NULL/empty-string handling in the prefilter.",
+  "status": "open",
+  "filed": "g1r12"
+}

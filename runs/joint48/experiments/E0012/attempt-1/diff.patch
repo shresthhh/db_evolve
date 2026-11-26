@@ -1,0 +1,279 @@
+diff --git a/src/storage/table/column_segment.cpp b/src/storage/table/column_segment.cpp
+index d20171f..520f973 100644
+--- a/src/storage/table/column_segment.cpp
++++ b/src/storage/table/column_segment.cpp
+@@ -13,6 +13,13 @@
+ #include "duckdb/planner/table_filter_state.hpp"
+ #include "duckdb/planner/filter/bloom_filter.hpp"
+ #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/expression/bound_between_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/common/operator/comparison_operators.hpp"
+ 
+ #include <cstring>
+ 
+@@ -402,6 +409,249 @@ static idx_t TemplatedNullSelection(UnifiedVectorFormat &vdata, SelectionVector
+ 	}
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Dense-mask evaluation of AND/OR trees of comparisons against constants
++//===--------------------------------------------------------------------===//
++// Expression filters such as "(x BETWEEN a AND b) OR (x >= c AND x <= d)" are evaluated by gathering the selected
++// values into a dense array and computing a branch-free byte mask per node. Only plain integer-ordered types are
++// handled; with no NOT and no NULL constants a NULL input makes every leaf (and therefore the whole tree) NULL.
++static bool IsDenseMaskType(const LogicalType &type) {
++	switch (type.id()) {
++	case LogicalTypeId::TINYINT:
++	case LogicalTypeId::SMALLINT:
++	case LogicalTypeId::INTEGER:
++	case LogicalTypeId::BIGINT:
++	case LogicalTypeId::UTINYINT:
++	case LogicalTypeId::USMALLINT:
++	case LogicalTypeId::UINTEGER:
++	case LogicalTypeId::UBIGINT:
++	case LogicalTypeId::DATE:
++	case LogicalTypeId::TIME:
++	case LogicalTypeId::TIMESTAMP:
++	case LogicalTypeId::TIMESTAMP_SEC:
++	case LogicalTypeId::TIMESTAMP_MS:
++	case LogicalTypeId::TIMESTAMP_NS:
++	case LogicalTypeId::TIMESTAMP_TZ:
++		return true;
++	case LogicalTypeId::DECIMAL:
++		return type.InternalType() != PhysicalType::INT128;
++	default:
++		return false;
++	}
++}
++
++static bool IsDenseMaskColumn(const Expression &expr, const LogicalType &type) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_REF) {
++		return false;
++	}
++	return expr.Cast<BoundReferenceExpression>().index == 0 && expr.return_type == type;
++}
++
++static bool IsDenseMaskConstant(const Expression &expr, const LogicalType &type) {
++	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return false;
++	}
++	auto &value = expr.Cast<BoundConstantExpression>().value;
++	return !value.IsNull() && value.type() == type;
++}
++
++static bool CanEvaluateDenseMask(const Expression &expr, const LogicalType &type) {
++	switch (expr.GetExpressionClass()) {
++	case ExpressionClass::BOUND_CONJUNCTION: {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		if (conj.children.empty()) {
++			return false;
++		}
++		for (auto &child : conj.children) {
++			if (!CanEvaluateDenseMask(*child, type)) {
++				return false;
++			}
++		}
++		return expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ||
++		       expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR;
++	}
++	case ExpressionClass::BOUND_COMPARISON: {
++		switch (expr.GetExpressionType()) {
++		case ExpressionType::COMPARE_EQUAL:
++		case ExpressionType::COMPARE_NOTEQUAL:
++		case ExpressionType::COMPARE_LESSTHAN:
++		case ExpressionType::COMPARE_GREATERTHAN:
++		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++			break;
++		default:
++			return false;
++		}
++		auto &comp = expr.Cast<BoundComparisonExpression>();
++		return (IsDenseMaskColumn(*comp.left, type) && IsDenseMaskConstant(*comp.right, type)) ||
++		       (IsDenseMaskConstant(*comp.left, type) && IsDenseMaskColumn(*comp.right, type));
++	}
++	case ExpressionClass::BOUND_BETWEEN: {
++		auto &between = expr.Cast<BoundBetweenExpression>();
++		return IsDenseMaskColumn(*between.input, type) && IsDenseMaskConstant(*between.lower, type) &&
++		       IsDenseMaskConstant(*between.upper, type);
++	}
++	default:
++		return false;
++	}
++}
++
++template <class T, class OP>
++static void DenseMaskCompare(const T *__restrict values, idx_t count, T constant, uint8_t *__restrict out) {
++	for (idx_t i = 0; i < count; i++) {
++		out[i] = OP::Operation(values[i], constant);
++	}
++}
++
++template <class T>
++static void DenseMaskBetween(const T *__restrict values, idx_t count, T lower, T upper, bool lower_inclusive,
++                             bool upper_inclusive, uint8_t *__restrict out) {
++	if (lower_inclusive && upper_inclusive) {
++		for (idx_t i = 0; i < count; i++) {
++			out[i] = uint8_t(values[i] >= lower) & uint8_t(values[i] <= upper);
++		}
++	} else {
++		for (idx_t i = 0; i < count; i++) {
++			uint8_t lower_ok = lower_inclusive ? values[i] >= lower : values[i] > lower;
++			uint8_t upper_ok = upper_inclusive ? values[i] <= upper : values[i] < upper;
++			out[i] = lower_ok & upper_ok;
++		}
++	}
++}
++
++template <class T>
++static void EvaluateDenseMask(const Expression &expr, const T *values, idx_t count, uint8_t *out) {
++	switch (expr.GetExpressionClass()) {
++	case ExpressionClass::BOUND_CONJUNCTION: {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		bool is_and = expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
++		EvaluateDenseMask<T>(*conj.children[0], values, count, out);
++		uint8_t child_mask[STANDARD_VECTOR_SIZE];
++		for (idx_t c = 1; c < conj.children.size(); c++) {
++			EvaluateDenseMask<T>(*conj.children[c], values, count, child_mask);
++			if (is_and) {
++				for (idx_t i = 0; i < count; i++) {
++					out[i] &= child_mask[i];
++				}
++			} else {
++				for (idx_t i = 0; i < count; i++) {
++					out[i] |= child_mask[i];
++				}
++			}
++		}
++		break;
++	}
++	case ExpressionClass::BOUND_COMPARISON: {
++		auto &comp = expr.Cast<BoundComparisonExpression>();
++		auto type = expr.GetExpressionType();
++		bool constant_left = comp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
++		if (constant_left) {
++			type = FlipComparisonExpression(type);
++		}
++		auto &constant_expr = constant_left ? *comp.left : *comp.right;
++		auto constant = constant_expr.Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++		switch (type) {
++		case ExpressionType::COMPARE_EQUAL:
++			DenseMaskCompare<T, Equals>(values, count, constant, out);
++			break;
++		case ExpressionType::COMPARE_NOTEQUAL:
++			DenseMaskCompare<T, NotEquals>(values, count, constant, out);
++			break;
++		case ExpressionType::COMPARE_LESSTHAN:
++			DenseMaskCompare<T, LessThan>(values, count, constant, out);
++			break;
++		case ExpressionType::COMPARE_GREATERTHAN:
++			DenseMaskCompare<T, GreaterThan>(values, count, constant, out);
++			break;
++		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++			DenseMaskCompare<T, LessThanEquals>(values, count, constant, out);
++			break;
++		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++			DenseMaskCompare<T, GreaterThanEquals>(values, count, constant, out);
++			break;
++		default:
++			throw InternalException("Unsupported comparison in dense mask filter");
++		}
++		break;
++	}
++	case ExpressionClass::BOUND_BETWEEN: {
++		auto &between = expr.Cast<BoundBetweenExpression>();
++		auto lower = between.lower->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++		auto upper = between.upper->Cast<BoundConstantExpression>().value.GetValueUnsafe<T>();
++		DenseMaskBetween<T>(values, count, lower, upper, between.lower_inclusive, between.upper_inclusive, out);
++		break;
++	}
++	default:
++		throw InternalException("Unsupported expression in dense mask filter");
++	}
++}
++
++template <class T>
++static idx_t DenseMaskFilterSelection(const Expression &expr, UnifiedVectorFormat &vdata, const SelectionVector &sel,
++                                      idx_t approved_tuple_count, SelectionVector &result_sel) {
++	auto data = UnifiedVectorFormat::GetData<T>(vdata);
++	T values[STANDARD_VECTOR_SIZE];
++	uint8_t mask[STANDARD_VECTOR_SIZE];
++	// gather the selected values into a dense array
++	for (idx_t i = 0; i < approved_tuple_count; i++) {
++		values[i] = data[vdata.sel->get_index(sel.get_index(i))];
++	}
++	EvaluateDenseMask<T>(expr, values, approved_tuple_count, mask);
++	if (!vdata.validity.AllValid()) {
++		for (idx_t i = 0; i < approved_tuple_count; i++) {
++			mask[i] &= uint8_t(vdata.validity.RowIsValid(vdata.sel->get_index(sel.get_index(i))));
++		}
++	}
++	// build the output selection from the mask
++	idx_t result_count = 0;
++	for (idx_t i = 0; i < approved_tuple_count; i++) {
++		result_sel.set_index(result_count, sel.get_index(i));
++		result_count += mask[i];
++	}
++	return result_count;
++}
++
++static bool TryDenseMaskFilterSelection(const Expression &expr, const LogicalType &type, UnifiedVectorFormat &vdata,
++                                        SelectionVector &sel, idx_t &approved_tuple_count) {
++	if (approved_tuple_count > STANDARD_VECTOR_SIZE || !IsDenseMaskType(type) || !CanEvaluateDenseMask(expr, type)) {
++		return false;
++	}
++	// write the result into a fresh selection vector: the incoming one may be shared
++	SelectionVector result_sel(approved_tuple_count);
++	idx_t result_count;
++	switch (type.InternalType()) {
++	case PhysicalType::INT8:
++		result_count = DenseMaskFilterSelection<int8_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::INT16:
++		result_count = DenseMaskFilterSelection<int16_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::INT32:
++		result_count = DenseMaskFilterSelection<int32_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::INT64:
++		result_count = DenseMaskFilterSelection<int64_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::UINT8:
++		result_count = DenseMaskFilterSelection<uint8_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::UINT16:
++		result_count = DenseMaskFilterSelection<uint16_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::UINT32:
++		result_count = DenseMaskFilterSelection<uint32_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	case PhysicalType::UINT64:
++		result_count = DenseMaskFilterSelection<uint64_t>(expr, vdata, sel, approved_tuple_count, result_sel);
++		break;
++	default:
++		return false;
++	}
++	sel.Initialize(result_sel);
++	approved_tuple_count = result_count;
++	return true;
++}
++
+ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
+                                      const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
+                                      idx_t &approved_tuple_count) {
+@@ -561,6 +811,10 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
+ 		return bloom_filter.Filter(vector, sel, approved_tuple_count, state);
+ 	}
+ 	case TableFilterType::EXPRESSION_FILTER: {
++		auto &expr_filter = filter.Cast<ExpressionFilter>();
++		if (TryDenseMaskFilterSelection(*expr_filter.expr, vector.GetType(), vdata, sel, approved_tuple_count)) {
++			return approved_tuple_count;
++		}
+ 		auto &state = filter_state.Cast<ExpressionFilterState>();
+ 		SelectionVector result_sel(approved_tuple_count);
+ 		if (scan_count > STANDARD_VECTOR_SIZE) {

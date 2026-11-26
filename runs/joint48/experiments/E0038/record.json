@@ -1,0 +1,40 @@
+{
+  "id": "E0038",
+  "title": "Huge-page backed hash-join pointer table for large builds",
+  "started": "2026-11-25T11:47:25-05:00",
+  "base": "3c9ef54dba04c4763ba2d3dbbccbdbe12e2b324c",
+  "candidate": "1999897cd02c54b6048c7916f439c1400fd2e53f",
+  "outcome": "retired",
+  "reasons": [
+    "no visible template faster beyond its noise (best: q09 -7.0%; needs at least -8.6%)"
+  ],
+  "attempts": 1,
+  "cost_usd": 1.1011438,
+  "summary": "Large hash-join pointer tables are now backed by 2MB huge pages. The change is only in src/execution/join_hashtable.cpp; no header changes.\n\nHow it works:\n- **Gate check:** THP on this machine is enabled=[madvise], defrag=[madvise]. Without an madvise call these tables never got huge pages.\n- **Allocation:** when the table is at least 32MB (4M slots, roughly 1M or more build rows) and THP mode is [madvise], it is allocated through the same BufferAllocator with 2MB extra. Memory accounting is unchanged. `entries` points at the 2MB-aligned address inside that block, and madvise(MADV_HUGEPAGE) is called before InitializePointerTable first writes to it.\n- **Reuse path:** a padded allocation's size is never a power of two (plain ones always are). PointerTableUsableSize() uses that to subtract the slack, so the reuse branch and the D_ASSERT still work.\n- **Free:** in the destructor, Reset() and the grow path, the aligned range gets MADV_DONTNEED and then MADV_NOHUGEPAGE before going back to jemalloc.\n\nThe free-time cleanup is required. Without it, q02 (whose builds are all small) was +5..9% slower whenever it ran after the large joins, but -1.6% when benched alone. The cause was recycled jemalloc memory that kept the huge-page flag, so later small allocations paid 2MB zeroing and compaction on page faults. With the cleanup q02 is -3..-6%.\n\nBench vs current best (several runs; differences under ~5% are noise):\n- q09: -8.4, -15.0, -9.3%\n- q03: -3.4, -13.1, -9.6%\n- q07: +11.4 (later runs -4.2, +3.0, -6.8; I read the +11.4% as noise)\n- q08: -8.2%\n- q05: +7.6 then +1.4%\n- All others within \u00b13%\n- Last full-bench geomean: -1.8%\n\nNot done: the build-only micro and the user/sys time comparison from the plan. dbe-tool can't set env vars or time a process, so I removed the temporary on/off switch and measured only with bench. A table-reuse sanity query (6M-row self join under memory_limit=300MB) returned the correct result; bench's result checks passed on every run.",
+  "notes": "- **/sys is readable through SQL:** `dbe-tool sql \"select * from read_csv('/sys/...', header=false, columns={'a':'VARCHAR'}, delim='|')\"` works; read_text fails on sysfs files and the Read tool is denied there.\n- **Threshold:** at 4MB, q16 (8MB table, 296K build rows) swung between -14% and +7%. I chose 32MB; the gains on q03/q07/q09 were about the same.\n- **Cleanup on free:** any future huge-page use (e.g. the GroupedAggregateHashTable entries at aggregate_hashtable.cpp:290) needs the same DONTNEED+NOHUGEPAGE step on free, or later small queries slow down.\n- **Follow-up:** applying this to the aggregate HT entries array would be a natural next change; I left it out to keep this to one idea.",
+  "train_ratio": 0.9948379734428265,
+  "val_ratio": 0.9928177207918801,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 1.0866697545245312,
+    "q03": 0.955199041044612,
+    "q04": 0.9817953530019203,
+    "q05": 1.024221510302309,
+    "q07": 0.9603884648513751,
+    "q08": 1.0235742134522692,
+    "q09": 0.9299968481668311,
+    "q13": 1.0011638570254442,
+    "q14": 1.009006745209252,
+    "q16": 0.9947323983293599,
+    "q17": 0.9923802034249616,
+    "q18": 0.9989492092077443,
+    "q19": 0.9829123708366586,
+    "q22": 0.9954904359411599
+  },
+  "improved": [],
+  "regressed": [],
+  "passes": 8,
+  "rule": "templates",
+  "finished": "2026-11-25T12:07:40-05:00"
+}

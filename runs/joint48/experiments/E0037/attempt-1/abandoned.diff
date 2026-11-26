@@ -1,0 +1,114 @@
+diff --git a/src/execution/join_hashtable.cpp b/src/execution/join_hashtable.cpp
+index 5254081..0567ece 100644
+--- a/src/execution/join_hashtable.cpp
++++ b/src/execution/join_hashtable.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/join_hashtable.hpp"
+ 
++#include "duckdb/common/bit_utils.hpp"
+ #include "duckdb/common/enums/join_type.hpp"
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/radix_partitioning.hpp"
+@@ -143,7 +144,8 @@ void JoinHashTable::Merge(JoinHashTable &other) {
+ 	sink_collection->Combine(*other.sink_collection);
+ }
+ 
+-static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const idx_t &count, const idx_t &bitmask) {
++static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const idx_t &count, const idx_t &bitmask,
++                                        const idx_t &slot_shift) {
+ 	if (hashes_v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+ 		auto &hash = *ConstantVector::GetData<hash_t>(hashes_v);
+ 		salt_v.SetVectorType(VectorType::CONSTANT_VECTOR);
+@@ -151,7 +153,7 @@ static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const
+ 		*ConstantVector::GetData<hash_t>(salt_v) = ht_entry_t::ExtractSalt(hash);
+ 		salt_v.Flatten(count);
+ 
+-		hash = hash & bitmask;
++		hash = (hash >> slot_shift) & bitmask;
+ 		hashes_v.Flatten(count);
+ 	} else {
+ 		hashes_v.Flatten(count);
+@@ -159,7 +161,7 @@ static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const
+ 		auto hashes = FlatVector::GetData<hash_t>(hashes_v);
+ 		for (idx_t i = 0; i < count; i++) {
+ 			salts[i] = ht_entry_t::ExtractSalt(hashes[i]);
+-			hashes[i] &= bitmask;
++			hashes[i] = (hashes[i] >> slot_shift) & bitmask;
+ 		}
+ 	}
+ }
+@@ -273,6 +275,18 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
+ 		VectorOperations::Copy(hashes_v, state.hashes_dense_v, count, 0, 0);
+ 	}
+ 
++	if (ht.slot_shift != 0) {
++		// move the slot bits down to the low bits (keeping the salt intact), so that the probe loop below
++		// can derive the slot with the bitmask only, exactly like it does for linear-probing continuations
++		auto hashes_dense = FlatVector::GetData<hash_t>(state.hashes_dense_v);
++		const auto shift = ht.slot_shift;
++		const auto bitmask = ht.bitmask;
++		for (idx_t i = 0; i < count; i++) {
++			const auto hash = hashes_dense[i];
++			hashes_dense[i] = (hash & ht_entry_t::SALT_MASK) | ((hash >> shift) & bitmask);
++		}
++	}
++
+ 	// the number of keys that match for all iterations of the following loop
+ 	idx_t match_count = 0;
+ 
+@@ -592,7 +606,7 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
+                              JoinHashTable::InsertState &state, const TupleDataCollection &data_collection,
+                              JoinHashTable &ht) {
+ 	D_ASSERT(hashes_v.GetType().id() == LogicalType::HASH);
+-	ApplyBitmaskAndGetSaltBuild(hashes_v, state.salt_v, count, ht.bitmask);
++	ApplyBitmaskAndGetSaltBuild(hashes_v, state.salt_v, count, ht.bitmask, ht.slot_shift);
+ 
+ 	const auto &layout = data_collection.GetLayout();
+ 
+@@ -815,6 +829,12 @@ void JoinHashTable::AllocatePointerTable() {
+ 	D_ASSERT(hash_map.GetSize() == capacity * sizeof(ht_entry_t));
+ 
+ 	bitmask = capacity - 1;
++	slot_shift = 0;
++	if (high_bit_slots) {
++		// take the log2(capacity) hash bits just below the 16 salt bits (same bits the radix partitioning uses)
++		const idx_t capacity_bits = CountZeros<uint64_t>::Trailing(capacity);
++		slot_shift = capacity_bits < 48 ? 48 - capacity_bits : 0;
++	}
+ 
+ 	DUCKDB_LOG(context, PhysicalOperatorLogType, op, "JoinHashTable", "Build",
+ 	           {{"rows", to_string(data_collection->Count())},
+@@ -1608,6 +1628,7 @@ idx_t JoinHashTable::GetRemainingSize() const {
+ 
+ void JoinHashTable::Unpartition() {
+ 	data_collection = sink_collection->GetUnpartitioned();
++	high_bit_slots = true;
+ }
+ 
+ void JoinHashTable::SetRepartitionRadixBits(const idx_t max_ht_size, const idx_t max_partition_size,
+@@ -1676,6 +1697,8 @@ void JoinHashTable::Reset() {
+ }
+ 
+ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
++	// a round holds only a subset of the partitions: high-bit slots would cluster, use the low bits
++	high_bit_slots = false;
+ 	if (finalized) {
+ 		Reset();
+ 	}
+diff --git a/src/include/duckdb/execution/join_hashtable.hpp b/src/include/duckdb/execution/join_hashtable.hpp
+index 942997d..c50810b 100644
+--- a/src/include/duckdb/execution/join_hashtable.hpp
++++ b/src/include/duckdb/execution/join_hashtable.hpp
+@@ -280,6 +280,12 @@ public:
+ 	bool has_null;
+ 	//! Bitmask for getting relevant bits from the hashes to determine the position
+ 	uint64_t bitmask = DConstants::INVALID_INDEX;
++	//! Right shift applied to hashes before the bitmask (0 = slot from the low hash bits). When all partitions are
++	//! in the table at once, slots come from the high bits below the salt, so that each radix partition (which is
++	//! stored contiguously in the data collection) inserts into its own contiguous region of the pointer table
++	idx_t slot_shift = 0;
++	//! Whether the pointer table is built over all partitions at once (in-memory join)
++	bool high_bit_slots = false;
+ 	//! Whether or not we error on multiple rows found per match in a SINGLE join
+ 	bool single_join_error_on_multiple_rows = true;
+ 	//! Whether or not to perform deduplication based on join_keys when building ht

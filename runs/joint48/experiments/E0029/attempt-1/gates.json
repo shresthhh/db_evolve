@@ -1,0 +1,22 @@
+{
+  "path_policy": [],
+  "static_audit": [],
+  "build": true,
+  "correctness": {
+    "ok": true,
+    "visible": [],
+    "hidden": {}
+  },
+  "smoke": [],
+  "review": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "physical_hash_join.cpp FinalizeFilters/CanUseBloomFilter: perfect hash tables now get only an exact, sparse-only bloom filter (count*4 <= range+1) and never a hashed one; both places that call CanUseBloomFilter are gated on is_perfect_hashtable. These are generic conditions (integer key, sparse build) with nothing tied to the workload.",
+      "perfect_hash_join_executor.cpp FillExactBloomFilter: the serial path builds the perfect table (BuildPerfectHashTable) before FinalizeFilters, and the parallel path fills the filter after FinishBuild and only when use_perfect_hash is set, so the bitmap is complete when it is read. Keys are widened the same way as TemplatedInsertExact. If the minimum from column statistics differs from the observed build minimum, InsertExact sets exact_overflow and the filter passes every row, so results stay correct. NULL keys never occupy a slot. Unsupported key types return false without pushing anything.",
+      "bitpacking.cpp BitpackingSelect: after LoadNextGroup, safe_end equals the start of the current group's metadata entry, and all packed data lies below every metadata entry, so the fixed 8-byte read stays inside the segment. Any metadata bytes it picks up are removed by the mask. The bit offset group_pos*width matches the old per-block calculation because each 32-value block is 4*width bytes and byte-aligned. Values near the bound fall back to the old extract.",
+      "Not blocking: the author did not run the width 1..56 sweep on an ATTACHed database or test negative keys through a scan probe; the code reasoning covers both cases."
+    ],
+    "required_changes": []
+  }
+}

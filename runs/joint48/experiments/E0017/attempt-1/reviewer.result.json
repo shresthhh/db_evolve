@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "output": {
+    "verdict": "approve",
+    "benchmark_specific": false,
+    "findings": [
+      "src/optimizer/compressed_materialization/compress_comparison_join.cpp: the change removes the path that compressed both key columns of a single-condition join. Keys now take the same path that multi-condition joins, DELIM joins and joins with non-colref conditions already used, so it cannot produce wrong results. It also doesn't check for any particular query, table or literal. The reason is a general planner interaction: the compress projection on the probe side gives the key a storage offset, and with that offset set the hash join never pushes its Bloom filter down to the probe scan.",
+      "Minor leftover: probe_compress_bindings is now always empty, so the loop that checks it marks every probe binding as referenced unconditionally. UpdateComparisonJoinStats now writes back the same, unchanged key stats. Both are harmless leftovers that could be simplified later. They don't justify a rejection.",
+      "Trade-off: hash tables keep 8-byte keys instead of compressed 4-byte keys, which may cost memory on very large builds. Build-side payload compression is kept, and upstream DuckDB has made the same call on this kind of trade-off. This does not move cost elsewhere."
+    ],
+    "required_changes": []
+  },
+  "text": "{\"verdict\":\"approve\",\"benchmark_specific\":false,\"findings\":[\"src/optimizer/compressed_materialization/compress_comparison_join.cpp: the change removes the path that compressed both key columns of a single-condition join. Keys now take the same path that multi-condition joins, DELIM joins and joins with non-colref conditions already used, so it cannot produce wrong results. It also doesn't check for any particular query, table or literal. The reason is a general planner interaction: the compress projection on the probe side gives the key a storage offset, and with that offset set the hash join never pushes its Bloom filter down to the probe scan.\",\"Minor leftover: probe_compress_bindings is now always empty, so the loop that checks it marks every probe binding as referenced unconditionally. UpdateComparisonJoinStats now writes back the same, unchanged key stats. Both are harmless leftovers that could be simplified later. They don't justify a rejection.\",\"Trade-off: hash tables keep 8-byte keys instead of compressed 4-byte keys, which may cost memory on very large builds. Build-side payload compression is kept, and upstream DuckDB has made the same call on this kind of trade-off. This does not move cost elsewhere.\"],\"required_changes\":[]}",
+  "cost_usd": 0.1088624,
+  "seconds": 19.913572072982788,
+  "error": ""
+}

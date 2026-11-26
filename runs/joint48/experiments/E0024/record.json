@@ -1,0 +1,40 @@
+{
+  "id": "E0024",
+  "title": "Parallel perfect-HJ build + dense INNER builds up to 4M range",
+  "started": "2026-11-24T22:24:03-05:00",
+  "base": "eaec16e1b34486da55a3945138b35dc66e2b8daf",
+  "candidate": "3145ec5c2755703a486765dfeac0382578496d96",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 2.9897732,
+  "summary": "The perfect hash join build now runs in parallel for builds with at least 64k rows, and INNER joins with a key range up to 4M now qualify when the keys fill at least half the range.\n\nWhat I changed:\n1. **Parallel key pass.** PerfectHashJoinExecutor::BuildPerfectHashTable allocates the table, an atomic key bitmap and a slot\u2192row address array. A new PerfectHashJoinBuildEvent, scheduled from PhysicalHashJoin::Finalize, runs tasks over ranges of 16 hash-table chunks. Each task reads the key column, sets the key's bit with an atomic `fetch_or`, flags a duplicate if the bit was already set, and records the row address for the slot.\n2. **Decision in FinishEvent.** FinishBuild copies the atomic bitmap into bitmap_build_idx, sets the dense flag and prepares the payload validity masks.\n   - The join filters (FinalizeFilters) are now created at this point, once the perfect-or-not decision is known. The min/max chunk is held in the sink until then.\n   - If a duplicate key was found, the join falls back to the regular `sink.ScheduleFinalize(*pipeline, *this)`, the same way HashJoinRepartitionEvent already does.\n   - Otherwise a second event gathers the payload over slot ranges of 131072 (a multiple of 64), so tasks never share a validity word.\n3. **RIGHT joins.** FlushFoundMatch uses the slot\u2192row array on the parallel path.\n4. **CanDoPerfectHashJoin.** I dropped the `!PropagatesBuildSide(op.join_type) ||` term, so INNER joins now take the existing \u226550% density rule for ranges up to 4M.\n\nBuilds under 64k rows still take the unchanged serial path.\n\nMeasured: I timed the serial build on a 2M-key dense build with a VARCHAR payload. ScanKeyColumn took 43\u201350ms, the selection fill plus duplicate check about 35ms, and the payload gather only about 13ms. Parallelising only the gather, as the issue proposed, left q14 33\u201347% slower once INNER builds were allowed. That is why the key pass is parallel too.\n\nBench with the final version, against the current best:\n- **q14:** \u22126.9%, \u22127.2%, \u22127.3% in three targeted runs, and \u221223.4% in one full-bench run. Another full-bench run showed q14 at +22.5%, but four reruns right after came back at \u22127% (138\u2013144ms against a best of 147\u2013181ms), so I treat that one as noise.\n- **q13:** \u22122.9% to \u22127.5%.\n- **Full bench:** geomean \u22123.3% in the second full run. Everything else stayed within \u00b15%, apart from q03 (+5.6% and +10.8% in two runs) and q02 (+6.5% once). As far as I can tell neither of those joins can take the perfect path, so I read them as noise.\n\nCorrectness: on the benchmark DB I compared each query against the same query with an extra `o_custkey+1 = b.k+1` condition, which forces the regular hash join. All results matched for:\n- an INNER join on a 3M-key dense build with NULL and VARCHAR payloads;\n- a RIGHT join on a build at 2/3 density with NULL keys and NULL VARCHAR payloads;\n- an INNER join with a duplicate key, which exercises the fallback.",
+  "notes": "- Dead end: the issue assumed the payload gather was the serial cost. Timing showed it is only ~15% of the serial build; ScanKeyColumn and the per-row duplicate/selection fill were 80\u201390ms for 2M rows. Parallelising only the gather made q14 +33\u201347% slower once INNER builds up to 4M were allowed.\n- The parallel build only works because FinalizeFilters is deferred to the build event's FinishEvent (`sink.perfect_filter_min_max`). Without that, builds that turn out to have duplicates would lose their bloom filter on the fallback.\n- Benchmark noise: q14 swung between +22% and \u221223% across full-bench runs, while targeted reruns were a steady \u22127%.\n- Follow-ups:\n  - q13 (RIGHT perfect join on customer) may gain more; the found-match flush is still a serial pass over all slots and could be parallelised by slot range.\n  - The probe-side scan still emits rows in range that match no key for 50\u201399% dense INNER builds. An exact bitmap filter could be pushed for perfect joins (the bitmap is already built), which could also cover q14's 2M dense build.",
+  "train_ratio": 0.9959999788834067,
+  "val_ratio": 1.000884219391954,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.9407902291668336,
+    "q03": 1.0123873059252924,
+    "q04": 1.0111560101159542,
+    "q05": 1.0113364883018032,
+    "q07": 0.9815258708143085,
+    "q08": 1.0169750734671767,
+    "q09": 1.013933552020966,
+    "q13": 0.9779572123260131,
+    "q14": 0.9315849258487845,
+    "q16": 0.9855928720987565,
+    "q17": 1.0068182540028772,
+    "q18": 1.0117692544205958,
+    "q19": 1.034425912581978,
+    "q22": 1.0136403992627536
+  },
+  "improved": [
+    "q14"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T22:47:14-05:00"
+}

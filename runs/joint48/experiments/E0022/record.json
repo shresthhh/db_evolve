@@ -1,0 +1,43 @@
+{
+  "id": "E0022",
+  "title": "Exact BF bitmap for small absolute key ranges",
+  "started": "2026-11-24T21:48:12-05:00",
+  "base": "2be9455ffdefd50e9428320e500c9fbf4a7ac631",
+  "candidate": "3d2dd57e2ad75df7944533413fe0ca1b57eecb8c",
+  "outcome": "accepted",
+  "reasons": [],
+  "attempts": 1,
+  "cost_usd": 0.37165679999999995,
+  "summary": "I changed one function, TrySetExactBloomFilter in src/execution/operator/join/physical_hash_join.cpp. I added EXACT_BF_SMALL_RANGE = 1<<22. The key range cap is now max(count*128, 1<<22), and EXACT_BF_MAX_RANGE still bounds it. So any integer join key whose range is under about 4M values gets an exact bitmap (at most 512KB), however few keys the build side has. Before this, a small selective build side was capped at 128 bits per key, so its filter stayed hashed and let many false positives through. I checked the bitmap code in planner/filter/bloom_filter.cpp: it makes one shared allocation and one fill, not one per thread. The build passed (BUILD OK). The full bench matched the current best's results and ran 10.2% faster on the geomean: q17 -36.8%, q19 -35.3%, q08 -19.5%, q02 -18.9%, q13 -8.1%. The worst change was q07 at +1.5%, which is noise. I did not run the JSON profile the plan asked for, so I have not directly confirmed the drop in lineitem scan rows on q17; the evidence is the bench timings. Correctness checks: a 3-key build over a 4,194,303 range with a negative key and keys at both ends returned the expected 3 rows and sum. A 43-key build over a range of about 4.19M, probed with 9M rows, matched the result with SET disabled_optimizers='join_filter_pushdown'.",
+  "notes": "The gains were larger than the issue predicted: q19 and q02 also moved to exact mode, not just q17 and q08. A possible follow-up is raising the small-range limit to 1<<24 (2MB) for larger datasets, where dimension key ranges grow with the scale factor. That would need a check of L2-miss cost when the probe hit rate is low.",
+  "train_ratio": 0.9011824807102738,
+  "val_ratio": 0.9898897108123483,
+  "val_ok": true,
+  "required_gain": 0.05,
+  "train_template_ratios": {
+    "q02": 0.7460453418201349,
+    "q03": 1.0413869777127385,
+    "q04": 0.9384383121262079,
+    "q05": 0.9924424597225743,
+    "q07": 0.9718614735847301,
+    "q08": 0.8342943341565581,
+    "q09": 0.9952605813441213,
+    "q13": 0.9974975140663389,
+    "q14": 0.9849652482501509,
+    "q16": 0.9683308041022268,
+    "q17": 0.6341872360465288,
+    "q18": 0.9746584304946444,
+    "q19": 0.6780952044768561,
+    "q22": 1.0007195337129502
+  },
+  "improved": [
+    "q02",
+    "q08",
+    "q17",
+    "q19"
+  ],
+  "regressed": [],
+  "passes": 4,
+  "rule": "templates",
+  "finished": "2026-11-24T21:58:10-05:00"
+}
