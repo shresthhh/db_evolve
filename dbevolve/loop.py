@@ -137,6 +137,8 @@ class Loop:
         prompt = prompt.replace("{{budget}}", f"{budget:.2f}")
         res = self.agent.run(role, prompt, self.slot, schema, budget, log_dir, writable=writable)
         self.run.state["cost_usd"] += res.cost_usd
+        if getattr(res, "billing", "plan") == "api":   # real spend on the fallback key
+            self.run.state["api_cost_usd"] = self.run.state.get("api_cost_usd", 0.0) + res.cost_usd
         self.run.save()
         return res
 

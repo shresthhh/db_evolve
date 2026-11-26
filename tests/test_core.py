@@ -174,3 +174,15 @@ def test_usage_limit_message_pauses_until_the_stated_reset():
     late = datetime.datetime(2026, 11, 19, 23, 0, tzinfo=ZoneInfo("America/New_York"))
     assert usage_limit_pause(msg, late) == (16 * 60 + 40) * 60 + 180  # next day
     assert usage_limit_pause('{"result": "ok"}') is None
+
+
+def test_api_key_fallback_only_after_a_usage_limit(monkeypatch, tmp_path):
+    from dbevolve import agents
+    monkeypatch.setattr(agents, "KEY_FILE", tmp_path / "none")
+    monkeypatch.delenv("DBE_FALLBACK_API_KEY", raising=False)
+    monkeypatch.setattr(agents, "_api_until", 0.0)
+    assert agents.fallback_api_key() is None and not agents._on_api()
+    monkeypatch.setenv("DBE_FALLBACK_API_KEY", "sk-test")
+    assert not agents._on_api()                      # key present, but no limit hit yet
+    monkeypatch.setattr(agents, "_api_until", agents.time.time() + 60)
+    assert agents._on_api()

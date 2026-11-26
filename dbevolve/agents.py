@@ -28,6 +28,7 @@ class AgentResult:
     cost_usd: float = 0.0
     seconds: float = 0.0
     error: str = ""
+    billing: str = "plan"                         # "plan" (subscription) or "api" (fallback key)
 
 
 class ClaudeCLI:
@@ -53,30 +54,59 @@ class ClaudeCLI:
         if writable:
             cmd += ["--permission-mode", "acceptEdits"]
         env = dict(os.environ, DBE_SLOT=str(cwd), DBE_CONFIG=str(self.cfg.path))
+        env.pop("ANTHROPIC_API_KEY", None)   # plan login by default; the key is only a fallback
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / f"{role}.prompt.md").write_text(prompt)
         start = time.time()
         waited = 0.0
         while True:
+            api = _on_api()
+            run_env = dict(env, ANTHROPIC_API_KEY=fallback_api_key()) if api else env
             try:
-                p = subprocess.run(cmd, input=prompt, cwd=cwd, env=env, text=True, capture_output=True,
+                p = subprocess.run(cmd, input=prompt, cwd=cwd, env=run_env, text=True, capture_output=True,
                                    timeout=self.a["timeout_s"])
                 stdout, stderr = p.stdout, p.stderr
             except subprocess.TimeoutExpired as e:
                 return AgentResult(False, error=f"agent timed out after {self.a['timeout_s']}s",
                                    seconds=time.time() - start, text=str(e.stdout or "")[-2000:])
-            pause = usage_limit_pause(f"{stdout}\n{stderr}")
+            pause = None if api else usage_limit_pause(f"{stdout}\n{stderr}")
             if pause is None or waited > 48 * 3600:
                 break
-            log(f"{role}: plan usage limit hit; waiting {pause / 60:.0f} min for the reset, then retrying")
-            sleep_wall(pause)
-            waited += pause
+            if fallback_api_key():
+                global _api_until
+                _api_until = time.time() + pause
+                log(f"{role}: plan usage limit hit; using the API key for {pause / 60:.0f} min "
+                    f"until the reset, then back to the plan")
+            else:
+                log(f"{role}: plan usage limit hit; waiting {pause / 60:.0f} min for the reset, then retrying")
+                sleep_wall(pause)
+                waited += pause
             start = time.time()
         (log_dir / f"{role}.raw.json").write_text(stdout or "")
         res = parse_cli_output(stdout, stderr)
         res.seconds = time.time() - start
+        if api:
+            res.billing = "api"
+            log(f"{role}: billed to the API key: ${res.cost_usd:.2f}")
         write_json(log_dir / f"{role}.result.json", res.__dict__)
         return res
+
+
+_api_until = 0.0   # wall-clock time until which agent calls go to the fallback API key
+KEY_FILE = Path.home() / ".config" / "db_evolve" / "anthropic_api_key"
+
+
+def fallback_api_key() -> str | None:
+    """The Anthropic API key used only while the plan is rate-limited: $DBE_FALLBACK_API_KEY, or
+    the file ~/.config/db_evolve/anthropic_api_key (keep it chmod 600). Never written to logs."""
+    key = os.environ.get("DBE_FALLBACK_API_KEY", "").strip()
+    if not key and KEY_FILE.is_file():
+        key = KEY_FILE.read_text().strip()
+    return key or None
+
+
+def _on_api() -> bool:
+    return bool(fallback_api_key()) and time.time() < _api_until
 
 
 _LIMIT = re.compile(r"hit your [^\n]*?limit", re.I)
