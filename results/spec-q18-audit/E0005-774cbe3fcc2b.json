@@ -1,0 +1,53 @@
+{
+  "id": "E0005",
+  "sha": "774cbe3fcc2b0a76c499ec5bd0908a2cbcb0039e",
+  "subject": "E0005: Zonemap-prunable join key-set filter through compressed-materialization projections",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 131,
+    "removed_lines": 17,
+    "conditions": 16,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"__internal_compress_integral_\"",
+      "\"duckdb/common/operator/add.hpp\"",
+      "\"duckdb/planner/expression/bound_constant_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_function_expression.hpp\"",
+      "\"duckdb/planner/filter/conjunction_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.1113775888141142,
+  "accepted_faster": {
+    "q18": 1.11
+  },
+  "audit": {
+    "mechanism": "When a hash join finishes its build side, DuckDB can push a filter built from the build keys into the probe-side table scan. That filter is used only for zonemap (row-group min/max) pruning. The change widens this in two ways.\n\n(A) The pushdown used to stop when the probe key was wrapped in compressed materialization's `__internal_compress_integral_*(x, min)` projection, which computes `x - min`. It now passes through that projection, records `min` as `storage_offset`, and adds the offset back to every key (in HUGEINT, with an overflow check) before casting to the storage type. This applies to both the min/max filters and the IN filter. The bloom filter is turned off whenever an offset is present.\n\n(B) Before, the IN-list zonemap filter was built only when the build side had at most `dynamic_or_filter_threshold` (default 50) rows. Now the keys are scanned when the build side has up to 64\u00d7threshold rows. If there are at most threshold distinct keys after the cast, the old IN filter is produced. If there are more and the storage type is integral, the sorted distinct keys are split at the threshold\u22121 largest gaps. The result is pushed as an `OptionalFilter` (zonemap pruning only, never row filtering) holding an OR of at most `threshold` ranges `[lo,hi]`, with a single-key range becoming an equality.",
+    "trigger": "(A) The optimizer walks the probe expression. The new step is taken for a BOUND_FUNCTION when `StringUtil::StartsWith(func.function.name, \"__internal_compress_integral_\")`, `func.children.size() == 2`, no offset has been recorded yet (`!filter.storage_offset.IsNull()` \u2192 reject), `func.children[1]` is a BOUND_CONSTANT that is not NULL, and both input and output are integral with an input of at most 64 bits (`GetTypeIdSize(src.InternalType()) > GetTypeIdSize(PhysicalType::INT64)` \u2192 reject). The walk then continues into the child, which must still reach a LogicalGet column (src/optimizer/join_filter_pushdown_optimizer.cpp:55-75). Through a UNION the offset is copied to each child (line 130). At run time a key is dropped from the filter if the HUGEINT add overflows or the try-cast to the storage type fails (physical_hash_join.cpp:717-735).\n\n(B) `CanUseInFilter` (physical_hash_join.cpp:740-749) needs `ht->Count() > 1`, an equality join (`cmp == COMPARE_EQUAL`), and `(ht->Count()+63)/64 <= dynamic_or_filter_threshold`, i.e. at most 3200 build rows (rows, not distinct keys). `PushInFilter` still bails out if the key list contains NULL or the keys form a dense range (line 779, `ContainsNull || IsDenseRange`). If the number of distinct keys is `<= max_filter_count`, an IN filter is built as before (line 785). Otherwise ranges are built only when `max_filter_count >= 2`, `storage_type.IsIntegral()`, the type is not UHUGEINT, and `in_list[0].type() == storage_type` (line 792). Every range endpoint must cast back to the storage type (line 825). The result is always wrapped as `make_uniq<OptionalFilter>` (line 845).",
+    "constants": "`dynamic_or_filter_threshold` = 50 (src/common/settings.json:452-456, `\"default_value\": \"50\"`) is an existing DuckDB setting and is not changed. It is reused here for a second purpose, as the maximum number of ranges. That choice is convenient, not derived; the author notes \"That would need its own constant\".\n\n`JOIN_FILTER_RANGE_SET_FACTOR = 64` (physical_hash_join.cpp:738) is a round power of two with no stated derivation beyond \"so that scanning the keys stays cheap\". Together they cap the build side at 3200 rows. On q18 the build side is roughly 100 keys (author: \"about 111 keys\"), so any factor of 3 or more would have triggered. The constant is not finely fitted to q18, but nothing measured supports 64 either.\n\nJust outside the cap (3201 or more build rows, counting duplicates) no IN or range filter is pushed at all. Only the min/max filter and possibly the bloom filter remain, which is the old behaviour. With exactly threshold+1 distinct keys the result is 50 ranges, at least one of them covering 2 keys. Choosing the largest gaps is a standard greedy that is optimal for minimising the total covered span with k intervals, not a workload-specific rule.\n\nPart (A) has no tuned constants; its only limits are the \u226464-bit integral input and a single offset.",
+    "natural_class": "(A) Any join whose probe key is an integer column that compressed materialization rewrites into `x - min` (it does this when statistics show a narrow range and it materializes through an ORDER BY, aggregate or join). Such joins now get min/max and IN zonemap filters at all, where before they got none.\n\n(B) Any equality hash join with an integral probe key and between threshold+1 distinct keys and 3200 build rows, where the keys are not dense. The pruning only pays off when the probe table is physically clustered on the join key, so that row-group zonemaps are narrow; on unclustered data the ranges prune nothing and the only cost is building them.\n\nExamples outside TPCH:\n- `SELECT e.* FROM events e JOIN (SELECT session_id FROM sessions WHERE flagged GROUP BY session_id HAVING count(*) > 5) s ON e.session_id = s.session_id;` with `events` loaded in `session_id` order and a few hundred flagged sessions.\n- `SELECT l.* FROM log_rows l WHERE l.batch_id IN (SELECT batch_id FROM batches WHERE status = 'failed' ORDER BY batch_id);` with `log_rows` appended in `batch_id` order and 50 to 3000 failed batches.",
+    "fallback": "If (A)'s conditions fail, the optimizer returns false as before and no join filter is pushed for that column. Columns without an offset go through `CastJoinFilterValueToStorage`, which then does exactly the old `DefaultTryCastAs(storage_type)`, so behaviour is unchanged.\n\nFor (B), builds with more than 3200 rows, non-equality joins, NULL or dense keys, and non-integral or UHUGEINT storage push no IN or range filter. That is the same result as before for all sizes above 50, except that non-integral keys between 51 and 3200 rows are now scanned before the bail-out, which is wasted work. Builds with at most 50 distinct keys get the old IN filter.\n\nOne behaviour change also covers previously handled cases: the bloom filter is skipped whenever an offset is present. Before, such columns got no pushdown at all, so this loses nothing compared with the old code. Since every new filter is optional (zonemap only), results cannot change; only pruning differs.",
+    "label": "heuristic",
+    "label_reason": "Part (A) is a principled generalization. It removes a blind spot where compressed materialization's `x - min` projection blocked join-filter pushdown, and it is gated only by type conditions.\n\nPart (B) is a standard idea: a range-set or zonemap filter built from the build keys by greedy largest-gap splitting. It contains nothing tied to TPCH's schema or query text. Its gate, however, is an ad-hoc constant (64\u00d7 a reused threshold of 50, so 3200 build rows), it reuses the IN-list setting as a range budget, and it only pays off on probe tables clustered on the key, as lineitem and orders are on orderkey. It would plausibly be accepted upstream with its own setting and better-justified limits, so the overall label is \"heuristic\" rather than \"general\".",
+    "citations": [
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:58 `if (!StringUtil::StartsWith(func.function.name, \"__internal_compress_integral_\") || func.children.size() != 2 || !filter.storage_offset.IsNull())`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:74 `filter.storage_offset = offset;`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:130 `new_col.storage_offset = child_column.storage_offset;`",
+      "src/function/scalar/compressed_materialization/compress_integral.cpp:21 `return UnsafeNumericCast<RESULT_TYPE>(input - min_val);`",
+      "src/execution/operator/join/physical_hash_join.cpp:717 `static bool CastJoinFilterValueToStorage(Value &value, const JoinFilterPushdownColumn &column)`",
+      "src/execution/operator/join/physical_hash_join.cpp:738 `static constexpr idx_t JOIN_FILTER_RANGE_SET_FACTOR = 64;`",
+      "src/execution/operator/join/physical_hash_join.cpp:747 `return (ht->Count() + JOIN_FILTER_RANGE_SET_FACTOR - 1) / JOIN_FILTER_RANGE_SET_FACTOR <= dynamic_or_filter_threshold;`",
+      "src/execution/operator/join/physical_hash_join.cpp:779 `if (FilterCombiner::ContainsNull(in_list) || FilterCombiner::IsDenseRange(in_list)) {`",
+      "src/execution/operator/join/physical_hash_join.cpp:785 `if (in_list.size() <= max_filter_count) {`",
+      "src/execution/operator/join/physical_hash_join.cpp:792 `if (max_filter_count < 2 || !storage_type.IsIntegral() || storage_type.id() == LogicalTypeId::UHUGEINT ||`",
+      "src/execution/operator/join/physical_hash_join.cpp:807 `const idx_t split_count = max_filter_count - 1;`",
+      "src/execution/operator/join/physical_hash_join.cpp:845 `auto filter = make_uniq<OptionalFilter>(std::move(child_filter));`",
+      "src/execution/operator/join/physical_hash_join.cpp:983 `bool has_cast = condition_type != pushdown_column.storage_type || !pushdown_column.storage_offset.IsNull();`",
+      "src/common/settings.json:456 `\"default_value\": \"50\"` (dynamic_or_filter_threshold)"
+    ]
+  },
+  "audit_cost_usd": 0.22363519999999998
+}

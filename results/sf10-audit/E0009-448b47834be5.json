@@ -1,0 +1,58 @@
+{
+  "id": "E0009",
+  "sha": "448b47834be52cbdbddede51fed8b782d1dc1897",
+  "subject": "E0009: Per-key bloom filter for multi-key joins, revived for the post-E0008 q09 plan",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/join_hashtable.hpp",
+    "src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp"
+  ],
+  "static": {
+    "added_lines": 107,
+    "removed_lines": 39,
+    "conditions": 9,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0117880190509019,
+  "accepted_faster": {
+    "q05": 1.06,
+    "q09": 1.27
+  },
+  "alone": {
+    "geomean": 1.0032719090378752,
+    "faster": {
+      "q03": 1.09,
+      "q20": 1.05
+    },
+    "slower": {
+      "q02": 0.95
+    }
+  },
+  "audit": {
+    "mechanism": "Before this change, DuckDB's hash join pushed a runtime bloom filter into the probe-side scan only for single-key equality joins. The filter was filled from the row hash of the hash table. Now a multi-key equi-join can build a separate bloom filter for each equality key. While the hash table is finalized, it gathers that key column from the build rows, hashes it on its own with VectorOperations::Hash (the same function the probe-side BFTableFilter uses), and fills the filter. After the build completes, the filter is pushed into the probe table scan as a single-column `col IN BF(...)` filter. Each per-key filter is a necessary condition for a match, so probe rows are pruned early, before the multi-key hash probe. Each filter is still wrapped in the existing SelectivityOptionalFilter, which switches off at runtime if it does not filter enough.",
+    "trigger": "All of the following must hold, per key, in FinalizeFilters and CanUseBloomFilter (src/execution/operator/join/physical_hash_join.cpp):\n(1) The existing join-filter-pushdown machinery already found a probe-side table scan column for the join condition, and the column needs no cast: `bool has_cast = condition_type != pushdown_column.storage_type;` and `if (!has_cast && ht && deferred_bloom_filters && CanUseBloomFilter(...))` (physical_hash_join.cpp:910-913).\n(2) The join does not use a perfect hash table: `if (is_perfect_hashtable) { return false; }` (:770).\n(3) The hash table conditions match the operator conditions: `ht->conditions.size() != op.conditions.size()` returns false (:777).\n(4) The key is an equality condition: `condition.comparison == ExpressionType::COMPARE_EQUAL` (:781).\n(5) New for multi-key joins: the key type is not nested, and the join has fewer than 2 per-key filters so far: `!condition.left->return_type.IsNested() && (ht->HasBloomFilter(cond_idx) || ht->BloomFilterCount() < MAX_KEY_BLOOM_FILTERS)` with `MAX_KEY_BLOOM_FILTERS = 2` (:784-786).\n(6) Unchanged pre-existing gates: the build side has a filter (`build_side_has_filter`, set from `IsFiltering(join.children[...])` in join_filter_pushdown_optimizer.cpp:305/307), and the estimated probe cardinality is larger than the build count, `build_to_probe_ratio > 1.0` (:791-796).\nAt build time, the per-key filling runs only when `conditions.size() > 1` (join_hashtable.cpp:816-836). Single-key joins keep the old path: `conditions.size() == 1 && HasBloomFilter(0)` (join_hashtable.cpp:747).",
+    "constants": "MAX_KEY_BLOOM_FILTERS = 2 (physical_hash_join.cpp:784). This is a budget the author picked to cap extra build-side work. It is not derived from hardware or from the literature. It happens to equal the number of keys in the q09 partsupp join (ps_partkey, ps_suppkey), so every 2-key join gets a filter on both keys. With 3 or more keys, only the first two pushable keys (in condition/probe-info order) get a filter, and the rest get none. It is an arbitrary cap, not a tuned value: q09 would behave the same with any cap of 2 or more. The other constants are pre-existing and unchanged: ratio > 1.0 (:793), and the SelectivityOptionalFilter values BF_THRESHOLD = 0.25 and BF_CHECK_N = 75 (selectivity_optional_filter.hpp:52-53). The runtime selectivity check means a filter on an unselective key (for example l_suppkey in q09) should disable itself, but the author did not measure whether it does.",
+    "natural_class": "Any multi-column equi-join that meets all of these conditions:\n- the build side is filtered;\n- the build side is smaller than the probe side;\n- at least one key column of a probe-side base-table scan is selective given the build-side filter;\n- the join does not use a perfect hash table.\nThis is common with composite foreign keys, as in fact tables joined to bridge or snapshot tables. Examples outside TPC-H:\n1) `SELECT s.* FROM sales s JOIN store_promotions p ON s.store_id = p.store_id AND s.product_id = p.product_id WHERE p.promo_type = 'CLEARANCE';` Here sales is scanned with `store_id IN BF` and `product_id IN BF`.\n2) `SELECT e.user_id, count(*) FROM events e JOIN experiments x ON e.user_id = x.user_id AND e.variant = x.variant WHERE x.experiment_name = 'checkout_v2' GROUP BY 1;` Here x is the small filtered build and events is the large probe.\nThe new path is not tied to TPC-H tables, columns or types. Only the 2-filter cap matters, and only for joins with 3 or more keys.",
+    "fallback": "If any per-key gate fails, that key gets no bloom filter, and the existing min/max dynamic filters are still pushed as before (physical_hash_join.cpp:880-907). Single-key joins follow the same logic as before: the filter is filled from the row hash in InsertHashes (join_hashtable.cpp:747). One change applies to them too: the old code called SetBuildBloomFilter(true) both when deferring and when pushing. The new code requests the filter only in the deferred branch and only when deferred_bloom_filters is non-null (:912). Multi-key joins that fail the gates behave exactly as before: no filter is built and Finalize adds no extra work, because key_bf_conditions is empty. When a filter is built but turns out unselective, the SelectivityOptionalFilter disables it at runtime. The extra build-side gather and hash cost is still paid.",
+    "label": "general",
+    "label_reason": "This extends an existing standard technique, sideways information passing through runtime bloom filters, from single-key to multi-key equi-joins. Each per-key filter is a necessary condition for a match, so it is semantically sound. NULL handling follows each condition (`NullValuesAreEqual(cond_idx)`). The build-side hash matches the probe-side hash: both use VectorOperations::Hash, per bloom_filter.cpp:90-92. The gates are the same broad gates DuckDB already used for single-key filters, plus a non-nested-type test. Nothing refers to the TPC-H schema, its data sizes or a particular query shape. The only new constant is the cap MAX_KEY_BLOOM_FILTERS = 2. It is arbitrary, but it is a cost bound, not a selectivity tuned to q09. Two caveats keep this from being a clean \"general\": the build side pays the gather and hash cost even for unselective keys, and there is no cost model choosing which keys deserve a filter. Upstream reviewers might ask for that, but the change is general in kind and in trigger.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:770 `if (is_perfect_hashtable) { return false; }`",
+      "src/execution/operator/join/physical_hash_join.cpp:777 `if (cond_idx >= ht->conditions.size() || ht->conditions.size() != op.conditions.size())`",
+      "src/execution/operator/join/physical_hash_join.cpp:781 `bool can_use_bf = condition.comparison == ExpressionType::COMPARE_EQUAL;`",
+      "src/execution/operator/join/physical_hash_join.cpp:784 `static constexpr idx_t MAX_KEY_BLOOM_FILTERS = 2;`",
+      "src/execution/operator/join/physical_hash_join.cpp:785-786 `!condition.left->return_type.IsNested() && (ht->HasBloomFilter(cond_idx) || ht->BloomFilterCount() < MAX_KEY_BLOOM_FILTERS)`",
+      "src/execution/operator/join/physical_hash_join.cpp:793-796 `build_to_probe_ratio > 1.0` ... `return can_use_bf && build_side_has_filter && probe_larger_then_build;`",
+      "src/execution/operator/join/physical_hash_join.cpp:910-917 `if (!has_cast && ht && deferred_bloom_filters && CanUseBloomFilter(...)) { ht->SetBuildBloomFilter(cond_idx); ...`",
+      "src/execution/operator/join/physical_hash_join.cpp:809 `SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N`",
+      "src/include/duckdb/planner/filter/selectivity_optional_filter.hpp:52-53 `BF_THRESHOLD = 0.25f; BF_CHECK_N = 75`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:305 `pushdown_info->build_side_has_filter = IsFiltering(join.children[0]);`",
+      "src/execution/join_hashtable.cpp:747 `if (conditions.size() == 1 && HasBloomFilter(0) && bloom_filters[0]->IsInitialized())`",
+      "src/execution/join_hashtable.cpp:816-836 `if (conditions.size() > 1) {... data_collection->Gather(... cond_idx, key ...); VectorOperations::Hash(key, key_hashes, count); bloom_filters[cond_idx]->InsertHashes(key_hashes, count);`",
+      "src/planner/filter/bloom_filter.cpp:90-92 probe side `VectorOperations::Hash(keys_v, state.hashes_v, approved_count);`"
+    ]
+  },
+  "audit_cost_usd": 0.2195044
+}

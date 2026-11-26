@@ -1,0 +1,42 @@
+{
+  "id": "E0001",
+  "sha": "19d14c8bae37d370aec82fe6e64b9c9447568ecf",
+  "subject": "E0001: Run JoinDependentFilterRule before DistributivityRule",
+  "files": [
+    "src/optimizer/optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 2,
+    "removed_lines": 1,
+    "conditions": 0,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.8612688505874073,
+  "accepted_faster": {
+    "q19": 1.86
+  },
+  "audit": {
+    "mechanism": "The diff moves one existing rule earlier in the rewrite order. JoinDependentFilterRule now runs before DistributivityRule. JoinDependentFilterRule takes a top-level filter of the form OR over AND branches that span several tables. For each table that has single-table conjuncts in every branch, it builds a new filter, OR(branch_1 conjuncts for T, ..., branch_n conjuncts for T), and ANDs these derived filters onto the original predicate. Filter pushdown can then apply them at each table's scan, below the join. In the old order, DistributivityRule ran first. Whenever every OR branch shared a conjunct (typically the join equality), it pulled that conjunct out and turned the root into AND(common, OR(...)). The derived rule only accepts a root OR, so it never fired on that common shape. The change makes the existing transitive-filter derivation reach that case. Distributivity still factors the common term out of the inner OR afterwards.",
+    "trigger": "The trigger is unchanged in the rule itself. Only its position in the rule list moved (src/optimizer/optimizer.cpp:53 `rewriter.rules.push_back(make_uniq<JoinDependentFilterRule>(rewriter));` now comes before `DistributivityRule` at :54). Conditions:\n(a) The expression is a conjunction with at least one conjunction child (join_dependent_filter.cpp:13-15, `ConjunctionExpressionMatcher` with `Policy::SOME`).\n(b) The operator is a FILTER or ANY_JOIN and the expression is the operator's root expression (:56-57 `op.type != LOGICAL_FILTER && op.type != LOGICAL_ANY_JOIN) || !is_root`).\n(c) The root is an OR (:63 `!= ExpressionType::CONJUNCTION_OR`).\n(d) At least one child is an AND that references more than one table (:71-73 `CONJUNCTION_AND && ExpressionReferencesMultipleTables`).\n(e) Some table has non-volatile single-table conjuncts in every branch (:40 `table_idxs.size() != 1` return; :98-100 `Expression does not appear in every conjuncted expression`). Otherwise it returns nullptr (:112).\nBehaviour only changes for root ORs whose branches all share at least one identical conjunct. In those cases DistributivityRule (distributivity.cpp:70-83, set intersection, `candidate_set.empty()` abort) would previously have rewritten the root into an AND first. When no common conjunct exists, Distributivity returned nullptr and the rule already fired under the old order. No loop: after the rule returns, ApplyRules recurses with the default is_root=false (expression_rewriter.cpp:29 `return ExpressionRewriter::ApplyRules(op, rules, std::move(result), changes_made);`). In the outer fixpoint loop (:83-86) the root is then an AND, so condition (c) fails.",
+    "constants": "None. There are no thresholds, cardinalities, data types or schema names. The only structural conditions are: root OR, an AND branch that spans multiple tables, and a per-table conjunct in every branch. Just outside the trigger: if any branch lacks a predicate on a table, no filter is derived for that table, and if no table qualifies the plan is unchanged (:105-106, :112-113).",
+    "natural_class": "This is the classic \"derive single-table restrictions from a disjunctive join predicate\" (OR-factoring / predicate move-around) optimisation. It now covers the very common shape where the join key is repeated inside each OR branch. That shape is typical of hand-written or ORM-generated SQL written as a comma join with all predicates in WHERE. Examples that are not from TPC-H:\n1) SELECT count(*) FROM orders o, customers c WHERE (o.cust_id = c.id AND c.country = 'DE' AND o.amount > 100) OR (o.cust_id = c.id AND c.country = 'FR' AND o.amount > 500);\n   Derived: c.country IN ('DE','FR') pushed to the customers scan, and (o.amount > 100 OR o.amount > 500) pushed to the orders scan.\n2) SELECT * FROM events e, users u WHERE (e.user_id = u.id AND u.plan = 'pro' AND e.kind = 'click') OR (e.user_id = u.id AND u.plan = 'free' AND e.kind = 'purchase');\nIn both, the old order factored out `e.user_id = u.id` first and lost the derivation.",
+    "fallback": "If the conditions fail, the rule returns nullptr and the rewriter goes on to DistributivityRule and the remaining rules exactly as before. Rule order relative to all other rules is unchanged. The only change in the result is the extra AND child of derived per-table ORs. These derived filters are implied by the original predicate (which is kept, :119), so results are unaffected. Possible costs: redundant re-evaluation of the derived ORs above the join, and a larger expression tree. The author did not run the existing optimizer tests, and other queries' plans/EXPLAIN output may change.",
+    "label": "general",
+    "label_reason": "This is a pure rule-ordering fix with no constants and no schema or query-specific tests. It lets an existing, principled transformation (deriving per-table filters from a disjunctive join predicate) apply in the common case where every OR branch repeats the join key, which the earlier distributivity rewrite was hiding. Any query of that shape over any schema benefits. TPC-H q19 is the motivating example, but the condition is structural and broad.",
+    "citations": [
+      "src/optimizer/optimizer.cpp:52-54 \"// derive join-dependent filters before distributivity ... JoinDependentFilterRule ... DistributivityRule\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:56-57 \"op.type != LogicalOperatorType::LOGICAL_FILTER && op.type != LogicalOperatorType::LOGICAL_ANY_JOIN) || !is_root\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:63 \"conjunction.GetExpressionType() != ExpressionType::CONJUNCTION_OR\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:71-73 \"CONJUNCTION_AND && ExpressionReferencesMultipleTables(*child)\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:40-41 \"if (table_idxs.size() != 1) { return; // Needs to reference exactly one table\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:98-100 \"Expression does not appear in every conjuncted expression, cannot derive any restriction\"",
+      "src/optimizer/rule/join_dependent_filter.cpp:119 \"result_conjunction.children.push_back(conjunction.Copy());\"",
+      "src/optimizer/rule/distributivity.cpp:81-83 \"if (candidate_set.empty()) { // nothing found: abort\"",
+      "src/optimizer/rule/distributivity.cpp:87 \"auto new_root = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);\"",
+      "src/optimizer/expression_rewriter.cpp:29 \"return ExpressionRewriter::ApplyRules(op, rules, std::move(result), changes_made);\" (is_root defaults false)",
+      "src/optimizer/expression_rewriter.cpp:83-86 \"do { ... ApplyRules(*op, to_apply_rules, std::move(*expression), changes_made, true); } while (changes_made);\""
+    ]
+  },
+  "audit_cost_usd": 0.1729206
+}

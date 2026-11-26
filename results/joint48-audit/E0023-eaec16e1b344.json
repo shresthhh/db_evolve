@@ -1,0 +1,42 @@
+{
+  "id": "E0023",
+  "sha": "eaec16e1b34486da55a3945138b35dc66e2b8daf",
+  "subject": "E0023: Deliminate selective ANTI delim joins (NOT EXISTS) with simple RHS",
+  "files": [
+    "src/optimizer/deliminator.cpp"
+  ],
+  "static": {
+    "added_lines": 5,
+    "removed_lines": 3,
+    "conditions": 1,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.028489444226222,
+  "accepted_faster": {
+    "q22": 1.38
+  },
+  "audit": {
+    "mechanism": "DuckDB's Deliminator normally keeps the join between the RHS and the DelimGet when the outer (LHS) side of a delim join has a filter. The reason is that the de-duplicated set of selected outer keys can then shrink the subquery side. Commit E0021 added an exception for SEMI delim joins: if the subquery is \"simple\" and correlated by plain column equality, the DelimGet join is removed anyway. The delim join then becomes an ordinary comparison join, and its IS NOT DISTINCT FROM conditions are turned into `=` so that runtime min/max and Bloom-filter join filters can reduce the RHS scan. This change applies the same exception to ANTI delim joins, so a correlated NOT EXISTS with a filtered outer query becomes a plain (RIGHT_)ANTI hash join with no DISTINCT and no extra inner join.",
+    "trigger": "The path is taken in Deliminator::Optimize when `!candidate.joins.empty() && HasSelection(delim_join) && SelectionIsReplaceableByJoinFilter(candidate)` (src/optimizer/deliminator.cpp:157). HasSelection is true if any LOGICAL_FILTER or any table filter other than IS_NOT_NULL exists under the delim join (deliminator.cpp:214-229). SelectionIsReplaceableByJoinFilter requires all of the following:\n- `(delim_join.join_type != JoinType::SEMI && delim_join.join_type != JoinType::ANTI)` returns false, so only SEMI or ANTI pass. ANTI is the only new part (deliminator.cpp:83).\n- `candidate.delim_get_count != 1 || candidate.joins.size() != 1` returns false, so there must be exactly one DelimGet and one join with it (deliminator.cpp:84).\n- That join is a LOGICAL_COMPARISON_JOIN of type INNER or SEMI (deliminator.cpp:88-93).\n- Every one of its conditions is `COMPARE_EQUAL` between two BOUND_COLUMN_REFs (deliminator.cpp:95-100).\n- `SubqueryIsSimple(*delim_join.children[1])`: the RHS contains only PROJECTION, FILTER, GET, DELIM_GET and INNER/SEMI comparison joins, so no aggregates, windows or set operations (deliminator.cpp:52-75).\n\nThe `=` conversion runs only if all joins were removed and `all_equality_conditions` holds (deliminator.cpp:179-185). It flips an NDF condition only when its RHS column can be traced through projections and filters to a column that the removal made IS NOT NULL (deliminator.cpp:108-134). Data types, cardinalities and table names are never checked.",
+    "constants": "There are no numeric thresholds or tuned constants. The gate is structural only: join type is SEMI or ANTI, exactly 1 DelimGet and 1 join with it, column-ref equality conditions, and the SubqueryIsSimple operator whitelist. \"Has a selection\" is the pre-existing upstream heuristic (any non-IS-NOT-NULL filter; upstream itself carries a TODO about selectivity estimation, deliminator.cpp:215). Just outside the gate, the old behaviour applies:\n- correlation by a non-column expression or by `<`;\n- a subquery containing an aggregate, window or LEFT join;\n- two DelimGets.\nIn each case the deepest DelimGet join is kept, as upstream does (deliminator.cpp:165-169).",
+    "natural_class": "Any correlated NOT EXISTS (and, through the earlier commit, EXISTS) where three things hold: the outer query has some filter, the correlation is column = column, and the subquery is a filter, projection or inner-join tree over base tables. Examples outside TPC-H:\n\n`SELECT c.id FROM customers c WHERE c.signup_date > '2024-01-01' AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);`\n\n`SELECT p.sku FROM products p WHERE p.category = 'toys' AND NOT EXISTS (SELECT * FROM returns r JOIN shipments s ON r.ship_id = s.id WHERE s.product_sku = p.sku AND r.reason <> 'damaged');`\n\nBoth are common anti-join patterns, such as \"customers with no orders\" or \"products never returned\".",
+    "fallback": "If the gate fails, control goes to the unchanged `else if` branch. It removes all DelimGet joins except the deepest one, so the delim join, DISTINCT and duplicate-eliminated scan stay exactly as before (deliminator.cpp:165-169). Delim joins whose LHS has no selection are unaffected; they were already fully deliminated upstream.\n\nOne caveat on the new path itself: according to the author's notes, a plain ANTI join (outer side as the build side) gets no runtime join filters. In that orientation the RHS is no longer reduced, either by the delim keys or by a Bloom filter. Whether that is a net loss depends on sizes, and this was not checked.",
+    "label": "general",
+    "label_reason": "This is a principled plan rewrite: correlated anti-join decorrelation that relies on runtime join filters instead of materialising and de-duplicating the delim keys. There are no numeric thresholds and nothing specific to the schema or the data. The gates (one DelimGet, column equality, simple RHS) are natural conditions that a large, ordinary class of NOT EXISTS queries meets.\n\nThe NULL semantics are argued soundly: the RHS replacing column is filtered with IS NOT NULL, so NDF and `=` agree on the RHS, and a NULL LHS key matches nothing either way, so ANTI still emits it. The author also says they checked this with NULL-key temp tables; I did not repeat that check.\n\nThe main reservations:\n- It drops the upstream \"keep the delim join when there is a selection\" heuristic in favour of relying on Bloom and min/max filters, which plain ANTI joins do not get.\n- It was measured on a single benchmark query (q22).\n\nThese are trade-off risks, not benchmark-recognition.",
+    "citations": [
+      "src/optimizer/deliminator.cpp:83 `(delim_join.join_type != JoinType::SEMI && delim_join.join_type != JoinType::ANTI) ||`",
+      "src/optimizer/deliminator.cpp:84 `candidate.delim_get_count != 1 || candidate.joins.size() != 1`",
+      "src/optimizer/deliminator.cpp:92 `if (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI)`",
+      "src/optimizer/deliminator.cpp:96-98 `cond.comparison != ExpressionType::COMPARE_EQUAL || cond.left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF`",
+      "src/optimizer/deliminator.cpp:102 `return SubqueryIsSimple(*delim_join.children[1]);`",
+      "src/optimizer/deliminator.cpp:52-68 SubqueryIsSimple whitelist `LOGICAL_PROJECTION/FILTER/GET/DELIM_GET`, INNER/SEMI joins only",
+      "src/optimizer/deliminator.cpp:157 `if (!candidate.joins.empty() && HasSelection(delim_join) && SelectionIsReplaceableByJoinFilter(candidate))`",
+      "src/optimizer/deliminator.cpp:165-169 fallback `candidate.joins.erase(candidate.joins.begin()); all_removed = false;`",
+      "src/optimizer/deliminator.cpp:183-184 `if (replace_selection_by_join_filter && all_equality_conditions) { ConvertNotDistinctToEqual(...)`",
+      "src/optimizer/deliminator.cpp:117-118 `if (std::find(non_null.begin(), non_null.end(), traced[0]) != non_null.end()) { cond.comparison = ExpressionType::COMPARE_EQUAL;`",
+      "src/optimizer/deliminator.cpp:215 `// TODO once we implement selectivity estimation using samples we need to use that here`"
+    ]
+  },
+  "audit_cost_usd": 0.1540162
+}

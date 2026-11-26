@@ -1,0 +1,43 @@
+{
+  "id": "E0004",
+  "sha": "f0d9e1f9517988ef435167cd958db3ecb9b74267",
+  "subject": "E0004: Hash join prefetch v2: build insert + probe, software-pipelined, LLC-sized threshold",
+  "files": [
+    "src/execution/join_hashtable.cpp"
+  ],
+  "static": {
+    "added_lines": 52,
+    "removed_lines": 3,
+    "conditions": 7,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.109543737095155,
+  "accepted_faster": {
+    "q09": 1.11
+  },
+  "audit": {
+    "mechanism": "The hash join now issues software prefetches (__builtin_prefetch) so that cache misses on large hash tables overlap with work instead of stalling one at a time. There are four places. (1) During the probe, the loop over hashes prefetches the pointer-table slot for the key 16 positions ahead. (2) Before the key comparison, a separate loop prefetches every candidate build-row pointer. (3) During the build, the insert loop prefetches for write the slot 16 positions ahead. (4) When following a collision chain, the next row is prefetched as soon as its pointer is loaded. The non-prefetch path is kept as a separate template instantiation. Results cannot change, because prefetches are only hints.",
+    "trigger": "Parts 1 to 3 run only when the gate `ShouldPrefetch(ht)` is true: `return ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES;` (src/execution/join_hashtable.cpp:204-205), where `HT_PREFETCH_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL` (:202). The gate is checked in three places:\n- Probe: `if (ShouldPrefetch(ht))` selects `ProbeForPointersInternal<..., true>` (:269). Inside the loop the condition is `if (PREFETCH && i + HT_PREFETCH_DISTANCE < count)` (:216).\n- Build-row prefetch before Match: `const bool prefetch = ShouldPrefetch(ht);` (:314), then `PrefetchRead(pointers[state.keys_to_compare_sel.get_index(i)])` (:329).\n- Build insert: `const bool prefetch = ShouldPrefetch(ht);` (:688), then `if (prefetch && i + HT_PREFETCH_DISTANCE < remaining_count)` (:694).\nPart 4, the chain prefetch in AdvancePointers, has no size gate. It runs whenever `ht.chains_longer_than_one` is true (the early return at :1004) and the loaded next pointer is non-null (`if (ptrs[idx]) { PrefetchRead(ptrs[idx]);` at :1016-1017).\nNothing depends on join type, key types, schema or query shape. It applies to any JoinHashTable, so inner, semi, anti, mark and outer joins with any key types are all covered.",
+    "constants": "- **HT_PREFETCH_THRESHOLD_BYTES = 4 MiB** (:202). This is the size of the pointer table (8-byte ht_entry_t), not of the row data. The capacity is `NextPowerOfTwo(count * load_factor)` with `DEFAULT_LOAD_FACTOR = 2.0` (src/include/duckdb/execution/join_hashtable.hpp:408,418). So the gate opens at capacity \u2265 2^20 slots, which means roughly more than 262,144 build rows (more than 2^18). It is a round number meant as \"larger than a typical L2 / LLC slice\". The code comment says \"smaller tables are likely cache-resident\" (:201). The author admits no other value was tried. It is not derived from TPCH table sizes, but it also is not calibrated to any machine. Just below it, a build of about 260K rows or fewer runs exactly the old code for parts 1 to 3. Because capacity is a power of two, the gate flips in one step when the build count crosses 2^18.\n- **HT_PREFETCH_DISTANCE = 16** (:200). This is a conventional software-pipelining distance, and the author tested no alternative. Near the end of a vector the condition `i + 16 < count` skips the prefetch, so the last 16 iterations of each vector (up to 2048 rows) get no prefetch. This is harmless.\n- The `__builtin_prefetch(p, 0/1, 3)` hints request read or write with high temporal locality (:187-197). These are the standard defaults.",
+    "natural_class": "Any hash join whose build side is larger than about 262K rows, so that the pointer table exceeds 4 MiB, on any schema and with any key types. Part 4 also applies to any build with duplicate keys or hash collisions, whatever its size. Two examples outside TPCH:\n1. `SELECT u.country, count(*) FROM events e JOIN users u ON e.user_id = u.id GROUP BY 1;` with users at 5M rows and events at 100M rows. Both build and probe prefetch.\n2. `SELECT o.id FROM orders_2024 o WHERE o.sku IN (SELECT sku FROM inventory_snapshot);` with a 1M-row inventory. This is a semi join over the same JoinHashTable. If inventory has duplicate skus, the chain prefetch also fires.",
+    "fallback": "When the gate is false, ProbeForPointers dispatches to the `<USE_SALTS, HAS_SEL, false>` instantiation (:278-282). That is the same code as before, because `PREFETCH && ...` is a compile-time false. The insert and row-pointer loops skip their prefetch branches through the runtime `prefetch` bool (:314, :688). So the old behaviour is unchanged, except for one predictable branch per iteration. The one change that is not gated is the AdvancePointers chain prefetch (:1017). It now runs on small tables too, where it is probably a no-op or a tiny cost.",
+    "label": "general",
+    "label_reason": "Software prefetching in hash-join build and probe is a standard, well-known technique (see Chen et al., \"Improving Hash Join Performance through Prefetching\"). Here it applies to every join hash table and has no schema, type or plan-shape tests. The only gate is the pointer-table size, which is a principled test of whether the table fits in cache. Its value (4 MiB, about 262K build rows) and the distance of 16 are untested round numbers, not values fitted to TPCH table sizes. Upstream might retune them per machine. The benefit is clear on large builds; the gain was measured only on q09. The extra non-pipelined prefetch pass over candidate rows and the ungated chain prefetch could cost a little on some workloads, but they never change results.",
+    "citations": [
+      "src/execution/join_hashtable.cpp:187 static inline void PrefetchRead(const void *p) { __builtin_prefetch(p, 0, 3);",
+      "src/execution/join_hashtable.cpp:200 static constexpr idx_t HT_PREFETCH_DISTANCE = 16;",
+      "src/execution/join_hashtable.cpp:202 static constexpr idx_t HT_PREFETCH_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL;",
+      "src/execution/join_hashtable.cpp:205 return ht.capacity * sizeof(ht_entry_t) > HT_PREFETCH_THRESHOLD_BYTES;",
+      "src/execution/join_hashtable.cpp:216 if (PREFETCH && i + HT_PREFETCH_DISTANCE < count) {",
+      "src/execution/join_hashtable.cpp:269 if (ShouldPrefetch(ht)) {",
+      "src/execution/join_hashtable.cpp:329 PrefetchRead(pointers[state.keys_to_compare_sel.get_index(i)]);",
+      "src/execution/join_hashtable.cpp:694 if (prefetch && i + HT_PREFETCH_DISTANCE < remaining_count) {",
+      "src/execution/join_hashtable.cpp:1004 if (!ht.chains_longer_than_one) {",
+      "src/execution/join_hashtable.cpp:1017 PrefetchRead(ptrs[idx]);",
+      "src/include/duckdb/execution/join_hashtable.hpp:408 static constexpr double DEFAULT_LOAD_FACTOR = 2.0;",
+      "src/include/duckdb/execution/join_hashtable.hpp:418 NextPowerOfTwo(LossyNumericCast<idx_t>(static_cast<double>(count) * load_factor))"
+    ]
+  },
+  "audit_cost_usd": 0.1463222
+}

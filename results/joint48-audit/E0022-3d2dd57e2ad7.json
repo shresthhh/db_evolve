@@ -1,0 +1,45 @@
+{
+  "id": "E0022",
+  "sha": "3d2dd57e2ad75df7944533413fe0ca1b57eecb8c",
+  "subject": "E0022: Exact BF bitmap for small absolute key ranges",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 4,
+    "removed_lines": 1,
+    "conditions": 0,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.109653173918608,
+  "accepted_faster": {
+    "q02": 1.34,
+    "q04": 1.07,
+    "q08": 1.2,
+    "q17": 1.58,
+    "q19": 1.47
+  },
+  "audit": {
+    "mechanism": "When a hash join pushes a bloom filter onto its probe-side scan, the engine can replace the hashed bloom filter with an exact bitmap: one bit for every integer key value between the build side's min and max key. A bitmap probe never gives a false positive. Before this change, the bitmap was allowed only if the key range was under 128 bits per build key. A small, selective build side (for example 40 part keys spread over 1..200000) therefore kept the hashed filter and let many false positives through. The change adds a floor to that cap: any range under 2^22 (about 4.2M values, a bitmap of at most 512KB) now gets the exact bitmap, no matter how few keys the build side has. Nothing else changes; the bitmap path itself (SetExactRange/InsertExact) already existed.",
+    "trigger": "TrySetExactBloomFilter is called only on the two bloom-filter pushdown branches of the join-filter pushdown finalize step (src/execution/operator/join/physical_hash_join.cpp:1083-1101). The first branch needs `!has_cast && pushdown_column.storage_offset.IsNull() && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(...)`. The second branch handles an integral storage offset and keeps the filter only if it became exact. CanUseBloomFilter (:865-889) requires: not a perfect hash table (`if (is_perfect_hashtable) return false;`), `cmp == ExpressionType::COMPARE_EQUAL`, `build_side_has_filter`, and probe estimated cardinality / build count `> 1.0`. Inside TrySetExactBloomFilter (:897-945):\n- `bf.IsExact() || bf.IsInitialized() || ht.NullValuesAreEqual(0) || ht.Count() == 0` returns early.\n- The first condition must be `COMPARE_EQUAL`, both sides must have the same type, and min/max must be non-null.\n- The key's physical type must be INT8-64 or UINT8-64 (`default: return;`).\n- The new gate: `key_cap = ht.Count() > EXACT_BF_MAX_RANGE ? EXACT_BF_MAX_RANGE : ht.Count() * EXACT_BF_MAX_BITS_PER_KEY; key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE); if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) return;`.\nIn practice the new behaviour applies only when build count < 2^22/128 = 32768 and (max-min) < 4,194,304. Builds with 32768 or more keys already qualified under the old rule.",
+    "constants": "- EXACT_BF_SMALL_RANGE = 1<<22 (:895). This is 4,194,304 bits, i.e. 512KB of bitmap. It is a memory-budget constant of roughly L2-cache size, and the comment says \"the bitmap is at most 512KB\". No measurement or hardware query backs it, so it is a round power of two. It does fit this workload neatly. At TPC-H SF1, p_partkey (200K), s_suppkey (10K), c_custkey (150K) and the nation/region keys all have ranges well inside it, so every selective dimension build in q02/q08/q17/q19 now qualifies. o_orderkey (range about 6M) falls just outside, and so do the other dimension keys at larger scale factors (part is 2M at SF10, about 4x... beyond 1<<22 at SF~21). The author's own note suggests raising it to 1<<24 \"for larger datasets\", which shows the value is tied to the benchmark's scale.\n- Just outside: a range of 4,194,304 or more with fewer than 32768 build keys falls back to the old hashed bloom filter. The output is still correct; the filter is just less selective.\n- EXACT_BF_MAX_BITS_PER_KEY = 128 and EXACT_BF_MAX_RANGE = 1<<32 come from earlier commits and are unchanged. The cap still enforces the 2^32 ceiling.",
+    "natural_class": "Any equality hash join on an integer key where all of these hold:\n- the build side is filtered and smaller than the probe side;\n- the join is not a perfect hash table;\n- the key range on the build side is under about 4.2M;\n- fewer than 32K keys survive on the build side.\nThis is a common pattern: a selective dimension filter joined to a fact table on a surrogate key. Two examples outside TPC-H:\n`SELECT sum(s.amount) FROM sales s JOIN products p ON s.product_id = p.id WHERE p.category = 'toys';` (products.id spans 1..1,000,000; a few hundred toys).\n`SELECT count(*) FROM events e JOIN users u ON e.user_id = u.user_id WHERE u.country = 'NZ' AND u.signup_year = 2019;` (user_id range of about 3M).\nThe path is not taken for dimensions with ranges over 4.2M, sparse or hashed ids, UUID/string/decimal-hugeint keys, or multi-key joins beyond the first key.",
+    "fallback": "If the range is at or above max(count*128, 2^22) (still capped at 2^32), TrySetExactBloomFilter returns without calling SetExactRange. In the first branch the regular hashed bloom filter is built and pushed as before. In the storage-offset branch no bloom filter is pushed, because the code requires `IsExact()` there. Both outcomes are identical to the parent commit. The exact bitmap also keeps a safety valve: if a key outside the range is inserted, it sets `exact_overflow` and the filter passes everything (bloom_filter.hpp:52-60).",
+    "label": "heuristic",
+    "label_reason": "The technique is principled. An exact bitmap over a bounded dense integer range is standard, costs a fixed amount of memory, and removes false positives; the condition (a selective integer-key dimension join) is broad and natural, and nothing in the code tests for TPC-H schema or query shapes. However, the gating constant 1<<22 is a hand-picked round number. It happens to cover every TPC-H SF1 dimension key range except orderkey, and that is exactly where the gains appear (q17/q19/q08/q02). There is no cost model: it does not compare bitmap size or cache misses against the expected probe selectivity. The author also concedes it may need raising for larger scale factors. Upstream would plausibly accept it, but likely with a different or adaptive limit.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:895 \"static constexpr idx_t EXACT_BF_SMALL_RANGE = idx_t(1) << 22;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:938-940 \"key_cap = MaxValue<idx_t>(key_cap, EXACT_BF_SMALL_RANGE);\"",
+      "src/execution/operator/join/physical_hash_join.cpp:941 \"if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) { return; }\"",
+      "src/execution/operator/join/physical_hash_join.cpp:893-894 \"EXACT_BF_MAX_BITS_PER_KEY = 128; EXACT_BF_MAX_RANGE = idx_t(1) << 32\"",
+      "src/execution/operator/join/physical_hash_join.cpp:900 \"if (bf.IsExact() || bf.IsInitialized() || ht.NullValuesAreEqual(0) || ht.Count() == 0)\"",
+      "src/execution/operator/join/physical_hash_join.cpp:910-929 \"case PhysicalType::INT8: ... case PhysicalType::UINT64: ... default: return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:873-888 \"if (is_perfect_hashtable) return false; ... cmp == ExpressionType::COMPARE_EQUAL ... build_to_probe_ratio > 1.0\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1083-1101 \"TrySetExactBloomFilter(*ht, op, min_val, max_val); ... if (ht->GetBloomFilter().IsExact())\"",
+      "src/include/duckdb/planner/filter/bloom_filter.hpp:37-41 \"void SetExactRange(uint64_t min, uint64_t range) { exact = true; ...\"",
+      ".dbe/review/issue.md \"raising the small-range limit to 1<<24 (2MB) for larger datasets, where dimension key ranges grow with the scale factor\""
+    ]
+  },
+  "audit_cost_usd": 0.15105800000000003
+}

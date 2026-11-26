@@ -1,0 +1,43 @@
+{
+  "id": "E0011",
+  "sha": "511697b3e4b162274d095d068971bb903caf8815",
+  "subject": "E0011: Semi-join RHS-aware estimate + HAVING selectivity",
+  "files": [
+    "src/optimizer/join_order/cardinality_estimator.cpp"
+  ],
+  "static": {
+    "added_lines": 15,
+    "removed_lines": 5,
+    "conditions": 2,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.016344938147732,
+  "accepted_faster": {
+    "q02": 1.1,
+    "q18": 1.08
+  },
+  "audit": {
+    "mechanism": "This changes how the join-order optimizer estimates SEMI join cardinality. Before, a semi join always kept 1/5 of the left (probe) side's estimated rows, whatever the size of the right (filter) side. Now the left side's denominator is multiplied by max(5, tdom / rhs_cardinality). In effect the estimate becomes min(0.2\u00b7|L|, |L|\u00b7|R|/tdom). This is the textbook containment rule: a semi join matches at most as many key values as the right side has rows, out of tdom distinct key values. The right side's row count is used as an upper bound on its distinct count, so a small right side gives a small semi-join estimate. ANTI joins keep the old fixed factor of 5. Only the estimate changes; the planner then uses it to pick join order and build side (in q18 the small IN-subquery result becomes the build side and customer becomes the probe side).",
+    "trigger": "The new path runs in CardinalityEstimator::CalculateUpdatedDenom whenever the join-order optimizer merges two subgraphs over an edge whose join type is SEMI (src/optimizer/join_order/cardinality_estimator.cpp:264-282). It applies when all of these hold:\n(1) `filter.filter_info->join_type == JoinType::SEMI && rhs.numerator_relations && rhs.denom > 0` (line 272);\n(2) `tdom > 0 && rhs_cardinality >= 1` (line 277), where tdom is the edge's total-domain estimate (`filter.has_distinct_count_hll ? distinct_count_hll : distinct_count_no_hll`) and `rhs_cardinality = GetNumerator(*rhs.numerator_relations) / rhs.denom` (line 276). Base cardinalities already include filter estimates (InitCardinalityEstimatorProps uses `stats.cardinality`, line 464-466).\n(3) The new factor only changes anything when tdom / rhs_cardinality > 5, i.e. the right side is estimated at less than 1/5 of the key's distinct-value count (`MaxValue<double>(selectivity, tdom / rhs_cardinality)`, line 278).\nNothing checks schema, table names, data types or query shape. Any IN / EXISTS subquery that the planner turns into a SEMI join inside the join-order optimizer can take this path.",
+    "constants": "- `DEFAULT_SEMI_ANTI_SELECTIVITY = 5` (src/include/duckdb/optimizer/join_order/cardinality_estimator.hpp:92) is DuckDB's existing upstream default, not added by this change. It now acts as a floor: the semi join is never estimated to keep more than 20% of the left side. That is a cap the new code keeps, not one it was tuned to. With a right side larger than tdom/5 the old estimate is reproduced exactly.\n- `rhs_cardinality >= 1` is a guard against dividing by zero or by an estimate below one row. Below one row the code falls back to the factor of 5 instead of giving a huge factor. It is not tuned.\n- `tdom > 0` is a guard against missing statistics.\nNo constant here is sized to the TPCH data. The only numeric effect is a smooth function of the estimated right-side size and the key's distinct count. One caveat: the right side's row count stands in for its distinct count. If the right side has many duplicate keys, the estimate is too low (the author says so). It is bounded below by |L|/tdom\u00b7|R|, which can still be far too low when |R| is large but holds few distinct keys. A right side of exactly tdom/5 rows gives the same result under the old and new formulas, so there is no discontinuity at the boundary.",
+    "natural_class": "Any SEMI join (IN-subquery, EXISTS, or a semi join from decorrelation) where the subquery returns far fewer rows than the join key has distinct values, typically a filtered or aggregated \"top/hot keys\" subquery. Examples:\n1) SELECT u.name, e.ts FROM users u JOIN events e ON e.user_id = u.id WHERE u.id IN (SELECT user_id FROM purchases GROUP BY user_id HAVING sum(amount) > 10000);\n2) SELECT * FROM orders_log o JOIN products p ON o.pid = p.pid WHERE o.session_id IN (SELECT session_id FROM fraud_flags WHERE flagged_at > now() - INTERVAL 1 DAY);\nIn both cases the right side is small compared with the key domain. The new estimate makes the semi-join result small, which can push it to the build side of a later join, as in q18. It does not apply to ANTI joins (NOT IN / NOT EXISTS) or to subqueries with large outputs.",
+    "fallback": "When the edge is ANTI, when the right side's estimate is below 1 row or missing, when tdom is 0, or when tdom/rhs \u2264 5, the selectivity stays at DEFAULT_SEMI_ANTI_SELECTIVITY (5). The denominator becomes `lhs.denom * 5`, the same as the old code. The lhs/rhs selection (lines 266-269) matches the old two branches: `left.denom*5` when the left subgraph is the edge's left set, `right.denom*5` otherwise. So the old behaviour is reproduced exactly. INNER and cross-product paths are untouched.",
+    "label": "general",
+    "label_reason": "This is the standard containment-based semi-join estimate (|L|\u00b7min(1, ndv(R)/tdom), with |R| as an upper bound on ndv(R)), and it keeps the existing upstream cap of 20%. It is gated only by sanity guards (tdom>0, rhs\u22651) and by the semi/anti distinction, which is principled. Nothing is tied to TPCH tables, columns, data sizes or query shapes, and the constant 5 comes from upstream DuckDB. Two risks remain. First, using row count in place of distinct count can make the estimate too low when the right side has many duplicates, which could hurt plans on other workloads. Second, the measured benefit is a single query (q18, -6 to -9%). These are general weaknesses of the estimator, not benchmark-specific gating.",
+    "citations": [
+      "src/optimizer/join_order/cardinality_estimator.cpp:266 \"bool lhs_is_left = JoinRelationSet::IsSubset(*left.relations, *filter.filter_info->left_set) &&\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:271 \"double selectivity = CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY;\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:272 \"if (filter.filter_info->join_type == JoinType::SEMI && rhs.numerator_relations && rhs.denom > 0) {\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:276 \"double rhs_cardinality = GetNumerator(*rhs.numerator_relations) / rhs.denom;\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:277 \"if (tdom > 0 && rhs_cardinality >= 1) {\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:278 \"selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:281 \"new_denom = lhs.denom * selectivity;\"",
+      "src/include/duckdb/optimizer/join_order/cardinality_estimator.hpp:92 \"static constexpr double DEFAULT_SEMI_ANTI_SELECTIVITY = 5;\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:137 \"numerator *= card_helper.cardinality_before_filters == 0 ? 1 : card_helper.cardinality_before_filters;\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:464 \"auto relation_cardinality = stats.cardinality;\"",
+      "src/optimizer/join_order/cardinality_estimator.cpp:203-209 UpdateNumeratorRelations: SEMI/ANTI keep only LHS numerator relations"
+    ]
+  },
+  "audit_cost_usd": 0.2050432
+}

@@ -1,0 +1,68 @@
+{
+  "id": "E0042",
+  "sha": "4f25ac98692c39c5345178e154a82aa715a2a26f",
+  "subject": "E0042: FSST code-level LIKE filter v2: DFA over FSST codes + filter-only no-decode + segment-straddling vectors",
+  "files": [
+    "src/function/table/table_scan.cpp",
+    "src/include/duckdb/storage/table/scan_state.hpp",
+    "src/storage/compression/fsst.cpp",
+    "src/storage/table/row_group.cpp",
+    "src/storage/table/scan_state.cpp",
+    "src/storage/table/standard_column_data.cpp"
+  ],
+  "static": {
+    "added_lines": 529,
+    "removed_lines": 8,
+    "conditions": 53,
+    "numeric_constants": [
+      "127",
+      "256"
+    ],
+    "string_literals": [
+      "\"!~~\"",
+      "\"StandardColumnData::Filter - ran out of segments\"",
+      "\"contains\"",
+      "\"duckdb/planner/expression/bound_constant_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_function_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_operator_expression.hpp\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\"",
+      "\"ends_with\"",
+      "\"prefix\"",
+      "\"starts_with\"",
+      "\"suffix\"",
+      "\"~~\""
+    ]
+  },
+  "accepted_gain": 1.0339993441733586,
+  "accepted_faster": {
+    "q02": 1.11,
+    "q13": 1.3,
+    "q17": 1.07
+  },
+  "audit": {
+    "mechanism": "Before this change, FSST-compressed string columns had no filter callback, so a pushed-down string filter always decompressed the whole vector and then evaluated the expression. Now, for filters that are LIKE patterns made only of literals and '%' (or contains/prefix/suffix calls), the pattern becomes a byte DFA: a KMP chain per literal part, plus start/end anchors and absorbing done/dead states. For each segment, that DFA is lifted once into a table indexed by (state, FSST code), with extra states for escape-code-plus-literal-byte. It then runs over the compressed codes of the candidate rows, four strings at a time, so no decompression is needed to evaluate the filter. Two related changes:\n- If the column is used only by the filter (not projected), no values are produced at all; a constant placeholder is emitted.\n- For such filter-only columns, a vector that crosses a segment boundary can now use per-segment filter callbacks piece by piece. Before, it fell back to scan-then-filter.\nA new NULL gate also sends segments that may contain NULLs back to the generic path, for every compression type that needs a separate validity pass (RLE included).",
+    "trigger": "All of these must hold:\n1. The column-level compression has a filter callback (`has_filter = compression && compression->filter`). FSST now registers one (`result.filter = FSSTStorage::Filter;`). Because a column only has a column-level compression when every segment uses the same one, columns that mix compression types fall back.\n2. The validity side can be filtered (`validity_has_filter`), and `force_fetch_row` is not set.\n3. The table filter is an EXPRESSION_FILTER of the form `[NOT] f(BOUND_REF varchar, BOUND_CONSTANT varchar)`, where:\n   - f is one of `contains`, `prefix`, `starts_with`, `suffix`, `ends_with`, `~~` (LIKE) or `!~~` (NOT LIKE);\n   - for LIKE, the pattern contains no `'_'` and no `'\\\\'`;\n   - the total literal length plus 3 is at most `MAX_STATES = 127`.\n4. The vector is within `STANDARD_VECTOR_SIZE`.\n5. The segment's stats say it cannot contain NULLs (`!filter_includes_validity && ...CanHaveNull()` \u2192 fallback).\n6. If the vector does not scan entirely from one segment (`!scan_entire_vector`), the piecewise path also requires all of the following:\n   - `state.filter_only` is set, i.e. the column is not in the scan's `projection_ids` (set via `input.CanRemoveFilterColumns() && !bind_data.is_create_index`);\n   - no updates on the column or its validity;\n   - every touched segment has a filter callback and no NULLs;\n   - validity is covered by a single segment (`SegmentCovers(state.child_states[0], ...)`).\nAfter the filter, the output depends on how the column is used:\n- filter-only column: a constant placeholder;\n- `EnableFSSTVectorsSetting` is on: an FSST_VECTOR;\n- otherwise: only the approved rows are decompressed.",
+    "constants": "- `MAX_STATES = 127` (fsst.cpp, `total_length + 3 > MAX_STATES` \u2192 return nullptr). This comes from the encoding, not from the workload: the lifted table has 2*states*256 entries addressed by uint16 state offsets (2*127*256 = 65024 < 65536). The +3 covers the done and dead states plus the extra end-anchor state. Just outside it, a pattern whose literals total more than about 124 bytes falls back to decompress-then-evaluate, which is correct, only slower.\n- `ALPHABET = 256` is the byte alphabet, and `FSST_ESC` (255) is the FSST escape code. Both are inherent to the format.\n- The 4-way interleave is a standard memory-level-parallelism trick and is not a gate.\n- `STANDARD_VECTOR_SIZE` is the engine constant.\nNone of these constants is tuned to TPC-H sizes. The segment size (about 15K rows) and the 13% boundary-crossing figure in the author's notes are facts about the data, not thresholds in the code.",
+    "natural_class": "Any table scan with a pushed-down LIKE / NOT LIKE / contains / prefix / suffix filter on a VARCHAR column that is FSST-compressed in all its segments and has no NULLs in the segment. The biggest gain comes when the column is not projected (filter-only). Examples outside TPC-H:\n- `SELECT count(*) FROM logs WHERE message NOT LIKE '%timeout%';`\n- `SELECT user_id, ts FROM events WHERE url LIKE 'https://shop.%/checkout%';` (url is filter-only here)\n- `SELECT id FROM docs WHERE contains(body, 'error') AND starts_with(path, '/var/');`\nNot covered: ILIKE (`~~*`), patterns with '_' or escapes, regexes, nullable segments, and columns that mix FSST with dictionary or uncompressed segments (the author notes o_clerk and c_address fall back for this reason).",
+    "fallback": "Unsupported filters take the existing path, unchanged. FSST's Filter calls `StringScan` and then `ColumnSegment::FilterSelection` (`if (!scan_state.has_pattern || vector_count > STANDARD_VECTOR_SIZE)`), and non-FSST columns, projected columns crossing a boundary, and columns with updates take `ColumnData::Filter`. One behaviour change is not a pure fallback: the new NULL gate (`state.current->GetNode().stats.statistics.CanHaveNull()` \u2192 `ColumnData::Filter`) sends nullable segments of all compression types that need a separate validity pass (e.g. RLE) to the generic scan+filter path, where before they used their specialised filter. This is a correctness fix, but it may slow down those segments.",
+    "label": "general",
+    "label_reason": "I rated this \"general\". Running a KMP/anchored DFA over dictionary or FSST codes (\"compressed pattern matching\") is a known, principled technique, and skipping materialisation of filter-only columns is standard late materialisation. The trigger is a broad, natural class: literal-and-% LIKE / contains / prefix / suffix predicates on FSST string columns. It is not keyed to any TPC-H column, pattern or size, and its only numeric constant (127 states) comes from 16-bit table addressing. The limits are real but structural, not tuned:\n- NULL-free segments only;\n- uniformly FSST columns only;\n- filter-only columns only, for the boundary-crossing path.\nIn TPC-H this fires mainly on q13's `o_comment NOT LIKE '%special%requests%'`, which is where the measured gain is, but the same code serves any log or text filter of the same shape.",
+    "citations": [
+      "src/storage/compression/fsst.cpp: `static constexpr idx_t MAX_STATES = 127;` and `if (total_length + 3 > MAX_STATES) { return nullptr; }`",
+      "src/storage/compression/fsst.cpp: `if (name == \"contains\") ... else if (name == \"prefix\" || name == \"starts_with\") ... else if (name == \"~~\" || name == \"!~~\")`",
+      "src/storage/compression/fsst.cpp: `if (pattern.find('_') != string::npos || pattern.find('\\\\') != string::npos) { return nullptr; }`",
+      "src/storage/compression/fsst.cpp: `func.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF || ... BOUND_CONSTANT`",
+      "src/storage/compression/fsst.cpp: `pattern_table[s * ALPHABET + FSST_ESC] = UnsafeNumericCast<uint16_t>(pending * ALPHABET);`",
+      "src/storage/compression/fsst.cpp: `if (!scan_state.has_pattern || vector_count > STANDARD_VECTOR_SIZE) { // fallback: scan + filter`",
+      "src/storage/compression/fsst.cpp: `if (state.filter_only) { ... result.Reference(Value(result.GetType()));`",
+      "src/storage/compression/fsst.cpp: `result.filter = FSSTStorage::Filter;`",
+      "src/function/table/table_scan.cpp:312: `if (input.filters && input.CanRemoveFilterColumns() && !bind_data.is_create_index) {`",
+      "src/storage/table/scan_state.cpp:72: `filter.filter_only = !projected;`",
+      "src/storage/table/row_group.cpp:782: `state.column_scans[scan_idx].filter_only = filter.filter_only;`",
+      "src/storage/table/standard_column_data.cpp:180: `bool has_filter = compression && compression->filter;`",
+      "src/storage/table/standard_column_data.cpp:194: `if (!state.filter_only || HasUpdates() || validity->HasUpdates() || !CanFilterAcrossSegments(state, target_count, !filter_includes_validity) ||`",
+      "src/storage/table/standard_column_data.cpp:212: `if (!filter_includes_validity && state.current->GetNode().stats.statistics.CanHaveNull()) {`"
+    ]
+  },
+  "audit_cost_usd": 0.2392974
+}

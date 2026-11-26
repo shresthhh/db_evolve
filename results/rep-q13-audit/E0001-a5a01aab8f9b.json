@@ -1,0 +1,46 @@
+{
+  "id": "E0001",
+  "sha": "a5a01aab8f9b6eee08f485765ed9dc96cd4fc0ae",
+  "subject": "E0001: Perfect hash join for RIGHT joins with dense keys up to 2^22",
+  "files": [
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 61,
+    "removed_lines": 6,
+    "conditions": 10,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.2206691524330495,
+  "accepted_faster": {
+    "q13": 1.22
+  },
+  "audit": {
+    "mechanism": "The perfect (direct-indexed array) hash join used to apply only to INNER joins, and only when the build key range was at most 2^20. It now also handles RIGHT joins, where unmatched build rows must be output. Each array slot stores the pointer to its hash-table row, and probe threads set a byte in a compact per-slot match array. Before the full-outer scan, those bytes are copied into the rows' found_match flags in one pass, so the existing ScanFullOuter emits the unmatched build rows unchanged. The accepted key range also grows from 2^20 to 2^22, but only when the build side fills at least a quarter of that range. NULL build keys are now skipped when the array is filled. The optimizer now also computes build-side min/max for RIGHT joins, so the runtime check has statistics to work with.",
+    "trigger": "CanDoPerfectHashJoin (src/execution/operator/join/perfect_hash_join_executor.cpp:74-75) requires: `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1 || ... != COMPARE_EQUAL || !TypeIsInteger(key_type.InternalType())` \u2192 false. In words: exactly one integer equality condition, on an INNER or RIGHT join. There must be no STRUCT/LIST/ARRAY column on the build side (:79-88). Min/max must be extractable with max >= min (:93-100). Then `build_range > Hugeint::Convert(MAX_DENSE_BUILD_SIZE)` \u2192 false, with MAX_DENSE_BUILD_SIZE = `idx_t(1) << 22` (:110-113). If `build_range > MAX_BUILD_SIZE && ht.Count() < build_range / 4` \u2192 false, with MAX_BUILD_SIZE = 1048576 (:109, :116-118). If `ht.Count() > build_range + 1` \u2192 false (:121). At build time, any duplicate key makes FillSelectionVector fail, and the join falls back (:156-160). For RIGHT joins, min/max now come from the join-filter aggregates even when nothing is pushed down: `(join.join_type == JoinType::INNER || join.join_type == JoinType::RIGHT) && ...` (src/optimizer/join_filter_pushdown_optimizer.cpp:275). The match tracking runs only when `PropagatesBuildSide(join.join_type)` (perfect_hash_join_executor.cpp:173). Of the newly admitted join types, that is RIGHT.",
+    "constants": "1) MAX_BUILD_SIZE = 1048576 (2^20) is the old upstream limit and is unchanged. 2) MAX_DENSE_BUILD_SIZE = 2^22 (~4.19M) is new. It is a round power of two that is not derived from cache or memory sizes. The array costs (range+1) entries per build column, plus an 8-byte pointer and a 1-byte match flag per slot for RIGHT joins. At 2^22 that is about 64 MB for a single VARCHAR column. The motivating q13 build side (customer, c_custkey 1..1.5M at SF10) sits just above the old 2^20 limit and well inside 2^22. The raise is plausibly sized to admit that table. A build range of 2^22+1 or more falls back to the regular hash join. 3) The density guard `count >= range/4` is a principled kind of rule (bounds the space wasted per real row), but the 1/4 factor is not justified anywhere. q13's customer table has density 1.0, so the factor isn't tuned to the data. A build range between 2^20 and 2^22 with fewer than range/4 rows falls back. 4) `range + 1` fixes an off-by-one: a range of N spans N+1 values.",
+    "natural_class": "Any RIGHT join (including a LEFT join the optimizer flips so the preserved side becomes the build side) on a single integer equality key, with duplicate-free build keys whose span is at most 2^22, or at most 2^20 at any density. Typical cases are primary-key or dimension tables with surrogate keys joined from a fact table. Under the larger range, INNER joins with dense builds of 1M\u20134M keys also qualify. Examples: `SELECT u.id, count(e.event_id) FROM users u LEFT JOIN events e ON e.user_id = u.id GROUP BY u.id;` (users, 2M dense ids, as build). `SELECT p.product_id, p.name, s.qty FROM sales s RIGHT JOIN products p ON s.product_id = p.product_id;` Also an INNER join of `orders_fact` with `dim_date` on an int date_key.",
+    "fallback": "If any condition fails (wrong join type, multiple or non-equality conditions, non-integer key, nested build column, range above 2^22, sparse build above 2^20, duplicate keys), CanDoPerfectHashJoin or BuildPerfectHashTable returns false. perfect_join_executor is then reset and the regular hash-join finalize is scheduled (physical_hash_join.cpp:1016-1019). That old path is unchanged. MarkMatchedBuildRows returns immediately when build_matched is null (perfect_hash_join_executor.cpp:200-201). One behavioural change also reaches existing INNER perfect joins: NULL build keys are now skipped (:256-258), and the off-by-one fix admits slightly more builds.",
+    "label": "heuristic",
+    "label_reason": "Extending the direct-array join to RIGHT joins by tracking build-side matches is a standard, general technique. It applies to any single-integer-key RIGHT or flipped LEFT join and does not look at TPC-H's schema or queries. The range increase is the part tied to the benchmark. 2^22, with an unexplained 1/4 density guard, is a round constant that happens to admit the q13 customer key range (1.5M, just over the old 2^20 limit). Nothing such as cache or memory budget justifies it, and it ignores per-column memory cost. Upstream would likely accept the mechanism, possibly with different constants, so it is not a special case.",
+    "citations": [
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:74 `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:109 `static constexpr idx_t MAX_BUILD_SIZE = 1048576;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:111 `static constexpr idx_t MAX_DENSE_BUILD_SIZE = idx_t(1) << 22;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:116 `if (perfect_join_statistics.build_range > MAX_BUILD_SIZE && ht.Count() < perfect_join_statistics.build_range / 4)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:121 `if (ht.Count() > perfect_join_statistics.build_range + 1)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:173 `if (PropagatesBuildSide(join.join_type)) {`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:199 `void PerfectHashJoinExecutor::MarkMatchedBuildRows()`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:256 `if (!vector_data.validity.RowIsValid(data_idx)) { continue; // NULL keys never match`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:318 `if (build_matched) { ... matched[state.build_sel_vec.get_index(i)] = 1;`",
+      "src/execution/operator/join/physical_hash_join.cpp:1373 `if (sink.perfect_join_executor) { sink.perfect_join_executor->MarkMatchedBuildRows();`",
+      "src/execution/operator/join/physical_hash_join.cpp:1016 `if (!use_perfect_hash) { sink.perfect_join_executor.reset(); sink.ScheduleFinalize(pipeline, event);`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:275 `(join.join_type == JoinType::INNER || join.join_type == JoinType::RIGHT) &&`"
+    ]
+  },
+  "audit_cost_usd": 0.1773736
+}

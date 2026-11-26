@@ -1,0 +1,41 @@
+{
+  "id": "E0045",
+  "sha": "c9a15ca13231772ca138544b1fb8b150cf2c1c88",
+  "subject": "E0045: Leaner streamed-run store for clustered-key radix agg (q18 subquery)",
+  "files": [
+    "src/execution/radix_partitioned_hashtable.cpp"
+  ],
+  "static": {
+    "added_lines": 79,
+    "removed_lines": 87,
+    "conditions": 2,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0128672016677283,
+  "accepted_faster": {
+    "q18": 1.28
+  },
+  "audit": {
+    "mechanism": "This rewrites the inner loops of an existing clustered-key radix aggregation path that a parent commit added. That path applies when a sink chunk is sorted on its first GROUP BY key. The rows in the chunk's first and last key runs go to a small boundary hash table. Each interior run of equal keys gets a single aggregate state outside the hash table and is never hashed. Before this change, run detection took two branchy passes over the keys (FindClusteredRuns, then FindRunHeads). Now it takes one branch-free pass: each row writes a candidate head and advances the head count by (cur != prev), records a per-row run id, and ORs together a 'decreasing' flag. The per-row state-address fill changes from a nested loop over runs to a flat states + (run_ids[i]-1)*stride. The routing, the run store, the merge and the semantics are unchanged. This is a standard branch-misprediction removal (predicated compaction) applied to run detection.",
+    "trigger": "The diff adds no new conditions. The new code runs whenever the pre-existing clustered path runs, under these gates:\n(1) Global gate. The path is enabled only if `number_of_threads > 1 && !radix_ht.grouping_set.empty()` and the first group key's physical type is INT8/16/32/64 or UINT8/16/32/64 (radix_partitioned_hashtable.cpp:251-262). It is disabled if any aggregate `IsDistinct()` (:266-269).\n(2) Per-chunk gate. The path is not taken if `count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= RadixHTLocalSinkState::MAX_CLUSTERED_CHUNKS` (:845). The key must have no NULLs and be non-decreasing within the chunk (`if (!sorted) return false;` :897). Once any thread sees an unsorted chunk, `gstate.any_unclustered` disables the path for all threads (:1049-1057).\n(3) Address-fill gate. The changed address fill in SinkInteriorRuns also needs `stream_runs_enabled`. That flag is false if `aggr.filter || aggr.function.HasStateDestructorCallback() || !aggr.function.HasStateCombineCallback()` (:275) or if any later group column is nested, FLOAT or DOUBLE (:279-284). It also needs `first_end < last_start` (:933), i.e. at least 3 runs in the chunk, a successful RegisterRunInterval (:934), and the other group columns changing only at key-run heads (:730-746).",
+    "constants": "The diff adds no new thresholds. The run_ids buffer is sized STANDARD_VECTOR_SIZE (:856), which is the engine's vector size and bounds the chunk (checked at :845). heads[n] is written for n <= i < count, so it stays in bounds. The inherited gates come from parent commits: number_of_threads > 1, the integral-key whitelist, and MAX_CLUSTERED_CHUNKS. They are unchanged here, and their tuning belongs to the audits of those commits. Just outside the gates (a non-integral first key, a single thread, an unsorted or NULL-containing key, DISTINCT aggregates), the code takes the ordinary hash-table AddChunk, exactly as before.",
+    "natural_class": "Multi-threaded GROUP BY whose first group key is an integer column that is physically clustered (non-decreasing per scan vector). Examples: tables loaded in key order, time-series keyed by an integer id or epoch, and parent/child fact tables stored in parent-key order. Runs are short (a few rows per key), which is where the branch-free form pays off most. Examples:\nSELECT session_id, count(*), sum(bytes) FROM events GROUP BY session_id HAVING sum(bytes) > 1e6;  -- events stored ordered by session_id\nSELECT DISTINCT user_id FROM clicks;  -- clicks loaded ordered by user_id\nSELECT order_id, customer_id, max(price) FROM order_items GROUP BY order_id, customer_id;  -- items in order_id order",
+    "fallback": "When the per-chunk sort or NULL check fails (now detected through the accumulated `decreasing` flag rather than an early exit, with the same result), SinkClustered returns false and the chunk goes to the normal ht.AddChunk (:1052-1058). When streaming is not allowed, interior rows go to the main HT via Slice and AddChunk (:943-951), which is unchanged. One cost is that the new scan has no early exit, so an unsorted chunk is scanned in full instead of stopping at the first descent. That chunk then disables clustering globally, so this costs at most one vector per thread.",
+    "label": "general",
+    "label_reason": "The change is a pure implementation improvement to an existing code path. It merges two run-detection passes into one, removes the data-dependent branches using a standard predicated-compaction idiom, and turns a nested address fill into a flat one. It adds no new gates, constants or shape tests, so any query that already took the clustered or streamed-run path benefits. The gating it inherits (sorted integral leading key, multiple threads) is a natural physical-property condition and belongs to the parent commits. The benefit concentrates on short runs like q18's roughly 4 rows per orderkey, but nothing in the code depends on that.",
+    "citations": [
+      "src/execution/radix_partitioned_hashtable.cpp:675-685 `heads[n] = UnsafeNumericCast<sel_t>(i); n += cur != prev; decreasing |= cur < prev; run_ids[i] = ...(n - 1);`",
+      "src/execution/radix_partitioned_hashtable.cpp:703-709 `first_end = run_count > 1 ? heads[1] : count; last_start = run_count > 1 ? heads[run_count - 1] : 0;`",
+      "src/execution/radix_partitioned_hashtable.cpp:725-726 `const SelectionVector heads(lstate.run_heads.data() + 1); const idx_t run_count = chunk_run_count - 2;`",
+      "src/execution/radix_partitioned_hashtable.cpp:772-774 `addresses[i - begin] = states + (static_cast<idx_t>(run_ids[i]) - 1) * stride;`",
+      "src/execution/radix_partitioned_hashtable.cpp:251 `if (number_of_threads > 1 && !radix_ht.grouping_set.empty())`",
+      "src/execution/radix_partitioned_hashtable.cpp:275 `if (aggr.filter || aggr.function.HasStateDestructorCallback() || !aggr.function.HasStateCombineCallback())`",
+      "src/execution/radix_partitioned_hashtable.cpp:845 `if (count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= RadixHTLocalSinkState::MAX_CLUSTERED_CHUNKS)`",
+      "src/execution/radix_partitioned_hashtable.cpp:856 `make_unsafe_uniq_array_uninitialized<sel_t>(STANDARD_VECTOR_SIZE)`",
+      "src/execution/radix_partitioned_hashtable.cpp:933-942 `if (first_end < last_start) { ... SinkInteriorRuns(..., run_count)`",
+      "src/execution/radix_partitioned_hashtable.cpp:1052-1058 `!SinkClustered(...)) { ... ht.AddChunk(group_chunk, payload_input, filter);`"
+    ]
+  },
+  "audit_cost_usd": 0.3087786
+}

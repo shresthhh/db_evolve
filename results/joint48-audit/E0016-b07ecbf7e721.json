@@ -1,0 +1,46 @@
+{
+  "id": "E0016",
+  "sha": "b07ecbf7e721bda6cd399b0ae1c44d5bc8d8949d",
+  "subject": "E0016: Rerun: BF for hash joins whose build side is a DELIM_GET",
+  "files": [
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 2,
+    "removed_lines": 1,
+    "conditions": 0,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0334823570771987,
+  "accepted_faster": {
+    "q04": 1.05,
+    "q14": 1.1,
+    "q22": 1.26
+  },
+  "audit": {
+    "mechanism": "When a hash join's build side (children[1]) is a LOGICAL_DELIM_GET, the optimizer now always marks it as \"build side has a filter\". That one flag is what makes the join eligible to push a Bloom filter on its build keys into the probe-side table scan. A DELIM_GET produces the set of distinct correlation keys from the outer query of a decorrelated subquery, so it is usually a small subset of the probe table's key domain. A Bloom filter then lets the inner scan skip rows whose key no outer row references. Before the change, the flag for this case came from `IsFiltering(join.children[0])`, i.e. whether the *probe* side had a filter. So a DELIM_GET build side got a Bloom filter only if the inner (probe) subtree happened to contain a filter or a filtered scan.",
+    "trigger": "All of the following must hold, and only the first is new.\n\n1. Plan shape (new): the comparison join's build child is a DELIM_GET: `if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) { ... build_side_has_filter = true; }` (src/optimizer/join_filter_pushdown_optimizer.cpp:331-333).\n\n2. Join type (existing): not MARK/SINGLE/LEFT/OUTER/ANTI/RIGHT_ANTI/RIGHT_SEMI (src/optimizer/join_filter_pushdown_optimizer.cpp:234-245). In practice that means INNER, SEMI or RIGHT.\n\n3. Pushdown target (existing): at least one comparison condition can be pushed down, and a LogicalGet target is found on the probe side: `if (!pushdown_info->probe_info.empty())` (src/optimizer/join_filter_pushdown_optimizer.cpp:329).\n\n4. Runtime gates (existing, unchanged), in `CanUseBloomFilter`:\n   - not a perfect hash table: `if (is_perfect_hashtable) return false;` (src/execution/operator/join/physical_hash_join.cpp:873)\n   - equality key: `cmp == ExpressionType::COMPARE_EQUAL` (src/execution/operator/join/physical_hash_join.cpp:879)\n   - probe larger than build: `build_to_probe_ratio > 1.0` (src/execution/operator/join/physical_hash_join.cpp:884)\n   - final check: `return can_use_bf && build_side_has_filter && probe_larger_then_build;` (src/execution/operator/join/physical_hash_join.cpp:888)\n\n5. Call-site gates (existing): the filter is only pushed if `!has_cast && pushdown_column.storage_offset.IsNull() && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(...)` (src/execution/operator/join/physical_hash_join.cpp:1059).",
+    "constants": "The change adds no constants. It replaces a computed boolean with the literal `true`, based on the idea that the distinct outer keys are usually far fewer than the probe side's keys.\n\nThe existing constants it relies on are untouched:\n\n- **Probe/build ratio `> 1.0`** (physical_hash_join.cpp:884): a natural break-even rule, not tuned. If the estimated probe side is not larger than the hash table, no Bloom filter is built.\n- **Selectivity auto-disable** `BF_THRESHOLD = 0.25f`, `BF_CHECK_N = 75` (src/include/duckdb/planner/filter/selectivity_optional_filter.hpp:52-53), applied via `SelectivityOptionalFilter(... BF_THRESHOLD, BF_CHECK_N)` (physical_hash_join.cpp:953-954): these are upstream DuckDB defaults. After 75 vectors, a filter that passes at least 25% of rows is paused.\n\nJust outside the assumption, when the DELIM_GET holds nearly every key because the outer side is unfiltered: the engine pays for building the Bloom filter and probing about 75 vectors, then the filter switches itself off. That costs a little; it does not change correctness.",
+    "natural_class": "Any correlated subquery that DuckDB decorrelates into a DELIM join, where the correlation predicate is an equality on an uncast base-table column of the inner table, and the inner table is larger than the set of distinct outer keys. This is a common pattern well beyond TPC-H: per-group comparisons, \"latest row per entity\", correlated EXISTS/IN, and correlated scalar aggregates.\n\nExample 1:\n```sql\nSELECT c.id, c.name\nFROM customers c\nWHERE c.region = 'EU'\n  AND c.credit_limit < (SELECT sum(p.amount) FROM payments p WHERE p.customer_id = c.id);\n```\nThe decorrelated inner part is roughly `payments JOIN DELIM_GET(c.id)`. The Bloom filter on the EU customer ids now prunes the `payments` scan.\n\nExample 2:\n```sql\nSELECT e.*\nFROM events e\nWHERE e.ts = (SELECT max(e2.ts) FROM events e2 WHERE e2.device_id = e.device_id)\n  AND e.kind = 'error';\n```\n\nWithout outer filters (for example, all customers), the DELIM_GET covers every key. The Bloom filter is still built but gets auto-disabled after 75 vectors.",
+    "fallback": "Joins whose build child is not a DELIM_GET take the unchanged path: `build_side_has_filter = IsFiltering(join.children[1])` (src/optimizer/join_filter_pushdown_optimizer.cpp:335). For DELIM_GET joins, the min/max range filters, perfect-hash path and other pushdown logic are unchanged. Only the Bloom-filter eligibility flag differs. If any runtime gate fails (perfect hash table, non-equality key, probe not larger than build, cast or compressed column), no Bloom filter is pushed, exactly as before.",
+    "label": "general",
+    "label_reason": "The trigger is an operator-type test (the build side is a DELIM_GET), not a schema-, size- or query-specific check. It applies to every decorrelated correlated subquery with an equality correlation. The reasoning behind it is principled: a DELIM_GET carries the distinct outer keys, which act as a semi-join reducer for the inner scan, much like sideways information passing or magic sets. The old code checked `children[0]`, the probe side, which looks like a mistake or at best an indirect proxy.\n\nThe change adds no tunable constants. The existing upstream safety nets (probe > build, the 25%/75-vector selectivity auto-disable) bound the downside when the DELIM_GET is not actually selective.\n\nThe only questionable part is the unconditional `true`. A more careful version would check whether the outer side of the DELIM join is filtered. Even so, it is a broad, natural rule, not a branch for q22.",
+    "citations": [
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:331 `if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) {`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:333 `pushdown_info->build_side_has_filter = true;`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:335 `pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:234-245 `case JoinType::MARK: ... case JoinType::RIGHT_SEMI: ... return;`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:329 `if (!pushdown_info->probe_info.empty()) {`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:210-230 `bool JoinFilterPushdownOptimizer::IsFiltering(...)`",
+      "src/execution/operator/join/physical_hash_join.cpp:873 `if (is_perfect_hashtable) { return false; }`",
+      "src/execution/operator/join/physical_hash_join.cpp:879 `const bool can_use_bf = cmp == ExpressionType::COMPARE_EQUAL;`",
+      "src/execution/operator/join/physical_hash_join.cpp:884 `const bool probe_larger_then_build = build_to_probe_ratio > 1.0;`",
+      "src/execution/operator/join/physical_hash_join.cpp:888 `return can_use_bf && build_side_has_filter && probe_larger_then_build;`",
+      "src/execution/operator/join/physical_hash_join.cpp:953 `make_uniq<SelectivityOptionalFilter>(std::move(bf_filter), SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N)`",
+      "src/include/duckdb/planner/filter/selectivity_optional_filter.hpp:52-53 `BF_THRESHOLD = 0.25f; BF_CHECK_N = 75;`",
+      "src/execution/operator/join/physical_hash_join.cpp:1059 `if (!has_cast && pushdown_column.storage_offset.IsNull() && ht &&join_condition[filter_idx] == 0 && CanUseBloomFilter(...))`"
+    ]
+  },
+  "audit_cost_usd": 0.2262748
+}

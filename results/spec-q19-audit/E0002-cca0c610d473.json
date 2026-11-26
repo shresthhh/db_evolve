@@ -1,0 +1,50 @@
+{
+  "id": "E0002",
+  "sha": "cca0c610d4735e6b5ffc36ed895a166dc2ace083",
+  "subject": "E0002: Linear-time union in scan ConjunctionOr filter",
+  "files": [
+    "src/storage/table/column_segment.cpp"
+  ],
+  "static": {
+    "added_lines": 386,
+    "removed_lines": 0,
+    "conditions": 77,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"Unsupported comparison type in DenseComparison\"",
+      "\"Unsupported expression in DenseExpressionMask\"",
+      "\"Unsupported type in TryDenseFilterSelection\"",
+      "\"duckdb/planner/expression/bound_between_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_comparison_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_conjunction_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_constant_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_reference_expression.hpp\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.6094693176545876,
+  "accepted_faster": {
+    "q19": 1.61
+  },
+  "audit": {
+    "mechanism": "The change adds a dense evaluation path for single-column table-scan filters made of AND/OR trees of constant comparisons. Each leaf comparison runs as one branchless loop that writes a 0/1 byte mask over the rows already selected. Masks are combined with &= or |=, and the output selection is emitted in input order, with NULL rows removed through validity at the end. If an earlier filter already reduced the incoming selection, the selected values are first gathered into a compact buffer, so the work stays proportional to the surviving rows. Separately, the generic CONJUNCTION_OR union, which checked every new row against the existing result for duplicates (quadratic), is replaced by a per-row bool bitmap. Each later child only sees rows not yet matched, and the loop stops early once every row has matched.",
+    "trigger": "Dense path (TryDenseFilterSelection). It is tried at the top of the CONJUNCTION_OR case (column_segment.cpp:739) and the EXPRESSION_FILTER case (:947). It requires all of the following:\n- `approved_tuple_count == 0 || approved_tuple_count > STANDARD_VECTOR_SIZE || vdata.sel->IsSet()` must be false (:659), i.e. a non-empty, flat vector of at most one vector's worth of rows.\n- The column's physical type is one of int8..int128, uint8..uint128, float or double (:660-674). This also covers DATE, DECIMAL and TIMESTAMP, which are stored as integers.\n- For an ExpressionFilter: the tree contains only BOUND_CONJUNCTION, BOUND_COMPARISON (=, <>, <, >, <=, >=) and BOUND_BETWEEN nodes. Every comparison is between the column, `BoundReferenceExpression>().index == 0 && expr.return_type == type` (:501), and a non-NULL constant of exactly that type, `!value.IsNull() && value.type() == type` (:509).\n- For a ConjunctionOr/And TableFilter: every leaf is a CONSTANT_COMPARISON with a non-NULL constant, `!constant_filter.constant.IsNull() && IsDenseComparison(...)` (:432).\n\nBitmap OR path: taken when the dense path is not applicable, the filter is CONJUNCTION_OR, and no incoming sel index is `>= STANDARD_VECTOR_SIZE` (:748-750).",
+    "constants": "The only constant is STANDARD_VECTOR_SIZE (2048 by default). It is DuckDB's compile-time vector size and is used only to size stack buffers and as a safety bound; it is not tuned to this workload. Just outside the bound (scan_count larger than one vector, which happens in some segment scans, or sel indices >= 2048), the code falls back to the original path. Everything else in the trigger is a type or shape test, not a number. NULL constants, NOT, IN, LIKE, functions, casts and multi-column expressions are all rejected.",
+    "natural_class": "Any scan with a pushed-down single-column filter that is an AND/OR (or BETWEEN) combination of constant comparisons on a numeric, decimal, date or timestamp column. Two examples:\n- `SELECT count(*) FROM orders_log WHERE amount BETWEEN 10 AND 20 OR amount BETWEEN 100 AND 200 OR amount > 5000;` with amount a DECIMAL or DOUBLE column. This is pushed as an EXPRESSION_FILTER.\n- `SELECT * FROM events WHERE ts_day = DATE '2024-01-01' OR ts_day = DATE '2024-03-01' OR ts_day >= DATE '2024-12-01';` This is a ConjunctionOrFilter of constant comparisons.\n\nAny query with an OR filter that falls back to the generic per-child loop (for example over string columns or mixed filter kinds) also gets the linear bitmap union.",
+    "fallback": "When the dense trigger fails, the CONJUNCTION_OR case uses the new bitmap union if all indices are < STANDARD_VECTOR_SIZE (:748-750). Otherwise it runs the original quadratic loop unchanged. The EXPRESSION_FILTER case falls through to the original ExpressionExecutor::SelectExpression code (:952 onward), which is unchanged. Other filter types are not affected.",
+    "label": "general",
+    "label_reason": "Both parts are standard techniques. Branchless mask evaluation of a predicate tree with selection compaction is a textbook vectorised-filter approach, and replacing a quadratic union with a bitmap is a straightforward algorithmic fix. The gates are type and shape conditions (numeric type, single column, constant comparisons, no NOT, flat vector) needed for correctness and for the template specialisation. No thresholds are tuned to TPCH sizes, and nothing refers to particular columns, tables or constants. The motivating query is q19 (an OR of BETWEEN ranges on l_quantity), but the code covers the entire broad class of numeric range/equality disjunctions on one column. A minor caveat: a dense mask evaluates every OR branch on every row, with no short-circuit. For highly selective first branches this could in principle do more work than the old path, but it is still bounded by rows \u00d7 leaves.",
+    "citations": [
+      "src/storage/table/column_segment.cpp:432 `return !constant_filter.constant.IsNull() && IsDenseComparison(constant_filter.comparison_type);`",
+      "src/storage/table/column_segment.cpp:501 `expr.Cast<BoundReferenceExpression>().index == 0 && expr.return_type == type;`",
+      "src/storage/table/column_segment.cpp:509 `return !value.IsNull() && value.type() == type;`",
+      "src/storage/table/column_segment.cpp:645 `// NULL rows never pass a tree of AND/OR comparisons`",
+      "src/storage/table/column_segment.cpp:659 `if (approved_tuple_count == 0 || approved_tuple_count > STANDARD_VECTOR_SIZE || vdata.sel->IsSet()) {`",
+      "src/storage/table/column_segment.cpp:739 `if (TryDenseFilterSelection(sel, vector, vdata, filter, approved_tuple_count)) {` (CONJUNCTION_OR)",
+      "src/storage/table/column_segment.cpp:748-750 `bool indices_in_range = true; ... if (sel.get_index(i) >= STANDARD_VECTOR_SIZE) {`",
+      "src/storage/table/column_segment.cpp:947 `if (TryDenseFilterSelection(sel, vector, vdata, filter, approved_tuple_count)) {` (EXPRESSION_FILTER)",
+      "src/storage/table/column_segment.cpp:952 `if (scan_count > STANDARD_VECTOR_SIZE) {` (original expression-filter path, unchanged)"
+    ]
+  },
+  "audit_cost_usd": 0.1783462
+}

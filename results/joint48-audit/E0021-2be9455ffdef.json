@@ -1,0 +1,57 @@
+{
+  "id": "E0021",
+  "sha": "2be9455ffdefd50e9428320e500c9fbf4a7ac631",
+  "subject": "E0021: Bundle: deliminate selective SEMI (E0019) + exact BF through CM offset (E0020)",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/optimizer/deliminator.cpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp",
+    "src/planner/filter/bloom_filter.cpp"
+  ],
+  "static": {
+    "added_lines": 199,
+    "removed_lines": 40,
+    "conditions": 27,
+    "numeric_constants": [
+      "203"
+    ],
+    "string_literals": [
+      "\"key_offset\""
+    ]
+  },
+  "accepted_gain": 1.0389180807335519,
+  "accepted_faster": {
+    "q04": 1.44,
+    "q09": 1.09,
+    "q19": 1.07
+  },
+  "audit": {
+    "mechanism": "The change has three parts. (1) Deliminator: a correlated EXISTS/IN that becomes a SEMI delim join whose outer side has a selection used to keep its join with the DelimGet, so the deduplicated outer keys could shrink the subquery. Now, when the subquery is simple and correlated by plain equality, that join is removed and the plan becomes an ordinary SEMI hash join. Reduction of the subquery's input is left to runtime join filters (min/max and Bloom filter). IS NOT DISTINCT FROM is turned into = when the subquery-side column is known to be non-NULL. (2) The join-filter pushdown optimizer no longer skips RIGHT_SEMI and RIGHT_ANTI joins. These joins emit only build rows, so dropping probe rows that cannot match is safe. (3) The exact-bitmap Bloom filter can now be probed through compressed materialization's integral offset. The stored value is (key - offset), and the filter adds the offset back modulo 2^64 before the lookup; the statistics check is shifted the same way. Before this change, a Bloom filter was never pushed through such an offset.",
+    "trigger": "Deliminator rewrite (src/optimizer/deliminator.cpp:155): `HasSelection(delim_join) && SelectionIsReplaceableByJoinFilter(candidate)`, which requires:\n- `delim_join.join_type == JoinType::SEMI`, `candidate.delim_get_count == 1` and `candidate.joins.size() == 1`;\n- the join with the DelimGet is a LOGICAL_COMPARISON_JOIN of type INNER or SEMI;\n- every condition is `COMPARE_EQUAL` between two `BOUND_COLUMN_REF`s;\n- `SubqueryIsSimple`: the subquery contains only PROJECTION/FILTER/GET/DELIM_GET and INNER or SEMI comparison joins.\n\n`HasSelection` is true for any LOGICAL_FILTER, or any table filter other than IS_NOT_NULL, on the outer side (deliminator.cpp:212-225). The NOT DISTINCT \u2192 = conversion runs only if all joins were removed and `all_equality_conditions` holds (deliminator.cpp:181).\n\nJoin-filter generation: RIGHT_SEMI and RIGHT_ANTI were deleted from the bail-out list in join_filter_pushdown_optimizer.cpp:236-244.\n\nOffset Bloom filter (physical_hash_join.cpp:1088-1100) requires:\n- `!pushdown_column.storage_offset.IsNull()`, i.e. the probe key went through `__internal_compress_integral_*`, with one offset only (join_filter_pushdown_optimizer.cpp:60-75);\n- `storage_type.IsIntegral() && condition_type.IsIntegral()`;\n- `join_condition[filter_idx] == 0` (the first key only);\n- `CanUseBloomFilter(...)`: the condition is an equality, the table is not a perfect hash table, `build_side_has_filter`, and `estimated probe cardinality / ht->Count() > 1.0` (physical_hash_join.cpp:873-888);\n- `TrySetExactBloomFilter` with the raw min/max actually produced an exact filter (`ht->GetBloomFilter().IsExact()`). If the filter is hashed, nothing is pushed (physical_hash_join.cpp:1095-1099; PushBloomFilter also returns if `!IsExact()`, diff line ~959).",
+    "constants": "The new code adds no numeric constant. The gates it inherits are older:\n- `build_to_probe_ratio > 1.0` (physical_hash_join.cpp:885) is a principled break-even point: the filter is built only when more rows are probed than built.\n- `EXACT_BF_MAX_BITS_PER_KEY = 128` and `EXACT_BF_MAX_RANGE = 1<<32` (physical_hash_join.cpp:893-894) decide whether the filter is exact. They bound memory relative to the pointer table and are not sized to TPC-H. Just outside them (a sparse or very wide key range), no filter is pushed through the offset (no hashed fallback), so the old behaviour applies.\n\nSerialization property id 203 and the modulo-2^64 arithmetic are mechanical. The structural tests (exactly 1 DelimGet, 1 join, equality on column refs only, INNER/SEMI joins only) are shape whitelists, not tuned numbers. A subquery with an aggregate, a LEFT join or a non-equality correlation keeps the old behaviour: the deepest DelimGet join is retained.",
+    "natural_class": "Two groups of queries take the new path:\n- Any correlated EXISTS or IN subquery with an equality correlation, a filtered outer side, and a subquery of scans, filters and inner joins.\n- Any hash join whose probe key has been compressed-materialized (an integer column with a nonzero minimum that flows through a materializing operator) and whose build-side keys are dense enough for an exact bitmap.\n\nExample 1:\n```sql\nSELECT u.id\nFROM users u\nWHERE u.country = 'DE'\n  AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.kind = 'purchase');\n```\nThis becomes a SEMI or RIGHT_SEMI join with a min/max and Bloom filter on events.user_id.\n\nExample 2:\n```sql\nSELECT p.sku\nFROM products p\nWHERE p.category = 'toys'\n  AND p.id IN (SELECT r.product_id FROM reviews r JOIN accounts a ON a.id = r.account_id WHERE a.verified);\n```\n\nExample 3, an offset Bloom filter, where the probe key ids start at 10^9:\n```sql\nSELECT count(*)\nFROM sales s\nJOIN (SELECT id FROM stores WHERE region = 'west') st ON s.store_id = st.id;\n```\nwhen s.store_id reaches the join through compressed materialization.",
+    "fallback": "If the deliminator conditions fail, the old logic runs unchanged: the deepest join with the DelimGet is kept and `all_removed = false` (deliminator.cpp:163-167). If the offset branch's conditions fail, or the filter would be hashed rather than exact, no Bloom filter is pushed for an offset column, as before. Only the earlier `storage_offset.IsNull()` branch builds hashed filters (physical_hash_join.cpp:1080). With `key_offset = 0` the Bloom filter lookups are identical to the old ones.\n\nThere is one behavioural change with no fallback. In the matching delim shape, the rewrite is unconditional: it does not consult selectivity or cost. If the runtime filters do not fire (for example, the build side is larger than the probe side), the subquery loses the old reduction by the outer selection. The author also reports a likely q07 regression (+4% to +12% in bench), which comes from the extra offset Bloom filter on a scan that was already filtered.",
+    "label": "general",
+    "label_reason": "I label this \"general\", with one cost-related caveat. All three parts are standard, schema-agnostic extensions of existing machinery:\n- Removing the join with the DelimGet for a simple equality-correlated EXISTS or IN is a well-known decorrelation simplification, and its gate is a natural shape whitelist rather than tuned numbers.\n- Allowing join filters on RIGHT_SEMI and RIGHT_ANTI joins is provably safe and closes an existing gap.\n- Probing an exact bitmap through a known additive offset is an exact algebraic fix that lets an existing optimization work after compressed materialization.\n\nNo constant is introduced or tuned to TPC-H sizes. The caveat is that the deliminator rewrite trades a guaranteed reduction for a runtime filter that is only conditionally built, with no cost check. The q07 regression shows the extra filters are not always a win. That is a cost-model weakness, not benchmark matching.",
+    "citations": [
+      "src/optimizer/deliminator.cpp:155 \"if (!candidate.joins.empty() && HasSelection(delim_join) && SelectionIsReplaceableByJoinFilter(candidate))\"",
+      "diff deliminator.cpp SelectionIsReplaceableByJoinFilter: \"delim_join.join_type != JoinType::SEMI || candidate.delim_get_count != 1 || candidate.joins.size() != 1\"",
+      "diff deliminator.cpp: \"cond.comparison != ExpressionType::COMPARE_EQUAL || cond.left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF\"",
+      "diff deliminator.cpp SubqueryIsSimple: \"if (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) return false;\"",
+      "src/optimizer/deliminator.cpp:163-167 \"Keep the deepest join with DelimGet in these cases\" (old path retained)",
+      "src/optimizer/deliminator.cpp:181 \"if (replace_selection_by_join_filter && all_equality_conditions) ConvertNotDistinctToEqual(...)\"",
+      "src/optimizer/deliminator.cpp:224 \"case LogicalOperatorType::LOGICAL_FILTER: return true;\"",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:236 removed \"case JoinType::RIGHT_ANTI: case JoinType::RIGHT_SEMI:\"",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:60 \"StringUtil::StartsWith(func.function.name, \\\"__internal_compress_integral_\\\")\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1088 \"!pushdown_column.storage_offset.IsNull() && pushdown_column.storage_type.IsIntegral() && condition_type.IsIntegral() && ht && join_condition[filter_idx] == 0\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1095 \"TrySetExactBloomFilter(*ht, op, raw_min_val, raw_max_val); if (ht->GetBloomFilter().IsExact())\"",
+      "src/execution/operator/join/physical_hash_join.cpp:885 \"const bool probe_larger_then_build = build_to_probe_ratio > 1.0;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:893-894 \"EXACT_BF_MAX_BITS_PER_KEY = 128; EXACT_BF_MAX_RANGE = idx_t(1) << 32\"",
+      "diff PushBloomFilter: \"if (!ht.GetBloomFilter().IsExact() || !column.storage_type.IsValid() || ...) return;\"",
+      "diff bloom_filter.cpp TemplatedLookupExact: \"bf.LookupExact(static_cast<uint64_t>(data[idx]) - key_offset)\"",
+      "diff bloom_filter.cpp TemplatedCheckStatisticsExact: \"if (static_cast<uint64_t>(key_min) != key_min_wide || ... key_min > key_max) return NO_PRUNING_POSSIBLE\""
+    ]
+  },
+  "audit_cost_usd": 0.30584500000000003
+}

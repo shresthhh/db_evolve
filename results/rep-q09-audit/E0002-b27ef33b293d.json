@@ -1,0 +1,47 @@
+{
+  "id": "E0002",
+  "sha": "b27ef33b293d02e06d6d7d254506d027d3416668",
+  "subject": "E0002: Bloom filter on first equality key of multi-condition hash joins",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 18,
+    "removed_lines": 5,
+    "conditions": 2,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.276598680582108,
+  "accepted_faster": {
+    "q09": 1.28
+  },
+  "audit": {
+    "mechanism": "Before this change, DuckDB built a bloom filter on the hash-join build side and pushed it into the probe-side table scan only when the join had a single key. Now joins with several equality keys also get one, but it covers only the first join condition's key column. For multi-key joins the build side reads that key column back out of the hash table's row storage, hashes it alone with VectorOperations::Hash and inserts those hashes into the filter. The usual row hash can't be used because it mixes all the keys together. The probe side was already set up for a filter on conditions[0], and it applies the filter to that one column during the scan, wrapped in the existing self-disabling selectivity filter.",
+    "trigger": "All of these must hold:\n(a) The pushdown filter being finalised belongs to join condition 0: `const bool is_first_key = join_condition[filter_idx] == 0;` (physical_hash_join.cpp:900).\n(b) That condition has no cast: `!has_cast` (physical_hash_join.cpp:899-901).\n(c) `CanUseBloomFilter` returns true. The hash table exists and is not a perfect hash table (`if (is_perfect_hashtable) return false;`, physical_hash_join.cpp:769). The new check `cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL` replaces the old `ht->conditions.size() == 1` (physical_hash_join.cpp:775-776). The build side has a filter (`build_side_has_filter`). The probe side is estimated larger than the build side: `build_to_probe_ratio > 1.0` (physical_hash_join.cpp:780-782).\n(d) The filter is only pushed on the deferred, in-memory finalize path (`if (deferred_bloom_filters)`, physical_hash_join.cpp:903).\n(e) On the build side, the multi-key branch runs when `bloom_filter.IsInitialized()` and `conditions.size() != 1` (join_hashtable.cpp:720-731).\nThe hash-table constructor puts equality conditions first (\"all non-equality conditions are at the back\", join_hashtable.cpp:57) and a hash join always has at least one equality (join_hashtable.cpp:68 `D_ASSERT(!equality_types.empty())`). So `conditions[0].comparison == EQUAL` is effectively always true. The real new gate is simply \"hash join with two or more keys\". No data type, schema or table-size condition is added.",
+    "constants": "The change adds no new constants. The ones it relies on were already there:\n- `build_to_probe_ratio > 1.0` (physical_hash_join.cpp:782): a principled break-even point, only build a filter when there are more probe rows than build rows. Just below it, no bloom filter is built and the old behaviour applies.\n- `BF_THRESHOLD = 0.25f` and `BF_CHECK_N = 75` (selectivity_optional_filter.hpp:52-53): the existing adaptive switch-off for the probe-side filter, shared with single-key joins and not tuned in this change.\n- Condition index `0`: not a tuned value, but a structural choice. The filter always goes on whichever equality key the planner listed first, whether or not it is the selective one; the author admits this. When key 0 is unselective, the build side pays an extra gather and hash per row (join_hashtable.cpp:726-730) and gets nothing for it, until the selectivity filter turns the probe check off.",
+    "natural_class": "Any hash join that meets all of these:\n- it has two or more equality keys (composite foreign keys);\n- the build side is filtered;\n- the probe side is larger than the build side;\n- the probe side is a real table scan, so the filter can be pushed down;\n- the first key matches the scan column's type exactly (no cast).\nThe filter is useful when the first key alone already removes many probe rows.\n\nExample 1, order lines against a filtered composite-key shipment table:\n`SELECT sum(l.qty) FROM order_lines l JOIN shipments s ON l.order_id = s.order_id AND l.line_no = s.line_no WHERE s.carrier = 'UPS';`\n\nExample 2, a fact table joined to a snapshot dimension on (customer_id, region_id):\n`SELECT count(*) FROM events e JOIN customer_snapshot c ON e.customer_id = c.customer_id AND e.region_id = c.region_id WHERE c.tier = 'gold';`\n\nComposite-key joins like these are common in star and snowflake schemas and in bridge tables.",
+    "fallback": "- Single-key joins keep the original path exactly: `if (conditions.size() == 1) { bloom_filter.InsertHashes(hashes_v, count); }` (join_hashtable.cpp:721-722). Their eligibility logic is unchanged apart from the redundant equality check on condition 0.\n- In a multi-key join, filters on keys other than condition 0 get only the existing min/max zone-map filters, as before.\n- Joins that fail any other guard (perfect hash table, no build-side filter, probe not larger than build, cast, external join) get no bloom filter, as before.",
+    "label": "general",
+    "label_reason": "This is general. It extends an existing technique, probe-side bloom-filter pushdown, from single-key joins to multi-key ones by filtering on one key, which is a standard and correct relaxation: a match on all keys implies a match on key 0. The only new gate is \"two or more equality keys\", which is broad and natural. Every threshold was already there for single-key joins, and nothing depends on TPCH's schema, data sizes or query shapes. q09 benefits because of its composite key (partsupp joined on part key and supplier key), but any composite-key join with a filtered build side would too. The weak spot is choosing key 0 blindly instead of the most selective key. When key 0 is unselective, the build side does extra work, which the adaptive selectivity filter only partly limits. That is a quality limitation, not overfitting to the benchmark.",
+    "citations": [
+      "src/execution/join_hashtable.cpp:720 `if (bloom_filter.IsInitialized()) {`",
+      "src/execution/join_hashtable.cpp:721 `if (conditions.size() == 1) {`",
+      "src/execution/join_hashtable.cpp:728-731 `data_collection->Gather(chunk_state.row_locations, sel, count, 0, key_v, sel, nullptr); VectorOperations::Hash(key_v, key_hashes_v, count); bloom_filter.InsertHashes(key_hashes_v, count);`",
+      "src/execution/join_hashtable.cpp:57 `// all non-equality conditions are at the back`",
+      "src/execution/join_hashtable.cpp:68 `D_ASSERT(!equality_types.empty());`",
+      "src/execution/join_hashtable.cpp:752-753 `if (should_build_bloom_filter) { bloom_filter.Initialize(context, Count());`",
+      "src/execution/operator/join/physical_hash_join.cpp:769 `if (is_perfect_hashtable) { return false;`",
+      "src/execution/operator/join/physical_hash_join.cpp:775-776 `cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL`",
+      "src/execution/operator/join/physical_hash_join.cpp:782 `const bool probe_larger_then_build = build_to_probe_ratio > 1.0;`",
+      "src/execution/operator/join/physical_hash_join.cpp:785 `return can_use_bf && build_side_has_filter && probe_larger_then_build;`",
+      "src/execution/operator/join/physical_hash_join.cpp:791-793 `!ht.NullValuesAreEqual(0)` / `ht.conditions[0].right->ToString()` / `ht.conditions[0].left->return_type`",
+      "src/execution/operator/join/physical_hash_join.cpp:900-901 `const bool is_first_key = join_condition[filter_idx] == 0; if (!has_cast && is_first_key && ht && CanUseBloomFilter(...))`",
+      "src/execution/operator/join/physical_hash_join.cpp:903 `if (deferred_bloom_filters) {`",
+      "src/include/duckdb/planner/filter/selectivity_optional_filter.hpp:52-53 `BF_THRESHOLD = 0.25f; BF_CHECK_N = 75;`",
+      "src/planner/filter/bloom_filter.cpp:90-92 `VectorOperations::Hash(keys_v, state.hashes_v, approved_count);`"
+    ]
+  },
+  "audit_cost_usd": 0.16878659999999998
+}

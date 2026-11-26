@@ -1,0 +1,47 @@
+{
+  "id": "E0001",
+  "sha": "fa5fe35db0c12f28f99bbc74bbeb251e46e774c5",
+  "subject": "E0001: Sub-row-group scan morsels for tables with few row groups",
+  "files": [
+    "src/include/duckdb/storage/table/row_group_collection.hpp",
+    "src/storage/data_table.cpp",
+    "src/storage/table/row_group_collection.cpp"
+  ],
+  "static": {
+    "added_lines": 37,
+    "removed_lines": 4,
+    "conditions": 1,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/parallel/task_scheduler.hpp\""
+    ]
+  },
+  "accepted_gain": 1.227520590727015,
+  "accepted_faster": {
+    "q02": 1.23
+  },
+  "audit": {
+    "mechanism": "Parallel table scans of DuckDB's native storage used to hand out one whole row group (about 122,880 rows) per task, so a table with fewer row groups than threads could keep only a few threads busy. Now the morsel size is computed per scan: about 4 morsels per scheduler thread, at least 4 vectors (8,192 rows), and never more than one row group. When that is smaller than the row group, the scan uses the existing \"scan part of a row group from a vector offset\" branch, which used to run only under verify_parallelism. DataTable::MaxThreads uses the same formula, so the pipeline starts enough threads to consume the smaller morsels. This is standard morsel-driven over-decomposition, applied to small tables.",
+    "trigger": "This runs for every parallel scan of a DataTable's RowGroupCollection, and for transaction-local storage, which goes through the same RowGroupCollection::NextParallelScan (src/storage/local_storage.cpp:405). The morsel size is m = min(max(ceil(total_vectors / (4*T)), 4), row_group_size/2048), from src/storage/table/row_group_collection.cpp:283-288, where T is the scheduler thread count (`TaskScheduler::GetScheduler(context).NumberOfThreads()`, :328) and total_vectors comes from `scan_rows = state.max_row - state.row_groups->GetBaseRowId()` (:327). The sub-row-group branch is taken when `morsel_vectors * STANDARD_VECTOR_SIZE < current_row_group.count || state.vector_index > 0` (:331). With the default row group of 60 vectors this means, in practice, a table with fewer than about 4*T full row groups, i.e. fewer than about T*491k rows (for example under about 3.9M rows at T=8, or about 15.7M at T=32). It is skipped if verify_parallelism is on, which forces m=1 as before (:324-325). The thread-count side uses the same helper at src/storage/data_table.cpp:276-280: `parallel_scan_vector_count = RowGroupCollection::GetParallelScanMorselVectors(GetTotalRows(), row_group_size, threads)`. Nothing in the trigger depends on operators, plan shape, data types, table names or column statistics.",
+    "constants": "There are two constants and one input.\n- MORSELS_PER_THREAD = 4 (row_group_collection.cpp:281). This is a generic over-decomposition factor for load balancing, the usual round number in morsel-driven schedulers. It sets the cutoff of about 4*T row groups, which scales with hardware threads, not with TPCH table sizes. Just above the cutoff (\u22654T full row groups) m reaches 60 and the old whole-row-group path runs. Just below it, m is 59 or similar: nearly whole row groups split into one large piece plus a small leftover piece of one or two vectors. That is slightly wasteful but harmless.\n- MIN_MORSEL_VECTORS = 4, i.e. 8,192 rows (:282). This floor stops tiny tables from being split into 2,048-row tasks with high per-task overhead. It is a round number, not obviously derived from TPCH. A 10k-row table gives 2 morsels; a table under 8,192 rows gives one morsel, as before.\n- row_group_size/STANDARD_VECTOR_SIZE (:283) is the existing cap, so morsels never span row groups.\nNone of these values match TPCH table cardinalities. The thing that ties the change to this benchmark is the scale factor: at the benchmarked SF, supplier (100k rows) and part (17 row groups, per the author) fall under the 4*T cutoff. Any small or medium table would fall under it too.",
+    "natural_class": "The new path is taken by any parallel scan of a native DuckDB table with fewer than about 4*T row groups: dimension tables, lookup tables and small fact tables. It pays off most when per-row work in the scan pipeline is heavy (expensive filters, LIKE or regex on strings, hash-join probes, aggregation), because then a single 122k-row row group is a real serial bottleneck. Examples, not from TPCH:\n(1) `CREATE TABLE users AS SELECT i AS id, md5(i::VARCHAR) AS email FROM range(300000) t(i); SELECT count(*) FROM users WHERE regexp_matches(email, '^ab.*f$');` This is 3 row groups. Before, at most 3 threads did the work; now it is split into roughly 37 morsels of 8 vectors each at T=8.\n(2) `SELECT c.country, sum(o.amount) FROM orders o JOIN customers c ON o.cid = c.id GROUP BY 1;` where customers has about 200k rows. The build-side scan of customers now runs on all threads instead of 2.",
+    "fallback": "If the table has enough row groups that m reaches row_group_size/2048 (60), the condition at :331 is false for full row groups. The else branch at :345-350 then runs, which hands out one whole row group, the same as the old code. MaxThreads (data_table.cpp:281-282) then gives the old value too. Under verify_parallelism the old 1-vector morsels are kept, with one difference: processed_rows is now also updated in that mode (:339), which only changes progress reporting. Results stay correct because batch_index is still incremented for each morsel (:352), so order-preserving consumers still see the batches in order. Zone-map and row-group skipping still happens inside InitializeScanInRowGroup (:358-362), but it is now re-evaluated for each morsel instead of once per row group.",
+    "label": "general",
+    "label_reason": "This is textbook morsel-driven parallelism: split work finer when there are too few units for the available threads. The trigger is broad and natural (\"fewer than about 4 row groups per thread\"), it scales with the thread count rather than the data, and the two constants (4 morsels per thread, an 8k-row minimum) are generic round numbers. They are not set to TPCH cardinalities, and nothing tests the schema, operators or plan shape. The TPCH gain comes only from supplier and part happening to be small at this scale factor; any small-table scan with real per-row work benefits the same way. Caveats: the constants are untuned guesses, as the author says. Splitting row groups may add some cost for compressed or FSST segments, from seeking to a vector offset and from repeated per-morsel setup, and that cost was not measured. A row group just under the cutoff may be split into uneven pieces.",
+    "citations": [
+      "src/storage/table/row_group_collection.cpp:281 `static constexpr idx_t MORSELS_PER_THREAD = 4;`",
+      "src/storage/table/row_group_collection.cpp:282 `static constexpr idx_t MIN_MORSEL_VECTORS = 4;`",
+      "src/storage/table/row_group_collection.cpp:286-288 `morsel_vectors = (total_vectors + target_morsels - 1) / target_morsels; ... MaxValue(morsel_vectors, MIN_MORSEL_VECTORS); return MinValue(morsel_vectors, row_group_vectors);`",
+      "src/storage/table/row_group_collection.cpp:324-329 `if (ClientConfig::GetConfig(context).verify_parallelism) { morsel_vectors = 1; } else { auto scan_rows = state.max_row - state.row_groups->GetBaseRowId(); ...`",
+      "src/storage/table/row_group_collection.cpp:331 `if (morsel_vectors * STANDARD_VECTOR_SIZE < current_row_group.count || state.vector_index > 0) {`",
+      "src/storage/table/row_group_collection.cpp:339-340 `state.processed_rows += morsel_end - morsel_start; state.vector_index += morsel_vectors;`",
+      "src/storage/table/row_group_collection.cpp:345-349 else branch: `state.processed_rows += current_row_group.count; vector_index = 0; max_row = row_start + current_row_group.count;`",
+      "src/storage/table/row_group_collection.cpp:352 `scan_state.batch_index = ++state.batch_index;`",
+      "src/storage/data_table.cpp:277-279 `parallel_scan_vector_count = RowGroupCollection::GetParallelScanMorselVectors(GetTotalRows(), row_group_size, threads);`",
+      "src/storage/data_table.cpp:282 `return GetTotalRows() / parallel_scan_tuple_count + 1;`",
+      "src/function/table/table_scan.cpp:71 `max_threads = storage.MaxThreads(context);`",
+      "src/storage/local_storage.cpp:405 `return storage->GetCollection().NextParallelScan(context, state, scan_state);`"
+    ]
+  },
+  "audit_cost_usd": 0.1815238
+}

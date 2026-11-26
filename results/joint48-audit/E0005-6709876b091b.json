@@ -1,0 +1,42 @@
+{
+  "id": "E0005",
+  "sha": "6709876b091b65a0799bc8360a364b72c9f97eb4",
+  "subject": "E0005: Bloom filter on first key of multi-key hash joins",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 23,
+    "removed_lines": 6,
+    "conditions": 3,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0139315377781546,
+  "accepted_faster": {
+    "q09": 1.22
+  },
+  "audit": {
+    "mechanism": "Before this change, DuckDB built and pushed a probe-side Bloom filter only for hash joins with exactly one join condition. Now, when a hash join has several conditions, it builds a Bloom filter on the first equality key alone. The hash table's own hash mixes all equality keys, so it can't be reused for a one-column filter. Instead, at hash-table finalize time the engine gathers key column 0 from the stored build rows, hashes it with the same `VectorOperations::Hash` the probe-side BFTableFilter uses, and inserts those hashes into the filter. The filter is pushed into the probe-side scan only for the column that corresponds to condition 0. Probe rows whose first key has no match on the build side are dropped during the scan, before the join. This is a sound pre-filter: a row that fails key 0 cannot satisfy the full conjunction.",
+    "trigger": "The new path only adds to the existing Bloom-filter gate in JoinFilterPushdownInfo::CanUseBloomFilter. All of these must hold:\n- a non-perfect hash table: `if (is_perfect_hashtable) { return false; }`\n- the condition being pushed is plain equality: `const bool can_use_bf = cmp == ExpressionType::COMPARE_EQUAL;`. Before the change this also required `ht->conditions.size() == 1`; that requirement is removed.\n- the build side is filtered: `build_side_has_filter`\n- the estimated probe cardinality is larger than the build count: `build_to_probe_ratio > 1.0`\n- in FinalizeFilters, the pushdown column is the join's first condition, has no cast, and the build side's min and max differ: `!has_cast && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(...)`\n- the probe column must resolve to a base-table scan column (`probe_info` is not empty).\n\nReorderConditions puts equality and NOT DISTINCT FROM conditions first, so condition 0 is always an equality key. If it is IS NOT DISTINCT FROM, `cmp` is not COMPARE_EQUAL and no filter is built. In the hash table, multi-key build-time insertion happens when `bloom_filter.IsInitialized() && equality_types.size() > 1`. The old combined-hash insertion is now limited to `equality_types.size() == 1`.",
+    "constants": "The change adds no new constants. The only new structural choice is `join_condition[filter_idx] == 0`: the filter always goes on the first equality key in the planner's order, not on the most selective key. That is arbitrary rather than tuned to this workload, and the author lists choosing the most selective key as a follow-up. The thresholds the path inherits were already in the engine and also govern single-key joins:\n- `build_to_probe_ratio > 1.0` (the variable is misnamed; it is probe estimate / build count). It is a principled break-even point. Just below it, no Bloom filter is built.\n- SelectivityOptionalFilter::BF_THRESHOLD / BF_CHECK_N: the pushed filter switches itself off at runtime if it is not selective enough.\n- In-filter and perfect-hash-table limits (also existing) decide when other mechanisms take over instead.\n\nJust outside the trigger, for example when the first key is IS NOT DISTINCT FROM, the build side is unfiltered, or the probe estimate is no larger than the build count, multi-key joins get no Bloom filter, exactly as before.",
+    "natural_class": "Any hash join on a composite equality key (two or more keys) whose build side is filtered and smaller than the probe side, and whose first key maps to a probe-side base-table column. This is common for composite foreign keys, fact-to-fact joins on (id, line) or (tenant_id, id), and multi-column date keys. Examples:\n- `SELECT count(*) FROM order_lines ol JOIN returns r ON ol.order_id = r.order_id AND ol.line_no = r.line_no WHERE r.reason = 'damaged';`\n- `SELECT e.* FROM events e JOIN sessions s ON e.tenant_id = s.tenant_id AND e.session_id = s.session_id WHERE s.country = 'NZ';`\n\nThe gain depends on how selective the first key is on its own. If key 0 has few distinct values (for example, a tenant_id with low cardinality), the filter passes nearly everything and the runtime selectivity check disables it. The extra build-side gather and hash is still paid.",
+    "fallback": "When the trigger fails, the old path runs unchanged:\n- multi-key joins get no Bloom filter (only min/max and in-filters, as before)\n- single-key joins still insert the combined hash in InsertHashes (`equality_types.size() == 1`)\n- `first_key_bloom_filter` is false, so Finalize skips the extra gather and hash.",
+    "label": "general",
+    "label_reason": "This is the standard sideways-information-passing Bloom filter, extended from single-key to composite-key equi-joins by filtering on one key, which is a sound pre-filter. It adds no thresholds or shape tests of its own and reuses the engine's existing probe-larger-than-build, build-filtered and runtime-selectivity gates. Nothing refers to particular columns, types or sizes. Choosing key 0 is arbitrary and can be suboptimal, but it is not tuned to this benchmark. The measured benefit is concentrated in one benchmark query (q09), while the code path applies to any filtered composite-key join.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:775 `const bool can_use_bf = cmp == ExpressionType::COMPARE_EQUAL;` (was `ht->conditions.size() == 1 && ...`)",
+      "src/execution/operator/join/physical_hash_join.cpp:768 `if (is_perfect_hashtable) { return false; }`",
+      "src/execution/operator/join/physical_hash_join.cpp:779-784 `build_to_probe_ratio > 1.0` / `return can_use_bf && build_side_has_filter && probe_larger_then_build;`",
+      "src/execution/operator/join/physical_hash_join.cpp:899 `if (!has_cast && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(...))`",
+      "src/execution/operator/join/physical_hash_join.cpp:790-793 PushBloomFilter uses `ht.conditions[0].right->ToString()` / `ht.conditions[0].left->return_type` / `NullValuesAreEqual(0)`",
+      "src/execution/operator/join/physical_comparison_join.cpp:34-59 ReorderConditions puts COMPARE_EQUAL / NOT_DISTINCT_FROM first",
+      "src/execution/join_hashtable.cpp:48-52 equality_types built from equality / not-distinct conditions",
+      "src/execution/join_hashtable.cpp:719-728 InsertFirstKeyIntoBloomFilter: `data_collection.Gather(... 0, key0 ...)`; `VectorOperations::Hash(key0, key0_hashes, count)`",
+      "src/execution/join_hashtable.cpp:733 `if (bloom_filter.IsInitialized() && equality_types.size() == 1)`",
+      "src/execution/join_hashtable.cpp:800 `const bool first_key_bloom_filter = bloom_filter.IsInitialized() && equality_types.size() > 1;`"
+    ]
+  },
+  "audit_cost_usd": 0.18332559999999998
+}

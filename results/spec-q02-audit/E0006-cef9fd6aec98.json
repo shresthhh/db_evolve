@@ -1,0 +1,57 @@
+{
+  "id": "E0006",
+  "sha": "cef9fd6aec98f7462c0cc3d125770f03d3623427",
+  "subject": "E0006: Rewrite correlated MIN/MAX scalar subquery over a subset of the outer join into a window aggregate",
+  "files": [
+    "src/planner/binder/query_node/plan_select_node.cpp"
+  ],
+  "static": {
+    "added_lines": 378,
+    "removed_lines": 0,
+    "conditions": 62,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/catalog/catalog_entry/table_catalog_entry.hpp\"",
+      "\"duckdb/function/aggregate_function.hpp\"",
+      "\"duckdb/planner/column_binding_map.hpp\"",
+      "\"duckdb/planner/expression/bound_aggregate_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_comparison_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_conjunction_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_subquery_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_window_expression.hpp\"",
+      "\"duckdb/planner/expression_iterator.hpp\"",
+      "\"duckdb/planner/operator/logical_window.hpp\"",
+      "\"max\"",
+      "\"min\""
+    ]
+  },
+  "accepted_gain": 1.6395631969065108,
+  "accepted_faster": {
+    "q02": 1.64
+  },
+  "audit": {
+    "mechanism": "This is a WinMagic-style rewrite (Zuzarte et al., SIGMOD 2003) done in the binder. Take a WHERE clause whose correlated scalar subquery computes an ungrouped MIN or MAX over tables and conjuncts that also appear in the outer query. The engine no longer decorrelates it with a delim join and hash aggregate. Instead it computes `min/max(arg) OVER (PARTITION BY <correlated outer columns> ROWS UNBOUNDED PRECEDING..UNBOUNDED FOLLOWING)` over the outer join, after filtering on the other WHERE conjuncts, and then evaluates the original conjunct against that window column. This is sound because each partition is the subquery's row set multiplied by the rows of the extra outer tables, and MIN/MAX ignore duplicates.",
+    "trigger": "The only call is `rewriter.TryRewrite(condition, root);` (src/planner/binder/query_node/plan_select_node.cpp:389) in Binder::PlanFilter, which is called only for the WHERE clause (:406). Every check below must hold:\n(a) Exactly one WHERE conjunct holds a subquery, and only one: `if (subquery_conjunct.IsValid() || count != 1 || !found) return false` (:183). No conjunct is volatile.\n(b) The subquery is a correlated scalar subquery: `subquery.subquery_type != SubqueryType::SCALAR || !subquery.IsCorrelated()` (:193). Every correlated column has depth 1 and a type that partitions exactly: `col.depth != 1 || !IsSupportedPartitionType(col.type)` (:197). Allowed types are integral, BOOLEAN, VARCHAR, DATE, TIMESTAMP, DECIMAL and UUID; floats are refused because of -0.0/0.0.\n(c) The subquery plan is a chain of single-column projections over one ungrouped aggregate: `!aggr_op.groups.empty() || aggr_op.grouping_sets.size() > 1 ...` (:225). That aggregate is plain min or max: `(aggr.function.name != \"min\" && aggr.function.name != \"max\") || aggr.children.size() != 1 || aggr.IsDistinct() || aggr.filter || aggr.order_bys` (:236).\n(d) Both the subquery FROM and the outer FROM contain only LOGICAL_GET, LOGICAL_CROSS_PRODUCT and LOGICAL_FILTER, with `default: return false` (:52-64). In practice this means comma-joins; explicit `JOIN ... ON` is refused.\n(e) Each subquery scan is matched greedily to a different outer scan of the same table, and neither scan may have table filters, dynamic filters or ordinality: `outer_get.GetTable().get() != table.get() ...` (:267). At least one outer scan must be left unmatched: `if (extra_tables.empty()) return false` (:294).\n(f) After remapping, every subquery conjunct equals an outer conjunct (flipped comparisons count as equal). Every unmatched outer conjunct references only the extra tables: `!conjunct_matched[k] && !OnlyReferencesTables(conjunct, extra_tables)` (:330).\n(g) Every correlated column belongs to an extra table and appears as a bare column in a matched `=` conjunct: `equality_columns.find(col.binding) == equality_columns.end()` (:338).",
+    "constants": "There are no numeric thresholds, cardinality tests or statistics. The fixed choices are all needed for correctness:\n- Only min/max, because they ignore duplicates. Rows of the extra tables multiply the subquery's rows inside each partition, which would break count, sum or avg (:236).\n- The partition-type whitelist (:197) makes sure grouping is never coarser than SQL equality. Just outside it, a FLOAT or DOUBLE correlation key falls back to the old path.\n- The window frame is the whole partition, UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING (:358). That is simply the definition of the rewrite.\n- Requiring an equality on each correlated column (:338) rejects NULL keys. Without an equality, for example with `IS NOT DISTINCT FROM`, the query falls back.\nThere is also no cost gate: whenever the shape matches, the rewrite always fires. It replaces a hash aggregate over the subquery tables with a partitioned window over the full outer join. That could be slower when the outer join is much larger than the subquery's input, but nothing is tuned to TPC-H sizes.",
+    "natural_class": "The class is the common \"row holding the per-group minimum or maximum\" (argmin/argmax) query written with a correlated subquery and comma-joins. The subquery must repeat a subset of the outer tables and predicates and correlate by equality on a column of another outer table. In TPC-H only Q2 matches: Q17 uses avg, and Q15's max subquery is uncorrelated.\n\nExamples outside TPC-H that take the path:\n1) `SELECT e.name, d.dname FROM emp e, dept d WHERE e.dept_id = d.id AND e.salary = (SELECT max(e2.salary) FROM emp e2 WHERE e2.dept_id = d.id);`\n   Here `emp e2` maps to `emp e`, `dept` is the extra table, and the window is max(e.salary) partitioned by d.id.\n2) `SELECT o.id, c.name FROM orders o, customers c, regions r WHERE o.cust_id = c.id AND c.region_id = r.id AND r.name = 'EU' AND o.created_at = (SELECT min(o2.created_at) FROM orders o2 WHERE o2.cust_id = c.id);`\n   This returns each EU customer's first order.\n\nExamples that do not take the path:\n- The same queries written with `JOIN ... ON`.\n- A subquery with its own extra predicate that the outer query lacks, such as `WHERE e2.dept_id = d.id AND e2.active`.\n- Correlation through the subquery's own table rather than an extra table, as in the classic `e.salary = (SELECT max(salary) FROM emp e2 WHERE e2.dept_id = e.dept_id)`. Here the outer emp is matched to e2, so no extra table is left and (e) fails at :294.",
+    "fallback": "TryRewrite returns false before changing anything when any check fails. All mutation of `condition` and `root` happens only after the last check (:340 onward). PlanSubqueries and the existing delim-join decorrelation then run unchanged on the original expression (:389-390).",
+    "label": "general",
+    "label_reason": "This is a published, standard unnesting technique (WinMagic). Every gate is a soundness condition: min/max ignore duplicates, the subquery's scans and conjuncts must be a subset of the outer ones, and correlation must be equality on a column with an exact-equality type. None is a tuned constant or a test on TPC-H names or sizes.\n\nThe scope is narrower than the full technique: comma-join trees only, a single subquery, greedy scan matching, and correlation only through an extra table. It always fires, with no cost check. Even so, those limits are conservative engineering choices, not a fingerprint of Q2. Ordinary argmin/argmax-per-group queries on other schemas take the path, although in TPC-H only Q2 benefits.",
+    "citations": [
+      "src/planner/binder/query_node/plan_select_node.cpp:389 \"rewriter.TryRewrite(condition, root);\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:406 \"root = PlanFilter(std::move(statement.where_clause), std::move(root));\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:183 \"if (subquery_conjunct.IsValid() || count != 1 || !found)\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:193 \"subquery.subquery_type != SubqueryType::SCALAR || !subquery.IsCorrelated()\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:197 \"if (col.depth != 1 || !IsSupportedPartitionType(col.type))\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:225 \"if (!aggr_op.groups.empty() || aggr_op.grouping_sets.size() > 1\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:236 \"(aggr.function.name != \\\"min\\\" && aggr.function.name != \\\"max\\\") || aggr.children.size() != 1\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:52-64 \"case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: ... default: return false;\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:267 \"outer_matched[o] || outer_get.GetTable().get() != table.get()\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:294 \"if (extra_tables.empty()) { return false;\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:330 \"!conjunct_matched[k] && !OnlyReferencesTables(conjunct, extra_tables)\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:338 \"equality_columns.find(col.binding) == equality_columns.end()\"",
+      "src/planner/binder/query_node/plan_select_node.cpp:358 \"window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;\""
+    ]
+  },
+  "audit_cost_usd": 0.2315804
+}

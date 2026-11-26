@@ -1,0 +1,59 @@
+{
+  "id": "E0027",
+  "sha": "050d7e14689ff6e0cb31f785b636bf08162f9ebd",
+  "subject": "E0027: Bundle: per-value BitPacking select for sparse filtered scans + exact BF up to 2^27 bits at 1024 bits/key",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/storage/compression/bitpacking.cpp"
+  ],
+  "static": {
+    "added_lines": 133,
+    "removed_lines": 0,
+    "conditions": 9,
+    "numeric_constants": [
+      "1024"
+    ],
+    "string_literals": [
+      "\"Invalid bitpacking mode\""
+    ]
+  },
+  "accepted_gain": 1.0993562870058893,
+  "accepted_faster": {
+    "q02": 1.07,
+    "q04": 1.12,
+    "q05": 1.3,
+    "q08": 1.16,
+    "q09": 1.14,
+    "q14": 1.22,
+    "q17": 1.22,
+    "q19": 1.21
+  },
+  "audit": {
+    "mechanism": "Two independent changes. (1) BitPacking-compressed integer columns now implement the storage-layer `select` callback. When a table scan has already filtered a vector on other columns, the remaining projected columns now decode only the selected rows. FOR groups read each value straight from the bitstream with one memcpy, shift and mask. CONSTANT and CONSTANT_DELTA groups compute the value in closed form. Before this change, the scan decoded all 2048 values and then sliced. DELTA_FOR still decodes every block because of the prefix sum, and dense selections (>1/4 of rows) decode the whole vector and compact it in place. (2) The hash join's 'exact bitmap' Bloom filter, a one-bit-per-key-value bitmap over [min,max] of the build keys that is pushed into the probe scan, now has a third admission tier. A build qualifies if its key range is below min(2^27, count*1024) bits, at most a 16 MB bitmap. Before, the limits were 128 bits/key or an absolute range of 2^22.",
+    "trigger": "Part 1: RowGroup::Scan takes the partial-scan branch when there are deletions or table filters (src/storage/table/row_group.cpp:740 `if (count == max_count && !has_filters)` ... else). For the non-filter columns, after the filters have produced a non-empty sel, it calls `col_data.Select(...)` (row_group.cpp:817). StandardColumnData::Select uses the codec path only if `has_select = compression && compression->select`, `validity_has_select`, and `scan_type == SCAN_ENTIRE_VECTOR`, meaning no updates (standard_column_data.cpp:108-114). Validity must be stored with a codec that has select. Constant validity (numeric_constant.cpp:213 `ConstantSelectValidity`) and uncompressed validity (validity_uncompressed.cpp:489) have one; Roaring does not. The new code registers `bitpacking.select = BitpackingSelect<T>` (bitpacking.cpp:1096), so it applies to any column segment checkpointed with BitPacking: integer types, DATE, and DECIMAL stored as integers. Inside the function: `if (sel_count * 4 > vector_count)` means full decode plus compaction (bitpacking.cpp diff, BitpackingSelect). Otherwise each group is handled by mode, and FOR uses direct extraction when `sizeof(T)==4||8` and `width <= 56`; every other FOR case unpacks only the 32-value blocks that contain a selected row. Part 2: TrySetExactBloomFilter (src/execution/operator/join/physical_hash_join.cpp:972-1024). It requires a single first condition `COMPARE_EQUAL`, matching integer key types (INT8..INT64/UINT8..UINT64), non-NULL min/max, and NULLs not treated as equal. The new tier is `medium_cap = ht.Count() >= EXACT_BF_MEDIUM_RANGE / EXACT_BF_MEDIUM_BITS_PER_KEY ? EXACT_BF_MEDIUM_RANGE : ht.Count() * EXACT_BF_MEDIUM_BITS_PER_KEY; key_cap = MaxValue(key_cap, medium_cap); if (range >= MinValue(EXACT_BF_MAX_RANGE, key_cap)) return;`.",
+    "constants": "`sel_count*4 > vector_count` (25% density): the author says it was not tuned ('The 1/4 density threshold was not tuned'). It is a plausible crossover between full unpack and per-value extraction. Just above it the code uses the old full-decode path plus a compaction loop. Just below it, per-value extraction runs, and both paths give the same result. `width <= 56`: comes from the hardware/format limit that a value at any bit shift must fit in an 8-byte load (shift \u22647, 7+56 \u2264 63, plus the mask). Above it, the code unpacks per 32-value block, which is still correct, only slower. ALGORITHM_GROUP_SIZE (32) and BITPACKING_METADATA_GROUP_SIZE are existing format constants. EXACT_BF_MEDIUM_RANGE = 2^27 bits = 16 MB bitmap: a round memory budget. It is not derived from hardware such as cache size, and 16 MB is larger than typical L2. Just outside it (range \u2265 2^27) the build falls back to the old rule (128 bits/key, or the 2^22 floor) and otherwise to a normal hashed Bloom filter or none. EXACT_BF_MEDIUM_BITS_PER_KEY = 1024: a round power of two. Raising it from 128 to 1024 admits very sparse builds, for example a heavily filtered dimension whose key range is about 1000x its surviving row count. That fits benchmark dimension tables with dense surrogate keys and selective predicates (selections around 0.1% give about 1000 bits/key), so it may be tuned to this workload's key-range/selectivity ratios. Just outside it (>1024 bits/key) the old caps apply. No statistics beyond the build's runtime min/max and count are used.",
+    "natural_class": "Part 1: any scan of a persistent (checkpointed) table that has a pushed-down filter, or deletions, and also projects other BitPacking-compressed integer, DATE or DECIMAL columns. It applies with NOT NULL or constant/uncompressed validity, no outstanding updates, and fewer than 25% of rows passing. Example: `SELECT user_id, amount_cents, created_day FROM events WHERE country_code = 17;` on a checkpointed events table where amount_cents and created_day are bitpacked. Another example: `SELECT sum(price), max(qty) FROM trades WHERE ts BETWEEN '2024-01-01' AND '2024-01-03';` when the filter keeps a few percent of rows. Part 2: any equi-join on an integer key whose build side has a key range below 2^27 and above 128 bits per surviving key. Example: `SELECT count(*) FROM page_views v JOIN users u ON v.user_id = u.id WHERE u.signup_country = 'NZ';`, with u.id dense over 50M and about 100K NZ users, so the range is about 500 bits/key. Before, this got a hashed BF; now it gets an exact bitmap pushed into the page_views scan.",
+    "fallback": "Part 1: if the codec or validity codec has no select, or the vector has updates, or the scan is not SCAN_ENTIRE_VECTOR, StandardColumnData::Select calls ColumnData::Select (standard_column_data.cpp:114-116). That path is unchanged and does a full Scan then `result.Slice(sel, s_count)` (column_data.cpp:358-362). `force_fetch_row` still uses FetchRow (column_data.cpp:234). Inside BitpackingSelect, dense selections use the existing BitpackingScanPartial. Part 2: if the range exceeds the enlarged cap, the function returns before SetExactRange as before, and the join uses whatever BF or min-max filter it used previously. The 128-bits/key, 2^22 and 2^32 rules are unchanged.",
+    "label": "heuristic",
+    "label_reason": "Part 1 is a standard, schema-independent technique: late materialization with selective decoding inside the codec, plugging into DuckDB's existing `select` callback interface, which RLE, Constant and DictFSST already implement. Any filtered scan of bitpacked integer columns benefits. Its only constants come from hardware or the format (56-bit load limit, 32-value blocks) or are a reasonable untuned density crossover (1/4). On its own it would be 'general'. Part 2 is a pure threshold relaxation of an existing exact-bitmap filter. The 16 MB budget and especially the 8x jump to 1024 bits/key are round numbers with no cost model behind them, and they plausibly target this benchmark's dense dimension keys under selective predicates. The author also did not measure how much each part contributes, so the 1024 constant has no separate justification. Nothing tests TPCH tables, columns or query shapes, so it is not a special case. The bundle as a whole is general in kind but carries tunable, plausibly workload-fitted thresholds.",
+    "citations": [
+      "src/storage/compression/bitpacking.cpp:1096 `bitpacking.select = BitpackingSelect<T>;`",
+      "src/storage/compression/bitpacking.cpp (BitpackingSelect) `if (sel_count * 4 > vector_count) { // dense selection: decoding the full vector is cheaper`",
+      "src/storage/compression/bitpacking.cpp (BitpackingSelect) `const bool direct_extract = sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t);` / `if (direct_extract && width <= 56)`",
+      "src/storage/compression/bitpacking.cpp (BitpackingExtractValue) `memcpy(&bits, block_start + bit_offset / 8, byte_count); return (bits >> shift) & ((uint64_t(1) << width) - 1);`",
+      "src/storage/compression/bitpacking.cpp (DELTA_FOR case) `// delta decoding requires decoding every row of the group up to the last row we consume`",
+      "src/storage/table/standard_column_data.cpp:108-116 `bool has_select = compression && compression->select; ... if (!has_select || !validity_has_select || !scan_entire_vector) { ColumnData::Select(...)`",
+      "src/storage/table/column_data.cpp:358-362 `Scan(transaction, vector_index, state, result); result.Slice(sel, s_count);`",
+      "src/storage/table/column_data.cpp:234-241 `if (state.scan_options && state.scan_options->force_fetch_row) {... } else { current.Select(...)`",
+      "src/storage/table/row_group.cpp:740 `if (count == max_count && !has_filters) {`",
+      "src/storage/table/row_group.cpp:817 `col_data.Select(transaction, state.vector_index, state.column_scans[i], result.data[i], sel,`",
+      "src/storage/compression/numeric_constant.cpp:213 `ConstantSelectValidity, ConstantFilterValidity);`",
+      "src/storage/compression/validity_uncompressed.cpp:489 `void ValiditySelect(...)`",
+      "src/execution/operator/join/physical_hash_join.cpp:969-970 `EXACT_BF_MEDIUM_RANGE = idx_t(1) << 27; EXACT_BF_MEDIUM_BITS_PER_KEY = 1024;`",
+      "src/execution/operator/join/physical_hash_join.cpp:976-981 `if (cond.comparison != ExpressionType::COMPARE_EQUAL || cond.left->return_type != cond.right->return_type ...) return;`",
+      "src/execution/operator/join/physical_hash_join.cpp:1016-1023 `auto medium_cap = ht.Count() >= EXACT_BF_MEDIUM_RANGE / EXACT_BF_MEDIUM_BITS_PER_KEY ? ... key_cap = MaxValue<idx_t>(key_cap, medium_cap); if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) return;`",
+      ".dbe/review/issue.md `The 1/4 density threshold was not tuned.` / `I did not separate how much each part contributes`"
+    ]
+  },
+  "audit_cost_usd": 0.3713978
+}

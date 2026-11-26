@@ -1,0 +1,48 @@
+{
+  "id": "E0012",
+  "sha": "b6929da26e9e9170936084797dd3d9e34cd54b2d",
+  "subject": "E0012: Join filters (min-max + bloom) for RIGHT_SEMI/RIGHT_ANTI probes and equality for deliminated EXISTS conditions",
+  "files": [
+    "src/optimizer/compressed_materialization/compress_comparison_join.cpp",
+    "src/optimizer/deliminator.cpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 136,
+    "removed_lines": 4,
+    "conditions": 37,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/planner/operator/logical_projection.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0205981048517594,
+  "accepted_faster": {
+    "q02": 1.08,
+    "q18": 1.08,
+    "q19": 1.05,
+    "q22": 1.16
+  },
+  "audit": {
+    "mechanism": "Three changes that work together. (1) Join-filter pushdown now runs for RIGHT_SEMI and RIGHT_ANTI hash joins. The build side's min/max filter and bloom filter are pushed into the probe-side scan, so probe rows whose key matches no build key are dropped early. This is safe because these joins output only build rows, and the output depends only on which build rows found a match. (2) Compressed materialization no longer wraps the join-key columns of RIGHT_SEMI/RIGHT_ANTI joins in `__internal_compress_integral`. That wrapper stopped the pushdown from reaching the scan. Payload columns are still compressed. (3) After the deliminator fully removes a delim join of type INNER, SEMI or ANTI, it rewrites the `IS NOT DISTINCT FROM` correlation conditions to `=`. It only does this when every removed DelimGet join used plain `=` on column refs (so IS NOT NULL filters were added on the subquery columns), the condition's RHS column traces back through pass-through projections and group keys to one of those filtered columns, and the subquery subtree contains only operators that cannot add NULLs. With the right side known to be non-NULL, NOT DISTINCT FROM and = mean the same for these join types. The = condition is then eligible for join filters, which NOT DISTINCT FROM was not (\"TODO: Need OR predicates\").",
+    "trigger": "Pushdown (A): `GenerateJoinFilters` now returns early only for MARK/SINGLE/LEFT/OUTER/ANTI. RIGHT_SEMI/RIGHT_ANTI fall through to the existing per-condition logic, which accepts only `COMPARE_EQUAL`/`<`/`<=`/`>`/`>=` and needs `PushdownJoinFilterExpression(*cond.left, ...)` to succeed, i.e. the probe key must be a plain column reachable down to a LogicalGet.\nCompression (B): `compress_condition_columns = join.join_type != JoinType::RIGHT_SEMI && join.join_type != JoinType::RIGHT_ANTI && join.type != LOGICAL_DELIM_JOIN`. The condition is checked only in the existing `join.conditions.size() == 1` branch.\nEquality rewrite (C): the delim join is fully removed (`candidate.joins.size() == candidate.delim_get_count && all_removed`). `CollectEqualityBindings` requires every condition of every DelimGet join to be `cond.comparison == COMPARE_EQUAL` with a BOUND_COLUMN_REF on the non-delim side. The delim join type is INNER, SEMI or ANTI. `PreservesNonNullColumns(rhs)` allows only PROJECTION, FILTER, GET, CROSS_PRODUCT, ORDER_BY, LIMIT, TOP_N, DISTINCT, WINDOW, AGGREGATE with `grouping_sets.size() <= 1`, and COMPARISON_JOIN of type INNER/SEMI/ANTI/RIGHT_SEMI/RIGHT_ANTI. A condition is rewritten if it is `COMPARE_NOT_DISTINCT_FROM` with a column-ref RHS that `TraceToBinding` maps to one of the IS-NOT-NULL'd bindings. In practice this covers a correlated EXISTS / NOT EXISTS / IN subquery whose correlation is a plain `outer.col = inner.col`.",
+    "constants": "The diff adds no numeric thresholds. The only gates are join types, operator types and expression types, and each follows from a semantic argument. RIGHT_SEMI/RIGHT_ANTI output depends only on which build rows matched, so filtering probe rows by build keys is sound. Operators in the whitelist cannot turn a non-NULL column into NULL; an outer join, ROLLUP/grouping sets, or UNION would make it fail. The existing `conditions.size() == 1` gate in the compression code is unchanged upstream logic. Just outside the gates, a subquery whose body contains a LEFT JOIN, a UNION, a GROUPING SETS clause, or a non-column correlation expression (e.g. `o.k = i.k + 1`) keeps IS NOT DISTINCT FROM and gets no join filter. Plain ANTI (non-flipped) joins still get no pushdown. Whether the filter actually reaches a scan still depends on the inherited bloom/min-max machinery and build-side choice from earlier commits (E0008/E0009), which this diff does not change.",
+    "natural_class": "Any hash join that the build/probe flipper turned into RIGHT_SEMI or RIGHT_ANTI, i.e. a small filtered subquery side used as the build against a large probe table, with a column-ref equality key. This covers most correlated EXISTS/NOT EXISTS and IN/NOT IN-style subqueries over a big fact table, in any schema. Examples:\n`SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM events e WHERE e.customer_id = c.id AND e.kind = 'refund');` If customers is the smaller filtered side and events is the probe, events gets a bloom/min-max filter on customer_id. The correlation also becomes `=`.\n`SELECT p.sku FROM products p WHERE p.category = 'toys' AND NOT EXISTS (SELECT 1 FROM sales s WHERE s.sku = p.sku AND s.ts > now() - INTERVAL 30 DAY);` This is a RIGHT_ANTI with sales as the probe.\nA cost: for every RIGHT_SEMI/RIGHT_ANTI single-condition join, key compression is now skipped, even when no filter ends up being pushed. As the author measured on q04, the bloom check over the whole scan can cost as much as the join work it saves.",
+    "fallback": "If the join type is not RIGHT_SEMI/RIGHT_ANTI, pushdown and compression behave exactly as before. If any deliminator check fails (non-equality DelimGet condition, non-column expression, a NULL-introducing operator in the subquery, a join type other than INNER/SEMI/ANTI, or a delim join that was not fully removed), the conditions stay IS NOT DISTINCT FROM and the old plan is produced. The only behaviour change outside the new paths is that RIGHT_SEMI/RIGHT_ANTI join keys are no longer compressed, even when no join filter ends up being generated.",
+    "label": "general",
+    "label_reason": "All three parts are principled and keyed on semantics, with no tuned constants and nothing specific to the TPCH schema or queries. Join filters on semi/anti probes are a standard sideways-information-passing technique; upstream's own comment called these cases a FIXME. Strengthening NOT DISTINCT FROM to = when the RHS is provably non-NULL is a textbook null-rejection rewrite, guarded by a conservative operator whitelist. They fire for any correlated EXISTS/NOT EXISTS/IN subquery with column equality and a flipped build side. The only reservations are about payoff, not generality. Turning off key compression for all RIGHT_SEMI/ANTI joins is a blunt workaround for the pushdown's inability to see through compress functions. The benefit was measured only on q22, and q04 was flat.",
+    "citations": [
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:207 - `case JoinType::ANTI: ... return;` (RIGHT_ANTI/RIGHT_SEMI removed from the early-return list)",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:224 - `case ExpressionType::COMPARE_NOT_DISTINCT_FROM: // TODO: Need OR predicates continue;`",
+      "src/optimizer/compressed_materialization/compress_comparison_join.cpp:58 - `const bool compress_condition_columns = join.join_type != JoinType::RIGHT_SEMI && join.join_type != JoinType::RIGHT_ANTI && ...`",
+      "src/optimizer/compressed_materialization/compress_comparison_join.cpp:62 - `if (join.conditions.size() == 1 && compress_condition_columns)`",
+      "src/optimizer/deliminator.cpp:80 - `if (cond.comparison != ExpressionType::COMPARE_EQUAL || other_side.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) return false;`",
+      "src/optimizer/deliminator.cpp:125 - `static bool PreservesNonNullColumns(const LogicalOperator &op)` with whitelist and `grouping_sets.size() > 1` -> false",
+      "src/optimizer/deliminator.cpp:181 - `cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM && ... TraceToBinding(rhs, ...)` -> `cond.comparison = ExpressionType::COMPARE_EQUAL;`",
+      "src/optimizer/deliminator.cpp:236 - `if (plain_equality) { TryConvertNotDistinctToEquality(delim_join, not_null_bindings); }` inside `candidate.joins.size() == candidate.delim_get_count && all_removed`",
+      "src/optimizer/deliminator.cpp:374 - `if (cond.comparison != COMPARE_NOT_DISTINCT_FROM && ...) { ... OPERATOR_IS_NOT_NULL ... }` (existing IS NOT NULL filter the rewrite relies on)",
+      "src/optimizer/build_probe_side_optimizer.cpp:249 - SEMI/ANTI flipped to RIGHT_SEMI/RIGHT_ANTI by the build-side optimizer"
+    ]
+  },
+  "audit_cost_usd": 0.2131408
+}

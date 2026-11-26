@@ -1,0 +1,67 @@
+{
+  "id": "E0031",
+  "sha": "1320822f46f181a24e9abe6bebacfabc31b8a0f5",
+  "subject": "E0031: Bundle: fallback block reuse cache + large perfect HA v3",
+  "files": [
+    "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/execution/physical_plan/plan_aggregate.cpp",
+    "src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp",
+    "src/include/duckdb/storage/block_allocator.hpp",
+    "src/storage/block_allocator.cpp",
+    "src/storage/buffer/buffer_pool.cpp"
+  ],
+  "static": {
+    "added_lines": 458,
+    "removed_lines": 13,
+    "conditions": 45,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"Large Table\"",
+      "\"Perfect hash aggregate: aggregate group %llu exceeded total groups %llu. This \"",
+      "\"disable_optimizer to disable optimizations that rely on correct statistics\"",
+      "\"duckdb/parallel/task_scheduler.hpp\"",
+      "\"duckdb/storage/buffer_manager.hpp\"",
+      "\"likely means that the statistics in your data source are corrupt.\\n* PRAGMA \"",
+      "\"true\""
+    ]
+  },
+  "accepted_gain": 1.0473688242517318,
+  "accepted_faster": {
+    "q07": 1.13,
+    "q08": 1.06,
+    "q13": 1.36
+  },
+  "audit": {
+    "mechanism": "Two independent changes. (1) Perfect-hash aggregation, which indexes a direct-addressed array by the bit-packed offsets (value \u2212 min) of integer group keys, used to be capped at perfect_ht_threshold bits (default 12, so 4K slots). It now goes up to 22 bits (4M slots) in a \"large\" mode. In large mode, slot states are initialised only when a slot is first touched (a bool per slot), thread-local tables are merged into the global one in 64K-slot stripes with one lock per stripe, and the output scan runs in parallel over 64K-slot blocks with no order preserved. (2) When the block-allocator pool is off, the BlockAllocator now keeps freed block-size (256KB) buffers on a mutex-protected LIFO stack of at most min(256MB, memory_limit/32) and hands them back on the next block-size allocation, instead of returning them to the malloc implementation. The author says this exists to undo slowdowns in later queries (q14, q16, q18) that appeared once q13 stopped churning 256KB blocks through the radix aggregate.",
+    "trigger": "Large perfect HA (planner, plan_aggregate.cpp). All of these must hold:\n- every GROUP BY key is an integer type (INT8..UINT64) with min/max statistics, range < 2^31, and the summed bits are `perfect_hash_bits > max_bits` \u2192 reject (l.280), where `max_bits = threshold >= LARGE_PERFECT_HT_MIN_THRESHOLD ? MaxValue(threshold, LARGE_PERFECT_HT_MAX_BITS) : threshold` (l.180), with MIN_THRESHOLD=12 and MAX_BITS=22 (l.142-144);\n- no DISTINCT aggregates, and every aggregate has a combine function (l.287);\n- large mode only when `perfect_hash_bits > threshold` (l.292), and then also:\n  - `child.estimated_cardinality < slots / 2` \u2192 reject (l.152);\n  - any aggregate with `HasStateDestructorCallback()` \u2192 reject (l.158), which excludes string_agg, list, min/max on strings and similar;\n  - `slots * (state_size + 1) * (threads + 1) > max_memory / 8` \u2192 reject (l.166);\n  - `return !ContainsDelimScan(child)` (l.169).\nThe default perfect_ht_threshold is \"12\" (settings.hpp:1340), so with defaults the large mode is on for 13\u201322-bit key ranges.\n\nBlock cache (block_allocator.cpp): in AllocateData, `size == block_size` and `!IsActive() || !IsEnabled()` (l.348). In FreeData, `size == block_size && !IsEnabled()` (l.367) and the cache count is below `MinValue(FALLBACK_CACHE_MAX_BYTES, memory_limit / FALLBACK_CACHE_MEMORY_LIMIT_DIVISOR)/block_size` (l.428, constants at l.98-99). The cache is in effect whenever the block_allocator_memory pool is not configured.",
+    "constants": "- LARGE_PERFECT_HT_MAX_BITS = 22 (plan_aggregate.cpp:142): no hardware or literature basis is given. 2^22 = 4M slots, which covers customer-key ranges at the scale factors used (o_custkey at SF10 spans 1.5M, i.e. 21 bits with the +2). One bit more falls back to the radix HT. The issue's earlier title, \"dense INNER builds up to 4M range\", reuses the same 4M figure.\n- LARGE_PERFECT_HT_MIN_THRESHOLD = 12 (l.144): exactly the default threshold. Its only effect is to switch large mode off if a user lowers the setting.\n- `estimated_cardinality >= slots/2` (l.152): a density heuristic that relies on the optimizer's estimate. The author records +60% slower on a sparse 1.8M-row / 2M-slot case with overestimated cardinality, so just inside the gate it can lose badly.\n- `(threads+1)*slots*(state+1) <= max_memory/8` (l.166): a principled memory bound, but the /8 is arbitrary.\n- No DELIM_SCAN (l.169): a shape test the author justifies as \"estimates unreliable\". It conveniently keeps correlated-subquery aggregates (several TPC-H queries) on the old path.\n- Stripe/block size 1<<16 (physical_perfecthash_aggregate.cpp:86): a reasonable granularity, not obviously tuned.\n- Cache cap of 256MB and memory_limit/32 (block_allocator.cpp:98-99): tuned directly on the benchmark. The issue says 64MB left q16 +5\u20137% slower, so the author \"raised the cap\" to 256MB. Below the cap, freed blocks go back to the allocator as before.",
+    "natural_class": "Any GROUP BY on one or more integer keys that have statistics, whose combined value range needs 13\u201322 bits (8K\u20134M slots), whose input is estimated to be at least half the slot count, with fixed-size, combinable, non-DISTINCT aggregates (sum, count, avg, min/max on numerics), and not under a correlated subquery. Examples outside TPC-H:\n- `SELECT user_id, count(*), sum(amount) FROM events GROUP BY user_id;` with user_id dense in 1..2M and 50M events.\n- `SELECT store_id, day_of_year, avg(sales) FROM daily_sales GROUP BY store_id, day_of_year;` with 5000 stores \u00d7 366 days (13+9 = 22 bits) over 10M rows.\nThe block cache affects every workload that allocates and frees 256KB buffer blocks when the pool is off, which is the default configuration. That is broad, but its benefit (avoiding allocator churn) is generic.",
+    "fallback": "If any large-mode guard fails, CanUsePerfectHashAggregate returns false and the planner uses the regular (radix) hash aggregate, which is unchanged. Ranges of \u226412 bits take the original perfect-HA path, with eager init, serial combine, serial source and INSERTION_ORDER (header: `is_large ? NO_ORDER : INSERTION_ORDER`). If the block pool is enabled, or the size is not block_size, allocation and free go straight to the underlying allocator as before.",
+    "label": "heuristic",
+    "label_reason": "Extending direct-addressed aggregation to multi-million-slot dense integer domains, with lazy init and a striped parallel merge and scan, is a recognised and broadly useful technique. A per-allocator block free-list is ordinary allocator hygiene. Both apply to many non-TPC-H queries and are on by default. However, the gates look fitted to the workload:\n- the 22-bit cap neatly covers custkey-sized domains;\n- the DELIM_SCAN exclusion is a shape test;\n- the density gate is known to regress sparse, overestimated inputs by 60%;\n- the 256MB cache size was picked by benchmarking the q16/q18 regressions that the large HA itself caused. The cache compensates for a benchmark-order side effect rather than following a principled design.\nUpstream would plausibly accept the idea with different constants and a cost model, so this is heuristic, not special_case.",
+    "citations": [
+      "src/execution/physical_plan/plan_aggregate.cpp:142 \"LARGE_PERFECT_HT_MAX_BITS = 22\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:144 \"LARGE_PERFECT_HT_MIN_THRESHOLD = 12\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:152 \"if (child.estimated_cardinality < slots / 2)\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:158 \"if (aggregate.function.HasStateDestructorCallback())\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:166 \"slots * (state_size + 1) * (threads + 1) > max_memory / 8\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:169 \"return !ContainsDelimScan(child);\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:180 \"threshold >= LARGE_PERFECT_HT_MIN_THRESHOLD ? MaxValue<idx_t>(threshold, LARGE_PERFECT_HT_MAX_BITS) : threshold\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:287 \"aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback()\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:292 \"if (perfect_hash_bits > threshold)\"",
+      "src/include/duckdb/main/settings.hpp:1340 perfect_ht_threshold \"DefaultValue = \\\"12\\\"\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:86 \"LARGE_PERFECT_HT_STRIPE_SIZE = idx_t(1) << 16\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:192 combine \"lock_guard<mutex> stripe_guard(gstate.stripe_locks[stripe]); gstate.ht->CombineRange(...)\"",
+      "src/execution/perfect_aggregate_hashtable.cpp AddChunkLazy \"if (!is_set[group]) { ... init_data[init_count++] = address_data[i]; }\"",
+      "src/storage/block_allocator.cpp:98 \"FALLBACK_CACHE_MAX_BYTES = 256ULL * 1024ULL * 1024ULL\"",
+      "src/storage/block_allocator.cpp:99 \"FALLBACK_CACHE_MEMORY_LIMIT_DIVISOR = 32\"",
+      "src/storage/block_allocator.cpp:348 \"if (!IsActive() || !IsEnabled())\"",
+      "src/storage/block_allocator.cpp:367 \"if (size == block_size && !IsEnabled())\"",
+      ".dbe/review/issue.md \"Full bench, 64MB cache (the planned size): q16 +4.8% / +6.7% / +5.7%, so I raised the cap.\"",
+      ".dbe/review/issue.md \"sparse inputs with overestimated cardinality ran +60% slower on a 1.8M-row, 2M-slot case\""
+    ]
+  },
+  "audit_cost_usd": 0.36320600000000003
+}

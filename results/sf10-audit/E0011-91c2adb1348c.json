@@ -1,0 +1,56 @@
+{
+  "id": "E0011",
+  "sha": "91c2adb1348c7dfa520cb698e983253075aa86c3",
+  "subject": "E0011: Deliminator: drop the delim join for SEMI/ANTI subqueries without blocking operators even when the LHS has a selection",
+  "files": [
+    "src/optimizer/deliminator.cpp"
+  ],
+  "static": {
+    "added_lines": 29,
+    "removed_lines": 1,
+    "conditions": 11,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0437250336167239,
+  "accepted_faster": {
+    "q02": 1.09,
+    "q04": 1.36,
+    "q22": 1.26
+  },
+  "alone": {
+    "geomean": 1.0328988473220164,
+    "faster": {
+      "q03": 1.06,
+      "q04": 1.34,
+      "q21": 1.4,
+      "q22": 1.26
+    },
+    "slower": {
+      "q02": 0.9,
+      "q09": 0.94
+    }
+  },
+  "audit": {
+    "mechanism": "DuckDB plans correlated subqueries as a DELIM_JOIN. The outer side's correlated keys are deduplicated into a DelimGet, which is joined back into the subquery. Before this change, the Deliminator kept the deepest join with the DelimGet whenever the outer (LHS) side had any filter, on the theory that the deduplicated filtered keys cut the subquery's work. Now, when the delim join is a SEMI or ANTI join (a conjunctive EXISTS / NOT EXISTS or correlated IN) and the subquery side has no aggregate, window, limit, order, top-n, distinct or nested delim join, that join is removed too. The plan then becomes an ordinary hash SEMI/ANTI join on the correlation columns, with no DelimGet, no dedup HASH_GROUP_BY and no materialised duplicate-eliminated set. The idea is that with no blocking operator in the subquery, the SEMI/ANTI join already does the same filtering the DelimGet join would have done, so the extra dedup and join are pure overhead.",
+    "trigger": "Inside Deliminator::Optimize, for each DELIM_JOIN candidate, all of these must hold:\n(a) The old keep-deepest condition is true: `bool keep_deepest = !candidate.joins.empty() && HasSelection(delim_join);` (src/optimizer/deliminator.cpp:87). So the RHS contains a comparison join with a DelimGet child, and HasSelection finds a LOGICAL_FILTER or a non-IS_NOT_NULL table filter somewhere under the delim join (deliminator.cpp:139-161). HasSelection is called on the whole delim join, not only the LHS.\n(b) `(delim_join.join_type == JoinType::SEMI || delim_join.join_type == JoinType::ANTI)` (deliminator.cpp:88). MARK, SINGLE, LEFT and INNER are excluded, so EXISTS under OR, EXISTS in the SELECT list, and scalar subqueries do not qualify.\n(c) `!HasBlockingOperator(*delim_join.children[1])` (deliminator.cpp:89). The helper searches the whole RHS subtree recursively and returns true on `LOGICAL_AGGREGATE_AND_GROUP_BY, LOGICAL_WINDOW, LOGICAL_LIMIT, LOGICAL_ORDER_BY, LOGICAL_TOP_N, LOGICAL_DISTINCT, LOGICAL_DELIM_JOIN` (deliminator.cpp:48-66). It does not look at ordinary joins, cardinalities or statistics.\nWhen all three hold, `keep_deepest = false`. Every delim-get join then goes through the existing RemoveJoinWithDelimGet. That function still has its own preconditions: the child join is INNER or SEMI, it uses column-ref conditions only, and it has the same number of conditions as delim columns (deliminator.cpp:204-226). If they pass, the delim join becomes a LOGICAL_COMPARISON_JOIN (deliminator.cpp:108-111).",
+    "constants": "There are no numeric thresholds or tuned constants. The only \"parameters\" are the hard-coded list of operator types treated as blocking (deliminator.cpp:50-56) and the join-type test SEMI/ANTI (deliminator.cpp:88). The list is principled: these are the operators whose output depends on the whole input, or which are expensive in proportion to input size, so a pre-filtered key set could cut their work or is needed for correctness of per-group evaluation. The gap is that the list leaves out ordinary joins inside the subquery. Take `EXISTS (SELECT 1 FROM big b JOIN other o ON ... WHERE b.k = outer.k)` with a highly selective outer filter. Before, the deduplicated outer keys were joined into `big` before the inner join (semi-join reduction). Now the whole `big \u22c8 other` join is computed and only then semi-joined. That can be a regression the gate does not detect. Just outside the gate, if the subquery contains, say, a GROUP BY or a LIMIT, the old keep-deepest behaviour applies unchanged. No cost model or cardinality estimate is consulted: the decision is purely on plan shape, even though the old comment says \"the selection can greatly reduce the cost of the RHS\".",
+    "natural_class": "Any correlated EXISTS / NOT EXISTS (or correlated IN / NOT IN that plans as SEMI/ANTI) that appears as a top-level WHERE conjunct, where the outer query has a filter and the subquery is a plain select-project-join with no aggregate, limit, order, window or distinct. This shape is very common outside TPC-H. Examples:\n1) `SELECT u.id FROM users u WHERE u.signup_date >= DATE '2024-01-01' AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.kind = 'purchase');`\n2) `SELECT p.sku FROM products p WHERE p.active AND NOT EXISTS (SELECT 1 FROM inventory i WHERE i.sku = p.sku AND i.warehouse_id = 3 AND i.qty > 0);`\nBoth become a single hash SEMI/ANTI join. The example in the constants field, with a join inside the subquery, also takes the path, and may get slower when the outer filter is very selective.",
+    "fallback": "If the delim join is not SEMI/ANTI, or the RHS contains any of the listed blocking operators, `keep_deepest` keeps its old value. The code then runs exactly as before: if there is a selection, it erases the deepest join from the removal list and keeps the delim join (deliminator.cpp:94-99). If there is no selection, the old code already removed all delim-get joins, so nothing changes there. If RemoveJoinWithDelimGet fails its own checks, it returns false and that join stays in place as before.",
+    "label": "heuristic",
+    "label_reason": "This is a heuristic: a general rule with no tie to the benchmark, but decided by plan shape alone. In its favour, it has no thresholds, names no table or column, and applies to a broad, very common class of queries: conjunctive correlated EXISTS / NOT EXISTS over flat subqueries on any schema. Turning a semi/anti delim join into a plain hash semi/anti join is a recognised decorrelation simplification. Against that, the decision ignores cardinality and cost, and it overrides an existing heuristic whose stated purpose was semi-join reduction of the subquery when the outer side is selective. The \"blocking operator\" proxy does not count joins inside the subquery, so some queries outside TPC-H could get slower. The author also notes that the resulting join keeps IS NOT DISTINCT FROM conditions, which block join filter pushdown. I would expect upstream to accept something like this, possibly with a cardinality-based gate.",
+    "citations": [
+      "src/optimizer/deliminator.cpp:48 \"static bool HasBlockingOperator(const LogicalOperator &op)\"",
+      "src/optimizer/deliminator.cpp:50-56 \"case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: ... case LogicalOperatorType::LOGICAL_DELIM_JOIN: return true;\"",
+      "src/optimizer/deliminator.cpp:87 \"bool keep_deepest = !candidate.joins.empty() && HasSelection(delim_join);\"",
+      "src/optimizer/deliminator.cpp:88-89 \"(delim_join.join_type == JoinType::SEMI || delim_join.join_type == JoinType::ANTI) && !HasBlockingOperator(*delim_join.children[1])\"",
+      "src/optimizer/deliminator.cpp:92 \"keep_deepest = false;\"",
+      "src/optimizer/deliminator.cpp:94-99 \"if (keep_deepest) { // Keep the deepest join with DelimGet ... as the selection can greatly reduce the cost of the RHS child\"",
+      "src/optimizer/deliminator.cpp:108-111 \"delim_join.type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;\"",
+      "src/optimizer/deliminator.cpp:139 \"// TODO once we implement selectivity estimation using samples we need to use that here\"",
+      "src/optimizer/deliminator.cpp:207 \"if (!ChildJoinTypeCanBeDeliminated(comparison_join.join_type)) { return false;\"",
+      "src/optimizer/deliminator.cpp:224 \"if (comparison_join.conditions.size() != delim_get.chunk_types.size()) { return false;\""
+    ]
+  },
+  "audit_cost_usd": 0.1720978
+}

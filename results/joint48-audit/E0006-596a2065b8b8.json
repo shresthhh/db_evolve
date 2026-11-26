@@ -1,0 +1,56 @@
+{
+  "id": "E0006",
+  "sha": "596a2065b8b8945762aaf80183b73fff053ecae4",
+  "subject": "E0006: Join key-set range filter through compress projections",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp",
+    "src/optimizer/row_group_pruner.cpp",
+    "src/optimizer/topn_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 153,
+    "removed_lines": 11,
+    "conditions": 23,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"__internal_compress_integral_\"",
+      "\"duckdb/common/string_util.hpp\"",
+      "\"duckdb/planner/expression/bound_constant_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_function_expression.hpp\"",
+      "\"duckdb/planner/filter/conjunction_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0146533189078502,
+  "accepted_faster": {
+    "q02": 1.07,
+    "q18": 1.14
+  },
+  "audit": {
+    "mechanism": "The change has two parts. (1) The join-filter pushdown optimizer can now pass through a compressed-materialization projection `__internal_compress_integral_*(x, const)`. It keeps the constant as `storage_offset`, so the existing min/max and IN-list join filters can now reach base-table columns that sit under such a projection. Before this change those filters stopped at the projection. Filter constants are shifted back by the offset, using HUGEINT arithmetic with an overflow check. (2) For equality hash joins whose build side is too large for the IN-list filter but still moderate, the engine collects the distinct non-NULL build keys and sorts them. It then cuts the sorted keys at the largest gaps into at most N ranges, and pushes an OR of `[lo,hi]` ranges (or `=k` for a single key) to the probe scan. The filter is wrapped in an OptionalFilter, so it only prunes row groups and segments by their zonemap min/max and is never evaluated per row. In effect this is a multi-interval zonemap filter, a finer version of the existing single min/max join filter.",
+    "trigger": "Pass-through (optimizer): the probe expression is a BOUND_FUNCTION whose name starts with \"__internal_compress_integral_\", has exactly 2 children, and the second child is a BOUND_CONSTANT (join_filter_pushdown_optimizer.cpp:60 `StartsWith(func.function.name, \"__internal_compress_integral_\") || func.children.size() != 2 ...`). The offset must be non-NULL and integral but not UINT128, and the result type must be integral. Only one offset level is allowed (:72 \"only a single offset is supported\"). The UNION rewrite copies the offset to the rewritten columns (:131 `new_col.storage_offset = child_column.storage_offset`). For targets with an offset, the TopN filter and the RowGroupPruner are turned off (topn_optimizer.cpp `if (!target.columns[0].storage_offset.IsNull()) return;`, row_group_pruner.cpp:139), and so is the bloom filter (physical_hash_join.cpp:1006 `pushdown_column.storage_offset.IsNull() &&`).\nRange-set filter (physical_hash_join.cpp:954-959): it runs only when the IN-list filter is not used (`else if (ht && cmp == ExpressionType::COMPARE_EQUAL)`) and `ht->Count() > threshold && ht->Count() <= threshold * RANGE_SET_MAX_KEYS_PER_RANGE`, with `max_ranges = threshold * 4`. PushRangeSetFilter then also requires the storage type to be a valid integral type that is not INT128/UINT128 (:745-746), and at least 2 distinct non-NULL keys. It gives up entirely if any key cannot be converted to storage (:762).",
+    "constants": "`threshold` = the existing `dynamic_or_filter_threshold` setting, default \"50\" (settings.hpp:703). This is upstream's IN-list cap, not a new value. With the default, the range filter runs for 51 to 3,200 build rows and builds at most 200 ranges.\n- `RANGE_SET_MAX_KEYS_PER_RANGE = 64` (physical_hash_join.cpp:738): a hand-picked multiplier with no stated rationale. Above 3,200 build rows (counted before dedup and NULL removal), no range filter is pushed and only the old single min/max filter applies. The pruning benefit fades gradually as the key count grows, so the hard cap is arbitrary rather than a principled limit.\n- `max_ranges = threshold*4` = 200: the author tuned this directly on the benchmark (\"going from 50 to 200 ranges cut lineitem rows from 17.5M to 12.1M\" for q18). Using fewer ranges only makes the ranges coarser and prunes less. The result stays correct, because the filter is optional.\n- The q18 subquery's key count (author: around 2,149 compressed keys) falls inside the 51\u20133,200 window. Nothing in the code refers to TPC-H, but 64 and 4 were picked or validated on this workload.\n- No hardware-derived constants.",
+    "natural_class": "Any equality hash join on an integer key, where the build side has between about 51 and 3,200 rows and the probe table's key column is roughly clustered with insertion order, so that zonemaps are selective. Typical cases are append-ordered IDs, timestamps stored as integers, and date surrogate keys. The build side often comes from an aggregate/HAVING or a selective filter. The pass-through part also helps any join whose probe key passes through compressed materialization, which DuckDB inserts above aggregates, DISTINCT and ORDER BY on small-range integers. Examples:\n`SELECT e.* FROM events e WHERE e.session_id IN (SELECT session_id FROM sessions WHERE country='NZ' AND started > now() - INTERVAL 1 DAY);` (a few hundred recent, clustered session ids prune most of a large append-ordered events table).\n`SELECT o.* FROM orders_log o JOIN (SELECT user_id FROM payments GROUP BY user_id HAVING sum(amount) > 10000) big USING (user_id);`\nIf the keys are randomly spread across the probe table (as in TPC-H q17's partkeys, according to the author), the filter prunes nothing. The cost is only an O(n log n) sort of \u22643,200 keys, plus one OR check per row group or segment.",
+    "fallback": "If the IN-list condition holds (Count \u2264 threshold), behaviour is the same as before. If the build side has more than 3,200 rows, the join is not an equality, or the key is not an integer, no range filter is pushed, and the min/max filter (plus the bloom filter when allowed) behaves as before. If any key fails conversion, PushRangeSetFilter returns without pushing anything. Without a compress projection, `storage_offset` is NULL and JoinFilterValueToStorage reduces to the old cast to the storage type. When an offset is present, the result can differ from the old path in one way: the bloom, TopN and RowGroupPruner filters are suppressed. Before this change those targets were not reachable at all, so nothing is lost.",
+    "label": "heuristic",
+    "label_reason": "Both ideas are general and principled. Pushing join filters through an invertible offset-subtraction projection removes a real optimizer blind spot. A gap-split multi-range zonemap filter is a well-known refinement of min/max join filtering (\"range sets\" / zone-map semi-join reduction). Neither part refers to schema or query shape. However, the range filter is gated by an ad hoc window (threshold < count \u2264 64*threshold), and the number of ranges (4*threshold = 200) was tuned on q18's row counts according to the author. The window happens to contain the q18 HAVING subquery's key count, and the measured gain is essentially only q18. Upstream would plausibly accept this, possibly with different constants or a cost-based choice of the range count. That makes it heuristic, not special_case.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:738 `static constexpr idx_t RANGE_SET_MAX_KEYS_PER_RANGE = 64;`",
+      "src/execution/operator/join/physical_hash_join.cpp:745 `if (max_ranges < 2 || !storage_type.IsValid() || !storage_type.IsIntegral() ||`",
+      "src/execution/operator/join/physical_hash_join.cpp:822 `ht->Count() > 1 && ht->Count() <= dynamic_or_filter_threshold && cmp == ExpressionType::COMPARE_EQUAL`",
+      "src/execution/operator/join/physical_hash_join.cpp:957 `if (ht->Count() > threshold && ht->Count() <= threshold * RANGE_SET_MAX_KEYS_PER_RANGE)`",
+      "src/execution/operator/join/physical_hash_join.cpp:958-959 `PushRangeSetFilter(..., threshold * 4)`",
+      "src/execution/operator/join/physical_hash_join.cpp (PushRangeSetFilter end) `auto filter = make_uniq<OptionalFilter>(std::move(or_filter));` \u2014 zonemap only",
+      "src/execution/operator/join/physical_hash_join.cpp:1006 `!has_cast && pushdown_column.storage_offset.IsNull() && ht && join_condition[filter_idx] == 0`",
+      "src/include/duckdb/main/settings.hpp:703 `DefaultValue = \"50\"` (dynamic_or_filter_threshold)",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:60 `StartsWith(func.function.name, \"__internal_compress_integral_\")`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:72 `// only a single offset is supported`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:131 `new_col.storage_offset = child_column.storage_offset;`",
+      "src/optimizer/row_group_pruner.cpp:139 `!pushdown_targets.front().columns[0].storage_offset.IsNull()`",
+      "src/optimizer/topn_optimizer.cpp `if (!target.columns[0].storage_offset.IsNull()) { return; }`",
+      "src/storage/table/column_segment.cpp:410 `auto &opt_filter = filter.Cast<OptionalFilter>();`"
+    ]
+  },
+  "audit_cost_usd": 0.20734779999999997
+}

@@ -1,0 +1,43 @@
+{
+  "id": "E0002",
+  "sha": "0c47211ada6381cbc3ea87d7518b4c41a8a9556e",
+  "subject": "E0002: Bloom filter pushdown for multi-key hash joins on the first key",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 23,
+    "removed_lines": 6,
+    "conditions": 3,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.1863734376021564,
+  "accepted_faster": {
+    "q09": 1.19
+  },
+  "audit": {
+    "mechanism": "DuckDB's hash join already built a Bloom filter over its build-side keys and pushed it into the probe-side table scan (as `col IN BF(...)`), but only for single-key equi-joins. Now multi-key equi-joins get one too, built on the first join key only. In Finalize, the hash table gathers key column 0 from the build rows, hashes it with the same VectorOperations::Hash that the scan-side BFTableFilter uses, and inserts those hashes. It no longer inserts the combined all-keys row hash. The scan can then drop probe rows whose first key matches no build row, before they reach the join. The remaining keys are still checked by the hash join itself.",
+    "trigger": "The trigger is the existing single-key Bloom filter trigger with `conditions.size()==1` replaced by a first-key equality test, plus a first-condition gate. In order:\n- Not a perfect hash table: `if (is_perfect_hashtable) { return false; }` (physical_hash_join.cpp:769).\n- Both the pushed condition and the first hash-table condition are equalities: `cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL` (physical_hash_join.cpp:776-777). This replaces `ht->conditions.size() == 1 && ...`.\n- The build side has a filter and the probe side is estimated to be larger than the build: `can_use_bf && build_side_has_filter && probe_larger_then_build` with `build_to_probe_ratio > 1.0` (physical_hash_join.cpp:781-786).\n- The filter being pushed belongs to join condition 0: `const bool is_first_condition = join_condition[filter_idx] == 0;` (physical_hash_join.cpp:902).\n- There is no type cast between the join key and the scan column: `!has_cast` (physical_hash_join.cpp:899-903).\n- The min and max differ (the `else` branch at :864) and the filter target is a pushdown-capable scan column.\n- On the build side, the new hashing path runs when `bloom_filter.IsInitialized() && conditions.size() > 1` (join_hashtable.cpp:788). The old row-hash insert is limited to `conditions.size() == 1` (join_hashtable.cpp:720).",
+    "constants": "The patch adds no new constants. The ones it relies on already existed:\n- `build_to_probe_ratio > 1.0` (physical_hash_join.cpp:783-784). This is the existing cost guard: use the filter only if the estimated probe side is larger than the build side. Just below 1.0, no Bloom filter is pushed and the join runs as before.\n- `SelectivityOptionalFilter::BF_THRESHOLD = 0.25f` and `BF_CHECK_N = 75` (selectivity_optional_filter.hpp:52-53). These existing adaptive parameters turn the pushed filter off at runtime if it does not prune enough. This matters more now, because a first-key-only filter is weaker than a full-key one: build-side filtering on the other keys does not shrink it.\n- The column index `0`. This is a structural choice (only the first key is used), not a tuned value. Whether the first condition is the selective one depends on the order in which the planner puts the conditions. In this benchmark it happens to be partkey, which is selective. For a join whose first key is unselective (for example a low-cardinality key), the filter costs build time and the runtime selectivity check should switch it off.",
+    "natural_class": "Any multi-column equi-join that is not a perfect hash table, where the build side is filtered and smaller than the probe side, the probe side is a table scan on the first key column, and the key types match without a cast. Examples outside this benchmark:\n1. Composite-key fact-to-dimension joins: `SELECT sum(s.amount) FROM sales s JOIN promo_items p ON s.item_id = p.item_id AND s.store_id = p.store_id WHERE p.campaign = 'BF2026';`\n2. Event joins on tenant and session: `SELECT count(*) FROM events e JOIN sessions x ON e.session_id = x.session_id AND e.tenant_id = x.tenant_id WHERE x.started > DATE '2026-01-01';`\nBoth previously got min/max filters only. Now the scan of the large table also applies a Bloom filter on item_id or session_id.",
+    "fallback": "When the trigger does not hold, the old path is unchanged:\n- Single-key joins still insert the stored row hashes into the Bloom filter via InsertHashes (join_hashtable.cpp:720).\n- Multi-key joins where the conditions fail, or where the filter is for a key other than the first, get only the min/max optional filters as before. The Bloom filter is never initialised, so `bf_on_first_key` is false and no extra gather or hash work is done (join_hashtable.cpp:788).\n- The Bloom filter is read only by the pushed-down BFTableFilter (physical_hash_join.cpp:795). It is not used inside the hash table, so leaving the combined hash out of it does not affect the join's own probing.\n- The pushed filter is wrapped in SelectivityOptionalFilter, which turns it off at runtime if it is not selective enough.\n- The author did not test NULL first keys or the external (spilling) hash join.",
+    "label": "general",
+    "label_reason": "This is a standard extension of sideways information passing: a Bloom filter on one key of a composite equi-join key is a sound, conservative prefilter. Its trigger is broad and has nothing to do with the schema: any multi-key equality join meeting the conditions DuckDB already used for single-key Bloom filters. It adds no thresholds and mentions no columns or tables. Its weakness is that it always picks the first key rather than the most selective one. That is a simplification, not a tuning to this benchmark, and the runtime selectivity check limits the damage when the first key prunes little. The build side does extra work: it gathers and hashes key column 0 once per build row.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:769 \"if (is_perfect_hashtable) {\"",
+      "src/execution/operator/join/physical_hash_join.cpp:776-777 \"cmp == ExpressionType::COMPARE_EQUAL && ht->conditions[0].comparison == ExpressionType::COMPARE_EQUAL\"",
+      "src/execution/operator/join/physical_hash_join.cpp:784 \"const bool probe_larger_then_build = build_to_probe_ratio > 1.0;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:787 \"return can_use_bf && build_side_has_filter && probe_larger_then_build;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:793-795 \"ht.conditions[0].right->ToString() ... make_uniq<BFTableFilter>(ht.GetBloomFilter(), ...)\"",
+      "src/execution/operator/join/physical_hash_join.cpp:902 \"const bool is_first_condition = join_condition[filter_idx] == 0;\"",
+      "src/execution/join_hashtable.cpp:720 \"if (bloom_filter.IsInitialized() && conditions.size() == 1) {\"",
+      "src/execution/join_hashtable.cpp:788 \"const bool bf_on_first_key = bloom_filter.IsInitialized() && conditions.size() > 1;\"",
+      "src/execution/join_hashtable.cpp:802-804 \"data_collection->Gather(chunk_state.row_locations, incr_sel, count, 0, first_key_v, ...); VectorOperations::Hash(first_key_v, first_key_hashes_v, count);\"",
+      "src/planner/filter/bloom_filter.cpp:90-92 \"VectorOperations::Hash(keys_v, state.hashes_v, approved_count);\"",
+      "src/include/duckdb/planner/filter/selectivity_optional_filter.hpp:52-53 \"BF_THRESHOLD = 0.25f; BF_CHECK_N = 75\""
+    ]
+  },
+  "audit_cost_usd": 0.16344799999999998
+}

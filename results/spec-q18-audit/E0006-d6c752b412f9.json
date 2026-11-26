@@ -1,0 +1,42 @@
+{
+  "id": "E0006",
+  "sha": "d6c752b412f9acc366532f9729c2ddbffe9bd8f1",
+  "subject": "E0006: Extra selectivity for HAVING-style aggregate-result range filters in join ordering",
+  "files": [
+    "src/optimizer/join_order/cardinality_estimator.cpp",
+    "src/optimizer/join_order/relation_manager.cpp"
+  ],
+  "static": {
+    "added_lines": 63,
+    "removed_lines": 2,
+    "conditions": 12,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.088765122987722,
+  "accepted_faster": {
+    "q18": 1.09
+  },
+  "audit": {
+    "mechanism": "There are two cardinality-estimate changes in the join-order optimizer. (1) Before this change, an aggregate relation with any filter above it already had its estimate scaled by 0.2. Now, if one of those filters is a range comparison (<, <=, >, >=) between an aggregate output column and a constant (e.g. HAVING sum(x) > c), the estimate is scaled by 0.2 a second time, so 0.04 overall. (2) For SEMI joins, the denominator multiplier was a fixed 5. It is now max(5, tdom / |RHS|), where tdom is the join key's distinct count and |RHS| is the product of the estimated cardinalities of the relations on the right side. This is the textbook containment estimate: the output is roughly |LHS| * |RHS| / tdom when the RHS holds few distinct keys. The fixed factor of 5 is still the ceiling on the estimate. Together, a semi join against a small, HAVING-filtered subquery is now estimated as small, so the optimizer can put it on the build side.",
+    "trigger": "Change 1 (relation_manager.cpp): the relation must be a LOGICAL_AGGREGATE_AND_GROUP_BY extracted as a join-order relation with non-empty datasource filters (`if (!datasource_filters.empty())`, relation_manager.cpp:317). At least one filter expression, or a child of a nested AND, must be a BOUND_COMPARISON of type `COMPARE_GREATERTHAN/\u2026GREATERTHANOREQUALTO/\u2026LESSTHAN/\u2026LESSTHANOREQUALTO` (relation_manager.cpp:220-224). One side must be a bare BOUND_COLUMN_REF with `binding.table_index == aggregate_index`, so an aggregate result and not a group key. The other side must be `IsFoldable()` (relation_manager.cpp:229-234). Casts, arithmetic over the aggregate, OR, equality and BETWEEN-as-non-comparison do not match. When it matches: `cardinality * DEFAULT_SELECTIVITY`, floored at 1 (relation_manager.cpp:321-326). Change 2 (cardinality_estimator.cpp:266-275): `join_type == JoinType::SEMI && right_set`, then `tdom > 0 && rhs_cardinality >= 1 && rhs_cardinality < tdom`, giving `selectivity = MaxValue(selectivity, tdom / rhs_cardinality)`. Here rhs_cardinality = GetNumerator(right_set) = the product of per-relation `stats.cardinality` (cardinality_estimator.cpp:132-139, 464-467), which for an aggregate already includes the filter discounts. ANTI joins, MARK joins and delim joins are not affected.",
+    "constants": "DEFAULT_SELECTIVITY = 0.2 (relation_statistics_helper.hpp:57) is DuckDB's existing generic filter-selectivity guess. Applying it a second time is an arbitrary \"HAVING range filters are very selective\" prior with no data behind it: a HAVING count(*) > 0 or sum(x) > -1 that keeps every group gets the same 0.04 factor. There is no threshold. Any foldable bound qualifies, regardless of its value relative to the aggregate's stats. DEFAULT_SEMI_ANTI_SELECTIVITY = 5 (cardinality_estimator.hpp:92) is pre-existing and is kept as a lower bound on the divisor via MaxValue. The new branch changes things only when tdom/|RHS| > 5, i.e. the RHS has fewer than 20% as many rows as the key domain. Just outside that (|RHS| \u2265 tdom/5), the old estimate holds exactly, so the change is continuous at the boundary. The `rhs_cardinality < tdom` guard is redundant given the max with 5. Neither constant was tuned to TPCH sizes. The trigger for the plan flip in q18 is that 0.2*0.2 applied to a ~1.5M-group aggregate gives an RHS small enough that tdom/|RHS| beats 5. That depends on the double-0.2 prior, not on a measured selectivity.",
+    "natural_class": "Change 2 covers any IN / EXISTS subquery that becomes a SEMI join where the subquery side is estimated well below the key's distinct count. That is common: e.g. `SELECT * FROM events e WHERE e.user_id IN (SELECT user_id FROM users WHERE country = 'NZ')`, or `SELECT * FROM posts p WHERE EXISTS (SELECT 1 FROM flagged f WHERE f.post_id = p.id)` with a small flagged table. Change 1 covers any aggregate subquery with a range HAVING used in a join or semi join, e.g. `SELECT o.* FROM orders_log o WHERE o.session_id IN (SELECT session_id FROM clicks GROUP BY session_id HAVING count(*) >= 50)`, or `SELECT c.name, t.total FROM customers c JOIN (SELECT cust_id, sum(amount) AS total FROM payments GROUP BY cust_id HAVING sum(amount) > 10000) t ON c.id = t.cust_id`. Both are natural shapes in analytics workloads. In TPCH, q18 is the clear beneficiary.",
+    "fallback": "If the aggregate's filters contain no matching range comparison, the estimate is the original single 0.2 discount, unchanged. For ANTI joins, or SEMI joins where tdom/|RHS| \u2264 5 (or tdom is 0, or the RHS estimate is < 1), selectivity stays DEFAULT_SEMI_ANTI_SELECTIVITY = 5, exactly the old code. Delim-join semi estimates (relation_manager.cpp:543-547) still use the fixed 5. Only estimates change, never execution semantics, so a wrong guess can only produce a worse join order, not a wrong result.",
+    "label": "heuristic",
+    "label_reason": "The SEMI-join change is a principled, broadly applicable containment estimate (|L|\u00b7|R|/tdom, with the old constant kept as a cap). On its own it would be \"general\". It has caveats: |RHS| is a product of relation cardinalities rather than a distinct count of the RHS key, and duplicate RHS keys make it underestimate how much the RHS filters. But the plan flip that produced the speedup also needs change 1. That change adds a second, unconditional 0.2 factor to any aggregate under a range HAVING, a pure prior with no use of statistics or of the constant's value. It is broad in shape and not tied to TPCH's schema, but it is a magic-number nudge that happens to push q18's subquery estimate past the 1/5 crossover. It is plausibly upstreamable with different constants or a stats-based version, so it is not a special case, but it is not a principled improvement either.",
+    "citations": [
+      "src/optimizer/join_order/relation_manager.cpp:317 `if (!datasource_filters.empty()) {`",
+      "src/optimizer/join_order/relation_manager.cpp:220-224 `case ExpressionType::COMPARE_GREATERTHAN: ... COMPARE_LESSTHANOREQUALTO: break; default: return false;`",
+      "src/optimizer/join_order/relation_manager.cpp:229-234 `binding.table_index == aggregate_index; ... comp.right->IsFoldable()`",
+      "src/optimizer/join_order/relation_manager.cpp:321-326 `MaxValue<idx_t>(LossyNumericCast<idx_t>(... * RelationStatisticsHelper::DEFAULT_SELECTIVITY), 1)`",
+      "src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp:57 `static constexpr double DEFAULT_SELECTIVITY = 0.2;`",
+      "src/optimizer/join_order/cardinality_estimator.cpp:266-275 `if (filter.filter_info->join_type == JoinType::SEMI && filter.filter_info->right_set) { ... selectivity = MaxValue<double>(selectivity, tdom / rhs_cardinality);`",
+      "src/optimizer/join_order/cardinality_estimator.cpp:132-139 `numerator *= card_helper.cardinality_before_filters ...` (product over RHS relations)",
+      "src/optimizer/join_order/cardinality_estimator.cpp:464-467 `auto relation_cardinality = stats.cardinality; auto card_helper = CardinalityHelper((double)relation_cardinality);`",
+      "src/include/duckdb/optimizer/join_order/cardinality_estimator.hpp:92 `static constexpr double DEFAULT_SEMI_ANTI_SELECTIVITY = 5;`",
+      "src/optimizer/join_order/relation_manager.cpp:543-547 delim-join semi/anti still `/ CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY`"
+    ]
+  },
+  "audit_cost_usd": 0.2048096
+}

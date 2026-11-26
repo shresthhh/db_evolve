@@ -1,0 +1,57 @@
+{
+  "id": "E0014",
+  "sha": "8a8ce6c57e762a480be012364d746e586a51307d",
+  "subject": "E0014: FSST batched decode + substring prefilter bundle (q13)",
+  "files": [
+    "src/storage/compression/fsst.cpp",
+    "src/storage/table/column_segment.cpp"
+  ],
+  "static": {
+    "added_lines": 323,
+    "removed_lines": 7,
+    "conditions": 37,
+    "numeric_constants": [
+      "65536"
+    ],
+    "string_literals": [
+      "\"!~~\"",
+      "\"Corrupt database file: FSST string ends with an escape code\"",
+      "\"contains\"",
+      "\"duckdb/common/likely.hpp\"",
+      "\"duckdb/planner/expression/bound_function_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_operator_expression.hpp\"",
+      "\"~~\""
+    ]
+  },
+  "accepted_gain": 1.0244033985668364,
+  "accepted_faster": {
+    "q02": 1.12,
+    "q04": 1.07,
+    "q13": 1.13
+  },
+  "audit": {
+    "mechanism": "Two independent changes to string column scans. (1) FSST decode: when a vector of FSST-compressed strings is turned into flat strings (StringScanPartial without FSST vectors, and Select), the engine no longer calls duckdb_fsst_decompress once per string with its own allocation. It decodes the strings of a vector back to back into shared heap allocations with a simple loop that handles one code per iteration (copy an 8-byte symbol and advance by len[code]; an escape copies one literal byte). Strings of 12 bytes or less are copied inline and their heap space is reused. This removes per-string overhead (call, allocation, the 4-code unrolled fast path and its tail). (2) Substring prefilter for scan-pushed ExpressionFilters of the form [NOT] col LIKE/NOT LIKE 'pattern' or contains(col, 'lit'). The engine takes the longest wildcard-free literal of the pattern. It finds runs of non-inlined strings that sit next to each other in memory (which the new decoder produces) and searches each run once with an SSE2 first-byte/last-byte memchr-style scan. Each hit is mapped back to its row. Only rows containing the literal are passed to the original LIKE expression. In the negated case, non-NULL rows without the literal pass directly. This is the standard \"required literal\" prefilter used by regex and LIKE engines, applied to a whole vector at once.",
+    "trigger": "Decode path: any FSST segment scan that produces flat strings. StringScanPartial takes it when enable_fsst_vectors is false (the default) (src/storage/compression/fsst.cpp:784-788 \"// Just decompress ... scan_state.DecompressStrings(\") and FSSTStorage::Select always takes it (fsst.cpp:815). Inside it, segments where every value is inlined keep the old per-string path (fsst.cpp:605 \"if (all_values_inlined) {\"). Prefilter path: ColumnSegment::FilterSelection, case EXPRESSION_FILTER, after TryDenseMaskFilterSelection has declined (src/storage/table/column_segment.cpp:1043-1047). Conditions: column_segment.cpp:769 \"scan_count > STANDARD_VECTOR_SIZE || approved_tuple_count == 0 || vector.GetType().id() != LogicalTypeId::VARCHAR || vector.GetVectorType() != VectorType::FLAT_VECTOR\" \u2192 bail. The expression is an optional OPERATOR_NOT around a BOUND_FUNCTION with 2 children: child0 BOUND_REF of type VARCHAR, child1 a non-NULL VARCHAR BOUND_CONSTANT, return type BOOLEAN (column_segment.cpp:~726-737). Function name must be \"contains\", \"~~\" or \"!~~\" (column_segment.cpp:741-743). The literal must satisfy \"return needle.size() >= 2;\" (column_segment.cpp:761). Contiguity runs break at NULLs, inlined strings and non-adjacent data: \"if (next.IsInlined() || next.GetData() != run_end) break;\" (column_segment.cpp:811). Inlined strings are searched one by one.",
+    "constants": "BATCH_BOUND = 65536 (fsst.cpp:612). This caps the worst-case decoded size (8 x compressed bytes) of one shared heap allocation. It is an allocation-granularity choice, not a TPC-H size. Larger or smaller values only change how many allocations are made. A single string larger than the bound still gets its own batch (\"batch_end > batch_start &&\" check). BATCH_SLACK = 32 (fsst.cpp:614): headroom so the 8-byte symbol memcpy can overrun the last string's end. It follows from the 8-byte symbol width. \"* 8\" in the size bound: the FSST maximum symbol length (format fact). string_t::INLINE_LENGTH (12): DuckDB's string format. Needle length >= 2 (column_segment.cpp:761): required by the first/last-byte comparison algorithm (it compares needle+1 for needle_len-2 bytes). One-character literals or pure-wildcard patterns fall back to the old path. 16: the SSE2 register width. Inputs of fewer than 16 candidate positions use the scalar loop. Choosing the longest literal is a standard heuristic. For q13's '%special%requests%' it picks \"requests\", which is a natural choice rather than one fitted to the data. None of these constants looks tuned to TPC-H cardinalities or string lengths.",
+    "natural_class": "Decode: every scan of an FSST-compressed VARCHAR column that materialises strings (a common case for medium-cardinality text in DuckDB storage), whatever the query. Prefilter: any LIKE / NOT LIKE / contains filter with a constant pattern containing a literal of at least 2 bytes, on a VARCHAR column, that the optimizer pushes into the table scan as an ExpressionFilter. Examples: SELECT count(*) FROM logs WHERE message LIKE '%timeout%connecting%'; SELECT id FROM tickets WHERE NOT contains(body, 'unsubscribe'); SELECT * FROM products WHERE title NOT LIKE '%refurbished%'. The benefit is largest when the column is FSST-compressed, because decoded strings are then contiguous and a whole run is searched at once. On other layouts runs are short, but results stay correct and the scan is still per-row.",
+    "fallback": "Decode: segments where every value is inlined use the old per-string DecompressString. Scans with enable_fsst_vectors=true keep the FSST-vector path unchanged. Prefilter: if any condition fails, TrySubstringPrefilter returns false and the existing ExpressionFilter evaluation runs unchanged (column_segment.cpp:1050 onwards). Examples are other functions, ILIKE, LIKE ... ESCAPE (bound as like_escape, a different name), non-constant patterns, needles shorter than 2, non-flat vectors, and scan_count > STANDARD_VECTOR_SIZE. When the prefilter does apply, the original expression still decides every row that contains the literal, so it only removes rows that cannot match. It does not change which rows match.",
+    "label": "general",
+    "label_reason": "Both parts are standard techniques with broad, natural triggers: removing per-string decode overhead with batched allocation, and a required-literal (longest fixed substring) prefilter with SIMD first/last-byte search ahead of LIKE. Neither looks at TPC-H tables, columns or query shapes. The constants come from the FSST format (8-byte symbols), SIMD width, DuckDB's inline length, or allocation granularity, not from workload sizes. The benchmark gain shows up in q13 (o_comment NOT LIKE '%special%requests%'), but the same path serves any pushed-down LIKE or contains filter on a string column and any FSST string scan. One limitation: the contiguous-run part pays off mainly together with the new FSST decoder's back-to-back layout.",
+    "citations": [
+      "src/storage/compression/fsst.cpp:588 \"if (pos_in + 1 >= in_len) { throw IOException(\\\"Corrupt database file: FSST string ends with an escape code\\\")\"",
+      "src/storage/compression/fsst.cpp:605 \"if (all_values_inlined) {\"",
+      "src/storage/compression/fsst.cpp:612 \"static constexpr idx_t BATCH_BOUND = 65536;\"",
+      "src/storage/compression/fsst.cpp:614 \"static constexpr idx_t BATCH_SLACK = 32;\"",
+      "src/storage/compression/fsst.cpp:653 \"if (decoded_size > string_t::INLINE_LENGTH) { used += decoded_size;\"",
+      "src/storage/compression/fsst.cpp:787 \"scan_state.DecompressStrings(... [](idx_t i) { return i; } ...)\" (flat scan, enable_fsst_vectors false)",
+      "src/storage/compression/fsst.cpp:815 \"scan_state.DecompressStrings(... [&sel](idx_t i) { return sel.get_index(i); } ...)\" (Select)",
+      "src/storage/table/column_segment.cpp:714 \"static bool GetSubstringPrefilter(const Expression &expr, string &needle, bool &negate)\"",
+      "src/storage/table/column_segment.cpp:741-743 \"if (name == \\\"contains\\\") ... else if (name == \\\"~~\\\" || name == \\\"!~~\\\")\"",
+      "src/storage/table/column_segment.cpp:761 \"return needle.size() >= 2;\"",
+      "src/storage/table/column_segment.cpp:769 \"if (scan_count > STANDARD_VECTOR_SIZE || approved_tuple_count == 0 || vector.GetType().id() != LogicalTypeId::VARCHAR || vector.GetVectorType() != VectorType::FLAT_VECTOR)\"",
+      "src/storage/table/column_segment.cpp:811 \"if (next.IsInlined() || next.GetData() != run_end) { break; }\"",
+      "src/storage/table/column_segment.cpp:1043-1047 \"if (TryDenseMaskFilterSelection(...)) ... if (TrySubstringPrefilter(*expr_filter.expr, vector, vdata, sel, approved_tuple_count, scan_count, state))\""
+    ]
+  },
+  "audit_cost_usd": 0.2576254
+}

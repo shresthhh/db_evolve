@@ -1,0 +1,58 @@
+{
+  "id": "E0007",
+  "sha": "1a0ec0cc6e10e7b4edfe41edc7ca8936dc782aff",
+  "subject": "E0007: Exact key-bitmap mode for join Bloom filter on dense integer build keys",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/planner/filter/bloom_filter.cpp"
+  ],
+  "static": {
+    "added_lines": 338,
+    "removed_lines": 12,
+    "conditions": 74,
+    "numeric_constants": [
+      "128",
+      "2048"
+    ],
+    "string_literals": [
+      "\"Unsupported key type for exact bloom filter\""
+    ]
+  },
+  "accepted_gain": 1.0496425117084005,
+  "accepted_faster": {
+    "q03": 1.29,
+    "q04": 1.14,
+    "q09": 1.16,
+    "q14": 1.05
+  },
+  "audit": {
+    "mechanism": "Before this change, a hash join that pushed a Bloom filter into the probe-side scan always used DuckDB's hashed, sectorised Bloom filter. Now, if the build side's first equality key is an integer whose observed [min,max] range is small enough, the filter becomes an exact bitmap with one bit per value (offset = key - min). The build side sets those bits with atomic fetch_or in JoinHashTable::Finalize. The probe tests bit[key-min] with no hashing and no false positives. The exact filter is also used for zone-map pruning in CheckStatistics: a non-overlapping range is pruned, and for row-group ranges of up to 2048 values each value is probed. This is a standard technique: a dense-domain bitmap or \"exact\" semi-join filter, similar to the bitmap behind perfect hashing.",
+    "trigger": "It runs only where a Bloom filter was already going to be built. In physical_hash_join.cpp:1059 that requires `!has_cast && pushdown_column.storage_offset.IsNull() && ht && join_condition[filter_idx] == 0 && CanUseBloomFilter(...)`. CanUseBloomFilter in turn needs a non-perfect hash table, `cmp == COMPARE_EQUAL`, `build_side_has_filter`, and probe estimated cardinality > build count (physical_hash_join.cpp:873-887). It also has to be the min != max branch.\n\nTrySetExactBloomFilter (physical_hash_join.cpp:896-942) then adds these conditions:\n- `!ht.NullValuesAreEqual(0)` and `ht.Count() != 0`.\n- `cond.comparison == COMPARE_EQUAL`.\n- `cond.left->return_type == cond.right->return_type == ht.equality_types[0]`, and min/max are non-NULL with that same type.\n- The physical type is INT8/16/32/64 or UINT8/16/32/64.\n- `range = max - min` satisfies `range < min(2^32, 128 * ht.Count())`.\n\nFor multi-key joins only key 0 goes into the bitmap (join_hashtable.cpp:849-850).",
+    "constants": "- EXACT_BF_MAX_BITS_PER_KEY = 128 (physical_hash_join.cpp:893). This caps the bitmap at 16 bytes per build row. That is roughly the size of the pointer table (8-byte entries, about 2x capacity), which is the memory bound the author's comment gives. Equivalently, keys must be at least 1/128 dense over their range. This is a principled memory-for-exactness trade-off and not tied to TPC-H sizes. TPC-H surrogate keys, filtered or not, are far denser than 1/128, so the benchmark is not near the edge. If a join is just outside the limit (keys sparser than 1/128, e.g. hashed or snowflake IDs), it silently uses the old hashed Bloom filter.\n- EXACT_BF_MAX_RANGE = 2^32 (physical_hash_join.cpp:894). This is a hard cap of a 512 MB bitmap, a sanity bound. Beyond it the old Bloom filter is used.\n- 2048 in TemplatedCheckStatisticsExact (bloom_filter.cpp, `range_typed > 2048`). This bounds the per-row-group cost of probing every value for zone-map pruning. Above it, only the range-overlap test runs and the result is NO_PRUNING_POSSIBLE. It is an arbitrary but small, conservative cost bound.\n\nNo constant refers to TPC-H schema, column names or data sizes.",
+    "natural_class": "Any equi-hash-join with these properties takes the new path:\n- the join is not a perfect hash join (the build range or count is too large for it);\n- the build side has a filter, and the probe is estimated larger than the build;\n- the first key is a same-typed integer, with no cast, on both sides;\n- the build keys fill at least 1/128 of their range.\n\nThis covers most star and snowflake joins on auto-increment or surrogate integer keys where a dimension is filtered.\n\nExample 1: `SELECT e.page_id, count(*) FROM events e JOIN users u ON e.user_id = u.id WHERE u.country = 'DE' AND u.signup_date > DATE '2024-01-01' GROUP BY 1;` (BIGINT ids, events much larger than users).\n\nExample 2 (multi-key, so key 0 only): `SELECT sum(s.qty) FROM sales s JOIN stores st ON s.store_id = st.store_id AND s.region = st.region WHERE st.format = 'outlet';`\n\nWorkloads that would not benefit:\n- VARCHAR or UUID keys, or decimals stored as INT128;\n- sparse 64-bit hashed IDs;\n- keys that need a cast (INT joined to BIGINT);\n- probe columns with a storage offset.",
+    "fallback": "If TrySetExactBloomFilter returns early, `exact` stays false. Initialize, InsertHashes, Finalize, Filter, FilterValue and CheckStatistics then run exactly the old hashed Bloom filter code: the original logic, now under `else` / `!IsExact()` branches (bloom_filter.cpp Filter `} else { HashInternal(...)`; join_hashtable.cpp:851 `else if (first_key_bloom_filter)`).\n\nAt run time, if exact mode is on but an inserted key falls outside the range (`exact_overflow`), or the probe vector type doesn't match, the filter lets every row through (`return approved_tuple_count`). That is safe, but the filtering benefit is lost.\n\nOne fragility: TrySetExactBloomFilter reads `min_val`/`max_val` after they were `std::move`d into ConstantFilters (physical_hash_join.cpp:1031, 1044). It works only because the Value and LogicalType move constructors copy `is_null`, `value_` and `id_` (value.cpp:186-188, types.cpp:53-54). The behaviour is correct but depends on moved-from state.",
+    "label": "general",
+    "label_reason": "This is a well-known technique: an exact bitmap semi-join filter over a dense integer domain. It is added behind the engine's existing Bloom filter gate. The new conditions are type and semantic correctness checks (same integer type, no cast, NULLs not equal) plus memory and density bounds (\u2264128 bits per build row, \u22642^32 range). Those bounds follow from a memory argument, not from TPC-H cardinalities. Nothing refers to the benchmark's schema or query shapes, and dense surrogate integer keys are the common case in real analytic schemas. Outside the bounds, the old Bloom filter is used unchanged. Two weaknesses: the 128 and 2048 constants are reasonable but untuned guesses, and the gate reads moved-from Values. Neither makes this a benchmark branch.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:893 \"EXACT_BF_MAX_BITS_PER_KEY = 128\"",
+      "src/execution/operator/join/physical_hash_join.cpp:894 \"EXACT_BF_MAX_RANGE = idx_t(1) << 32\"",
+      "src/execution/operator/join/physical_hash_join.cpp:899 \"if (bf.IsExact() || bf.IsInitialized() || ht.NullValuesAreEqual(0) || ht.Count() == 0)\"",
+      "src/execution/operator/join/physical_hash_join.cpp:903 \"cond.comparison != ExpressionType::COMPARE_EQUAL || cond.left->return_type != cond.right->return_type\"",
+      "src/execution/operator/join/physical_hash_join.cpp:937 \"if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1059 \"if (!has_cast && pushdown_column.storage_offset.IsNull() && ht &&join_condition[filter_idx] == 0 && CanUseBloomFilter(...))\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1064 \"TrySetExactBloomFilter(*ht, op, min_val, max_val);\"",
+      "src/execution/operator/join/physical_hash_join.cpp:873 \"if (is_perfect_hashtable) { return false; }\"",
+      "src/execution/operator/join/physical_hash_join.cpp:882 \"build_to_probe_ratio > 1.0\"",
+      "src/execution/operator/join/physical_hash_join.cpp:1031 \"make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(min_val))\"",
+      "src/common/types/value.cpp:186 \"Value::Value(Value &&other) noexcept : type_(std::move(other.type_)), is_null(other.is_null), value_(other.value_)\"",
+      "src/execution/join_hashtable.cpp:849 \"if (exact_bloom_filter) { InsertFirstKeyIntoExactBloomFilter(...)\"",
+      "src/include/duckdb/planner/filter/bloom_filter.hpp InsertExact \"slot.fetch_or(1ULL << (offset & 63), std::memory_order_relaxed);\"",
+      "src/planner/filter/bloom_filter.cpp Initialize \"const idx_t num_words = (exact_range >> LOG_SECTOR_SIZE) + 1;\"",
+      "src/planner/filter/bloom_filter.cpp Filter \"if (filter.ExactOverflow() || keys_v.GetType().InternalType() != key_type.InternalType()) { return approved_tuple_count; }\"",
+      "src/planner/filter/bloom_filter.cpp TemplatedCheckStatisticsExact \"range_typed > 2048\""
+    ]
+  },
+  "audit_cost_usd": 0.26258499999999996
+}

@@ -1,0 +1,51 @@
+{
+  "id": "E0040",
+  "sha": "d34eabd99f6b4f4e9cb6fad5a319c5eee1bb6b9d",
+  "subject": "E0040: Coalesce sparse filtered scan chunks before emitting",
+  "files": [
+    "src/function/table/table_scan.cpp"
+  ],
+  "static": {
+    "added_lines": 84,
+    "removed_lines": 7,
+    "conditions": 11,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.1025880959184389,
+  "accepted_faster": {
+    "q02": 1.08,
+    "q03": 1.15,
+    "q05": 1.19,
+    "q07": 1.09,
+    "q08": 1.22,
+    "q09": 1.09,
+    "q14": 1.27,
+    "q17": 1.27,
+    "q19": 1.06
+  },
+  "audit": {
+    "mechanism": "In the parallel DuckDB table scan, when a filtered scan produces an output chunk that is very sparse (fewer than 256 rows at the default 2048-row vector size), the scan no longer passes it on right away. It copies the rows into a per-thread buffer and keeps scanning the same parallel range, appending more chunks, until the buffer holds 1024 rows, the range runs out, the batch index changes, or the next chunk would push it past 2048 rows. A chunk that does not fit is held and emitted on the next call. This is ordinary chunk compaction at the scan source: it trades one extra copy of the surviving rows for fewer, fuller chunks, so downstream operators (hash probes, aggregates, projections) pay their per-chunk overhead less often. It never crosses into the next parallel range, which keeps batch indexes and insertion order intact.",
+    "trigger": "Only in DuckTableScanState::TableScanFunc, the parallel/global table scan. After a non-empty scan chunk is produced (src/function/table/table_scan.cpp:347 `if (output.size() > 0)`), it coalesces when all of these hold (table_scan.cpp:348-349): `output.size() < COALESCE_MIN_ROWS && !bind_data.is_create_index && !l_state.scan_state.filters.GetFilterList().empty()`. The constant is `COALESCE_MIN_ROWS = STANDARD_VECTOR_SIZE / 8` (table_scan.cpp:382). In words: any table filter is present (a pushed-down constant or IS NULL predicate, or a dynamic join filter pushed into the scan at runtime), the scan is not a CREATE INDEX scan, and the chunk has fewer than 256 rows. The loop runs `while (accum.size() < COALESCE_TARGET_ROWS && !context.interrupted)` (table_scan.cpp:420) with `COALESCE_TARGET_ROWS = STANDARD_VECTOR_SIZE / 2` (table_scan.cpp:383). It stops on an empty scan, which sets `range_exhausted` (table_scan.cpp:424), or on `CurrentBatchIndex(l_state) != batch_index || accum.size() + scratch.size() > STANDARD_VECTOR_SIZE`, which sets `has_pending` (table_scan.cpp:427-428). A pending chunk is emitted as is if it has at least COALESCE_MIN_ROWS rows; otherwise it starts a new coalesce (table_scan.cpp:329-336). Column types, data types, table names and query shape are never checked.",
+    "constants": "COALESCE_MIN_ROWS = STANDARD_VECTOR_SIZE/8 = 256 rows (table_scan.cpp:382). This is the selectivity cutoff, about 12.5% per chunk, and it was picked by trial on this benchmark: the author reports that /4 (512) made q22 3.5\u201312% slower, because its orders scan passes 12.7% of rows (about 260 per chunk), and that /8 fixed q22 and improved the geomean. The value sits just below a measured selectivity of one benchmark query, so it is tuned to this workload even though it is written as a neat fraction of the vector size. Just outside it, a chunk of 256 or more rows goes through unchanged with no copy, and a chunk of 255 rows gets the full copy and merge. Nothing protects against selectivities near the line where copying costs about what it saves, which is the regression the author saw at 512.\nCOALESCE_TARGET_ROWS = STANDARD_VECTOR_SIZE/2 = 1024 (table_scan.cpp:383). The author says it \"was not tuned\". Below 1024 the loop keeps scanning, and once the buffer reaches 1024 it is emitted.\nSTANDARD_VECTOR_SIZE (2048) as the overflow limit (table_scan.cpp:427). This is a hard engine invariant: a chunk cannot exceed the vector capacity.\nNone of the three depends on hardware. All are fixed fractions of the vector size, and only the 1/8 was chosen empirically.",
+    "natural_class": "Any parallel table scan with a selective pushed-down filter (under about 12.5% of rows per 2048-row chunk), or with a selective dynamic join filter, which DuckDB pushes into probe-side scans from hash-join builds. This covers selective point and range predicates on large tables and probe sides of selective star or snowflake joins, so it reaches well beyond TPCH. Examples:\n(1) `SELECT user_id, count(*) FROM events WHERE event_type = 'purchase' AND ts >= TIMESTAMP '2024-06-01' GROUP BY user_id;` when purchases are about 2% of events.\n(2) `SELECT s.store_name, sum(f.amount) FROM sales_fact f JOIN stores s ON f.store_id = s.id WHERE s.region = 'NW' GROUP BY 1;` Here the build-side min/max or IN dynamic filter on f.store_id makes the fact scan's chunks sparse.\nQueries that do not benefit: unfiltered scans, filters that are not pushed down (complex expressions left in a FILTER operator), CREATE INDEX, the index-scan path, and the local-storage phase (per the author, not covered). Queries that pay copy cost for little gain: chunks just under 256 rows with a cheap downstream operator.",
+    "fallback": "If there is no table filter, the scan is a CREATE INDEX scan, or the chunk has 256 or more rows, the chunk is emitted exactly as before. The scan body was moved into ScanChunk (table_scan.cpp:385-395), which has the same three branches as the old inline code: CreateIndexScan, the all_columns plus ReferenceColumns projection path, and the plain Scan. The only change on the default path is that the `has_pending` and `range_exhausted` flags are checked first (table_scan.cpp:329, 341). Both are false unless coalescing ran earlier, so the old behaviour is unchanged.",
+    "label": "heuristic",
+    "label_reason": "Compacting sparse vectors after selective filters is a standard, principled technique in vectorized engines. The trigger is broad and has nothing to do with the schema: any filtered parallel scan, including those with dynamic join filters, and no checks on types, tables or plan shape. The one threshold that matters, 1/8 of the vector size, was picked by A/B testing on the benchmark, specifically to fix a q22 regression whose selectivity (about 260 rows per chunk) sits just above the new cutoff. The target size was not tuned at all. The kind of change is general, but its constant is fitted to this workload. An upstream version would probably keep the idea and choose or adapt the constants differently, for example from the cost of the downstream operator.",
+    "citations": [
+      "src/function/table/table_scan.cpp:47-54 `DataChunk coalesce_chunk; ... bool has_pending = false; ... bool range_exhausted = false;`",
+      "src/function/table/table_scan.cpp:329-336 `if (l_state.has_pending) { ... if (l_state.coalesce_scratch.size() >= COALESCE_MIN_ROWS) { output.Reference(l_state.coalesce_scratch);`",
+      "src/function/table/table_scan.cpp:341-343 `if (l_state.range_exhausted) { ... l_state.range_exhausted = false;`",
+      "src/function/table/table_scan.cpp:348-349 `if (output.size() < COALESCE_MIN_ROWS && !bind_data.is_create_index && !l_state.scan_state.filters.GetFilterList().empty())`",
+      "src/function/table/table_scan.cpp:382 `static constexpr idx_t COALESCE_MIN_ROWS = STANDARD_VECTOR_SIZE / 8;`",
+      "src/function/table/table_scan.cpp:383 `static constexpr idx_t COALESCE_TARGET_ROWS = STANDARD_VECTOR_SIZE / 2;`",
+      "src/function/table/table_scan.cpp:385-395 `void ScanChunk(...) { if (bind_data.is_create_index) { storage.CreateIndexScan(...` (old scan body, moved unchanged)",
+      "src/function/table/table_scan.cpp:420 `while (accum.size() < COALESCE_TARGET_ROWS && !context.interrupted)`",
+      "src/function/table/table_scan.cpp:424 `l_state.range_exhausted = true;`",
+      "src/function/table/table_scan.cpp:427-428 `if (CurrentBatchIndex(l_state) != batch_index || accum.size() + scratch.size() > STANDARD_VECTOR_SIZE) { l_state.has_pending = true;`",
+      ".dbe/review/issue.md: 'At STANDARD_VECTOR_SIZE/4, q22 got slower ... (about 260 rows per chunk) ... STANDARD_VECTOR_SIZE/8 is safe on the visible queries.'",
+      ".dbe/review/issue.md: 'The target size (1024) was not tuned'"
+    ]
+  },
+  "audit_cost_usd": 0.15118579999999998
+}

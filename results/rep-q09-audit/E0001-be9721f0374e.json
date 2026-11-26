@@ -1,0 +1,50 @@
+{
+  "id": "E0001",
+  "sha": "be9721f0374e6dc16a5bde75cf58e00e80ad798d",
+  "subject": "E0001: Length-aware selectivity for substring contains() scan filters",
+  "files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp"
+  ],
+  "static": {
+    "added_lines": 33,
+    "removed_lines": 0,
+    "conditions": 7,
+    "numeric_constants": [
+      "0.01",
+      "0.75"
+    ],
+    "string_literals": [
+      "\"contains\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.4170068596901664,
+  "accepted_faster": {
+    "q09": 1.42
+  },
+  "audit": {
+    "mechanism": "When the join-order optimizer estimates a base table's cardinality, it used to treat a pushed-down substring filter `contains(col, 'lit')` (what `LIKE '%lit%'` is rewritten to) as an unknown predicate with the default selectivity 0.2. It now estimates selectivity as 0.2 \u00d7 0.75^L, where L is the literal length (capped at 64), with a floor of 0.01 and at least 1 row. Longer needles are assumed to be rarer. Only the cardinality estimate changes, which can change the join order and build/probe sides; execution itself does not change. Because the new estimate is below the base cardinality, ExtractGetStats now treats the table as having a selective (\"equality-like\") filter and skips the blanket 0.2 default.",
+    "trigger": "The new path runs in RelationStatisticsHelper::InspectTableFilter, which ExtractGetStats calls for every table filter on a LogicalGet whose scan supplies column statistics (relation_statistics_helper.cpp:135 `if (column_statistics) { ... InspectTableFilter(...)`). All of the following must hold:\n- the filter is `case TableFilterType::EXPRESSION_FILTER` (:472). This exists only if the scan accepted generic expression pushdown on a single column (filter_combiner.cpp:379 `if (!get.function.pushdown_expression)`, :390 \"refer to exactly one column\");\n- the expression is a BOUND_FUNCTION (:476) with `func.function.name != \"contains\" || func.children.size() != 2` false (:480);\n- child 0 is a BOUND_REF or BOUND_COLUMN_REF (:484), so the bare column with no wrapping function (no lower(col), etc.);\n- child 1 is a BOUND_CONSTANT (:487) that is not NULL and has type VARCHAR (:491 `constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR`), and its length is not 0 (:495).\nThere are no tests on table name, column or plan shape. NOT contains, OR, prefix/suffix LIKE, multi-wildcard LIKE ('%a%b%'), ILIKE and regexp all fall through to `return cardinality_after_filters` (:505). Within TPC-H, only Q9 (`p_name like '%green%'`) matches. Q13's `'%special%requests%'` is not a single contains. Q2, Q14 and Q20 use suffix/prefix patterns.",
+    "constants": "- Base 0.2: the engine's existing DEFAULT_SELECTIVITY (relation_statistics_helper.hpp:57 `DEFAULT_SELECTIVITY = 0.2`), not new.\n- Per-character factor 0.75 (:499 `pow(0.75, ...)`): no source is cited. The idea of a fixed per-character selectivity is standard (PostgreSQL's like_selectivity multiplies by FIXED_CHAR_SEL=0.2 per literal character), but 0.75 is a much weaker decay and looks hand-picked. For Q9's 'green' (L=5) it gives 0.2\u00d70.237 \u2248 0.047. The true selectivity in TPC-H is \u22480.054 (5 words drawn from 92 colours, so 1-(91/92)^5). The constant lands almost exactly on the benchmark's real value. With L=4 the estimate is 0.063, with L=6 it is 0.036.\n- Floor 0.01 (:500): reached once 0.75^L < 0.05, i.e. L \u2265 11. Every literal of 11 or more characters gets 1%. This is an arbitrary safety clamp.\n- Length cap 64 (:499 `MinValue<idx_t>(literal_length, 64)`): has no effect, because the floor already applies at 11.\n- Minimum 1 row and `MinValue(..., cardinality_after_filters)` (:502): sanity bounds.\nJust outside the trigger (empty literal, non-constant needle, an expression on the column, NOT/OR) the estimate stays at the old 0.2 default.",
+    "natural_class": "Any query on a native DuckDB table (or another scan that supports expression pushdown and statistics) with a positive single-substring filter on a bare VARCHAR column, written as `LIKE '%lit%'` or `contains(col,'lit')`, where the join order matters. Examples outside TPC-H:\n1) `SELECT u.name, count(*) FROM events e JOIN users u ON e.user_id=u.id WHERE u.email LIKE '%@example.org%' GROUP BY 1;` (L=12, so 1% instead of 20%. This makes users a smaller build side.)\n2) `SELECT p.title, c.body FROM posts p JOIN comments c ON c.post_id=p.id WHERE p.title LIKE '%duckdb%';` (L=6, so \u22483.6% instead of 20%.)\nThe direction is reasonable in general. The magnitude can be badly wrong in either direction: a short common needle like '%e%' gets 15%, and a long but very common one like '%http://%' (L=7) gets 2.7%, so the estimate can underestimate heavily and pick bad build sides.",
+    "fallback": "If any condition fails, the function returns the input cardinality, exactly as the old `default:` branch did (:477-496, :505). ExtractGetStats then applies the unchanged 0.2 default when no filter reduced the estimate (:147-152). CONJUNCTION_AND still takes the minimum over its children (:451-457), so contains ANDed with other filters on the same column also picks up the new estimate. Execution operators are unchanged.",
+    "label": "heuristic",
+    "label_reason": "The idea is a recognised technique: length-based LIKE selectivity in the style of PostgreSQL's per-character FIXED_CHAR_SEL. It applies to any `LIKE '%x%'` on any column, with no tests on schema or query shape, so it is not a special case. However, the constants (0.75 per character, the 0.01 floor) have no stated derivation. For the only TPC-H literal that triggers it ('green', L=5), they produce 4.7%, very close to the true 5.4% in TPC-H. The constants appear fitted to make Q9's estimate correct, and the win comes from that one query flipping its join order. Upstream would probably accept something similar, maybe with different constants or a version based on statistics.",
+    "citations": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp:472 `case TableFilterType::EXPRESSION_FILTER: {`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:480 `if (func.function.name != \"contains\" || func.children.size() != 2)`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:484 `if (child_class != ExpressionClass::BOUND_REF && child_class != ExpressionClass::BOUND_COLUMN_REF)`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:491 `if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR)`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:498-500 `DEFAULT_SELECTIVITY * pow(0.75, ...MinValue<idx_t>(literal_length, 64)); selectivity = MaxValue(selectivity, 0.01);`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:502 `return MinValue(MaxValue<idx_t>(estimate, 1), cardinality_after_filters);`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:505 `default: return cardinality_after_filters;`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:135-138 `if (column_statistics) { ... InspectTableFilter(base_table_cardinality, ...)`",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:147-152 `bool has_equality_filter = (cardinality_after_filters != base_table_cardinality); if (!has_equality_filter && has_non_optional_filters) { ... DEFAULT_SELECTIVITY`",
+      "src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp:57 `static constexpr double DEFAULT_SELECTIVITY = 0.2;`",
+      "src/optimizer/filter_combiner.cpp:379 `if (!get.function.pushdown_expression)`",
+      "src/optimizer/filter_combiner.cpp:405 `auto expr_filter = make_uniq<ExpressionFilter>(std::move(filter_expr));`",
+      "src/optimizer/rule/like_optimizations.cpp:91 `// contains requires both a leading AND a trailing %`"
+    ]
+  },
+  "audit_cost_usd": 0.21256739999999996
+}

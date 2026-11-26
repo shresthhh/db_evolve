@@ -1,0 +1,54 @@
+{
+  "id": "E0029",
+  "sha": "e715f91cf53b8e8c56da3df2f961f264b6d02f98",
+  "subject": "E0029: Bundle: sparse perfect-HJ exact BF (E0028) + branch-free fixed 8-byte BitPacking per-value extract",
+  "files": [
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp",
+    "src/storage/compression/bitpacking.cpp"
+  ],
+  "static": {
+    "added_lines": 112,
+    "removed_lines": 12,
+    "conditions": 22,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/common/bit_utils.hpp\""
+    ]
+  },
+  "accepted_gain": 1.025680437251383,
+  "accepted_faster": {
+    "q02": 1.05,
+    "q07": 1.12,
+    "q09": 1.13,
+    "q14": 1.09
+  },
+  "audit": {
+    "mechanism": "The change has two independent parts.\n(1) Join filter pushdown: before this change, a hash join that used a perfect hash table never got a bloom filter, because the engine relied on min/max pruning. Now, when the build keys are sparse within their [min,max] range, the join builds an \"exact\" bloom filter, which is a bitmap with one bit per key value. It fills the bitmap from the occupied slots of the perfect hash table after the build, then pushes it to the probe-side table scan, so non-matching probe rows are dropped during the scan.\n(2) BitPacking compressed scans: when a filtered scan fetches only some rows (sparse selection) from a FOR-mode group of 32- or 64-bit integers, it used to decode each value with a variable-length extract. It now does one fixed 8-byte unaligned load, a shift and a mask. The group pointer and mask are hoisted out of the per-value loop. If the 8-byte load could read past the current group's metadata entry, it falls back to the old extract.",
+    "trigger": "Part 1, all of these must hold:\n- The join uses a perfect hash table (`use_perfect_hash`) and the min/max filter pushdown is active (`if (sink.perfect_filter_min_max)` / `if (filter_min_max)`, physical_hash_join.cpp:673, :1332).\n- The pushdown column has no cast and no storage offset, the condition is join_condition 0, and `CanUseBloomFilter` holds (physical_hash_join.cpp:1184). That requires `cmp == ExpressionType::COMPARE_EQUAL`, `build_side_has_filter` (the build side is filtering, or is a DELIM_GET) and `estimated_cardinality(probe) / ht->Count() > 1.0` (physical_hash_join.cpp:966-976). The old `if (is_perfect_hashtable) return false;` is removed.\n- `TrySetExactBloomFilter(..., sparse_only=true)` (physical_hash_join.cpp:1188) requires:\n  - an equality condition on identical integer types (INT8..INT64 or UINT8..UINT64);\n  - NULLs are not treated as equal, and `ht.Count() > 0`;\n  - range < min(2^32, max(count*128, 2^22, min(count*1024, 2^27))) (physical_hash_join.cpp:1031-1040);\n  - and the new test: NOT `ht.Count() * PERFECT_HT_BF_MIN_RANGE_PER_KEY > range + 1`, i.e. count*4 <= range+1 (physical_hash_join.cpp:1042).\n- The CM-offset branch (physical_hash_join.cpp:1206-1208) passes `is_perfect_hashtable` as sparse_only and skips `SetBuildBloomFilter` for perfect hash tables.\n- The filter is pushed only if `FillExactBloomFilter` succeeds (perfect_hash_join_executor.cpp:342-385): the BF must be exact and not yet initialized, and build_min must be a non-null integer.\n\nPart 2 (bitpacking.cpp:903-955): BitpackingSelect is on the sparse path (`sel_count * 4 <= vector_count`), the type is 4 or 8 bytes (`sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t)`), the group mode is `BitpackingMode::FOR`, `width <= 56`, and per value `value_ptr + sizeof(uint64_t) <= safe_end` (bitpacking.cpp:945).",
+    "constants": "- PERFECT_HT_BF_MIN_RANGE_PER_KEY = 4 (physical_hash_join.cpp:988): the BF is used only if at most 25% of the key range is occupied. This is a hand-picked density cut-off, not derived from anything. Just outside it (more than 25% occupied, e.g. a dense dimension-key join) no BF is built and the join behaves as before, relying on min/max pruning. It is plausibly tuned so that TPC-H joins on supplier/nation-filtered keys (e.g. s_nationkey=7 keeps about 1/25 of suppliers) qualify while dense PK joins do not. It is still a reasonable selectivity gate, and upstream might choose 2-8.\n- EXACT_BF_* caps (2^22, 2^27, 128 and 1024 bits/key, 2^32) are pre-existing from E0022/E0027 and not changed here. They bound the bitmap to 512KB/16MB/pointer-table size, which is memory-based reasoning.\n- The probe/build ratio > 1.0 and the build_side_has_filter condition are pre-existing.\n- Part 2: width <= 56 is a hardware/algorithmic bound: an 8-byte load covers at most 7 bits of shift plus 56 bits of value. The 8-byte load is the machine word. `sel_count*4 > vector_count` (25% selection) is the pre-existing dense/sparse switch. Near the end of the data (within 8 bytes of the metadata entry) values use the old extract. None of these is workload-tuned.",
+    "natural_class": "Part 1: any equi-join on an integer key where the build side is a filtered small table whose surviving keys are scattered (\u226425% density) in their range, so a perfect hash table is chosen, and the probe side is a larger base-table scan. This is a common star-schema pattern. Examples:\n- `SELECT sum(o.amount) FROM orders o JOIN customers c ON o.cust_id = c.id WHERE c.country = 'NZ';` (customers.id is dense, and the filter leaves ~2% of ids)\n- `SELECT count(*) FROM events e JOIN users u ON e.user_id = u.user_id WHERE u.plan = 'enterprise';`\n\nPart 2: any selective filtered scan over BitPacking-compressed INTEGER/BIGINT columns that projects other columns, e.g. `SELECT price, qty FROM trades WHERE ts BETWEEN 1000 AND 1050;` on a persisted table where price and qty are bitpacked.",
+    "fallback": "Part 1:\n- If the sparse test or any other condition fails, the perfect hash table gets no BF. That is the old behaviour: only min/max (and IN-list) filters are pushed.\n- If FillExactBloomFilter returns false, the deferred filters are cleared and not pushed (physical_hash_join.cpp:627-637).\n- If a key falls outside the BF's dynamic range, the BF sets overflow and passes everything, so results stay correct.\n- Non-perfect hash joins are unaffected: the `else if (deferred_bloom_filters)` path is unchanged.\n\nPart 2: non-FOR modes, 8/16-bit types, width > 56 and dense selections take the unchanged code. Values whose 8-byte load would cross the metadata entry use the original BitpackingExtractValue.",
+    "label": "heuristic",
+    "label_reason": "Neither part refers to TPC-H schemas, columns or query shapes.\n- Part 2 is a plain, principled decoding micro-optimisation (a fixed word load with a bounds guard) whose constants come from the word size. On its own it would be \"general\".\n- Part 1 is a standard technique: semi-join or sideways information passing via an exact bitmap filter, extended to perfect hash joins. It is gated by a hand-chosen density cut-off (count*4 <= range+1) layered on earlier hand-chosen bitmap-size caps, and the author's gains are concentrated in q07/q02, whose filtered dimension joins (nation-filtered supplier) fit that gate.\n- The gate is a natural sparsity condition that many star-schema queries outside TPC-H would meet, so this is not a query-specific branch. But its constants are plausibly tuned rather than derived, hence \"heuristic\".\n- The measured end-to-end evidence is noisy, and the author's own note says the q07-shaped scan CPU did not drop: 2.10s without the BF vs 2.21s with it.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:988 `static constexpr idx_t PERFECT_HT_BF_MIN_RANGE_PER_KEY = 4;`",
+      "src/execution/operator/join/physical_hash_join.cpp:1042 `if (sparse_only && ht.Count() * PERFECT_HT_BF_MIN_RANGE_PER_KEY > range + 1) { return; }`",
+      "src/execution/operator/join/physical_hash_join.cpp:1031-1039 `key_cap = ... EXACT_BF_MAX_BITS_PER_KEY ... EXACT_BF_SMALL_RANGE ... EXACT_BF_MEDIUM_RANGE ... if (range >= MinValue<uint64_t>(EXACT_BF_MAX_RANGE, key_cap)) return;`",
+      "src/execution/operator/join/physical_hash_join.cpp:962-976 removed `if (is_perfect_hashtable) return false;`; `return can_use_bf && build_side_has_filter && probe_larger_then_build;`",
+      "src/execution/operator/join/physical_hash_join.cpp:1184-1190 `if (deferred_bloom_filters && is_perfect_hashtable) { TrySetExactBloomFilter(*ht, op, min_val, max_val, true); if (ht->GetBloomFilter().IsExact()) deferred_bloom_filters->emplace_back(...)`",
+      "src/execution/operator/join/physical_hash_join.cpp:1206-1208 `TrySetExactBloomFilter(*ht, op, raw_min_val, raw_max_val, is_perfect_hashtable); ... if (!is_perfect_hashtable) { ht->SetBuildBloomFilter(true); }`",
+      "src/execution/operator/join/physical_hash_join.cpp:627-637 `PushPerfectHashJoinBloomFilters ... if (sink.perfect_join_executor->FillExactBloomFilter(context)) { ... PushBloomFilter(...) } sink.deferred_bloom_filters.clear();`",
+      "src/execution/operator/join/physical_hash_join.cpp:673 and :1332 `if (use_perfect_hash) { PushPerfectHashJoinBloomFilters(...); }`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:344 `if (!bf.IsExact() || bf.IsInitialized() || perfect_join_statistics.build_min.IsNull()) return false;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:369-385 `if (bitmap_build_idx.AllValid()) { ... bf.InsertExact(min_bits + slot); } ... CountZeros<uint64_t>::Trailing(entry) ... bf.InsertExact(min_bits + slot);`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:330-334 `build_side_has_filter = true` for DELIM_GET else `IsFiltering(join.children[1])`",
+      "src/storage/compression/bitpacking.cpp:890 `if (sel_count * 4 > vector_count) { // dense selection`",
+      "src/storage/compression/bitpacking.cpp:903 `const bool direct_extract = sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t);`",
+      "src/storage/compression/bitpacking.cpp:933-955 `if (direct_extract && width <= 56) { ... const auto safe_end = scan_state.bitpacking_metadata_ptr + sizeof(bitpacking_metadata_encoded_t); ... if (value_ptr + sizeof(uint64_t) <= safe_end) { memcpy(&bits, value_ptr, 8); value_bits = (bits >> (bit_offset % 8)) & mask; } else { ... BitpackingExtractValue(...) }`",
+      "src/storage/compression/bitpacking.cpp:651-653 `current_group = DecodeMeta(...bitpacking_metadata_ptr); bitpacking_metadata_ptr -= sizeof(bitpacking_metadata_encoded_t);` (safe_end = current group's metadata entry)"
+    ]
+  },
+  "audit_cost_usd": 0.269009
+}

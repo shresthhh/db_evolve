@@ -1,0 +1,49 @@
+{
+  "id": "E0012",
+  "sha": "8990731e60d645bb78c228268c43081fdebc84b8",
+  "subject": "E0012: OR-of-ranges scan filter as dense-mask ExpressionFilter",
+  "files": [
+    "src/storage/table/column_segment.cpp"
+  ],
+  "static": {
+    "added_lines": 254,
+    "removed_lines": 0,
+    "conditions": 58,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"Unsupported comparison in dense mask filter\"",
+      "\"Unsupported expression in dense mask filter\"",
+      "\"duckdb/common/operator/comparison_operators.hpp\"",
+      "\"duckdb/planner/expression/bound_between_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_comparison_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_conjunction_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_constant_expression.hpp\"",
+      "\"duckdb/planner/expression/bound_reference_expression.hpp\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.010024006462785,
+  "accepted_faster": {
+    "q19": 1.11
+  },
+  "audit": {
+    "mechanism": "Some pushed-down scan filters are ExpressionFilters on one column, typically ORs of ranges such as `(x BETWEEN a AND b) OR (x BETWEEN c AND d)`. These used to go through the generic ExpressionExecutor. They now use a dedicated interpreter. It first copies the currently selected values into a dense array. It then walks the AND/OR tree and computes a branch-free uint8 match mask for each node, combining child masks with `&` or `|`. Finally it ANDs the mask with the column's validity and turns it into a new selection vector without branches. This is standard vectorised, branch-free predicate evaluation over a column. The filter set itself does not change, so plans and cardinalities stay the same.",
+    "trigger": "The new path is taken only in ColumnSegment::FilterSelection, in the `case TableFilterType::EXPRESSION_FILTER` branch (src/storage/table/column_segment.cpp:813-817), when TryDenseMaskFilterSelection returns true. All of the following must hold:\n(1) `approved_tuple_count > STANDARD_VECTOR_SIZE` is false (line 616).\n(2) The column type passes IsDenseMaskType (lines 418-440). Accepted types are TINYINT through UBIGINT, DATE, TIME, TIMESTAMP and its _SEC/_MS/_NS/_TZ variants, and DECIMAL when `type.InternalType() != PhysicalType::INT128`. Floats, doubles, VARCHAR, HUGEINT and wide decimals are rejected.\n(3) The whole expression tree passes CanEvaluateDenseMask (lines 457-494):\n- Inner nodes must be BOUND_CONJUNCTION nodes of type CONJUNCTION_AND or CONJUNCTION_OR with at least one child.\n- Leaves must be either a BOUND_COMPARISON (=, !=, <, >, <=, >=) between the column and a constant, in either order, or a BOUND_BETWEEN whose input is the column and whose bounds are constants.\n- \"The column\" means a BOUND_REF with `index == 0 && expr.return_type == type` (line 447).\n- Constants must satisfy `!value.IsNull() && value.type() == type` (line 455), so the constant type must match the column exactly, with no casts.\nAnything else in the tree makes it ineligible: NOT, IN, functions, casts, or IS NULL.\n(4) The physical type must be one of INT8/16/32/64 or UINT8/16/32/64 (the switch at lines 621-648; any other type returns false).\nNothing in the trigger looks at the schema, at column names, at statistics, or at any selectivity threshold.",
+    "constants": "There is only one constant in the trigger: STANDARD_VECTOR_SIZE (2048), DuckDB's own vector size. It sizes the stack buffers `T values[STANDARD_VECTOR_SIZE]` and `uint8_t mask[STANDARD_VECTOR_SIZE]`. The guard `approved_tuple_count > STANDARD_VECTOR_SIZE` exists so those buffers cannot overflow. It was not tuned to the workload. If more rows are selected than that, which can happen when scan_count spans more than one vector, the code falls back to the existing chunked ExpressionExecutor loop. No selectivity, size or statistics thresholds are involved. The type whitelist is a correctness limit, not a tuned value: floats are left out because of NaN ordering, and INT128 is not instantiated.",
+    "natural_class": "Any table scan where the optimiser pushes a one-column ExpressionFilter made of AND/OR combinations of range or equality comparisons against constants of exactly the column's type. The column can be an integer, a DATE, a TIMESTAMP or a narrow DECIMAL. In practice DuckDB pushes this shape for ORs of ranges or equalities on a single column. Examples:\n- `SELECT count(*) FROM events WHERE ts BETWEEN TIMESTAMP '2024-01-01' AND TIMESTAMP '2024-01-31' OR ts BETWEEN TIMESTAMP '2024-06-01' AND TIMESTAMP '2024-06-30';`\n- `SELECT * FROM orders_log WHERE status_code = 3 OR status_code = 7 OR (status_code >= 100 AND status_code < 200);` with a SMALLINT/INTEGER status_code. This applies if the planner keeps it as an OR expression filter rather than turning it into an IN filter.\n- `SELECT sum(amount) FROM payments WHERE amount_cents < 0 OR amount_cents > 1000000;`\nThe path is not taken for floats, strings, IN lists, predicates that need a cast such as an INTEGER column compared with a BIGINT literal, or non-constant operands.",
+    "fallback": "If TryDenseMaskFilterSelection returns false, it does so before changing `sel` or `approved_tuple_count`. Control then continues into the existing ExpressionFilter code, starting with `auto &state = filter_state.Cast<ExpressionFilterState>(); SelectionVector result_sel(approved_tuple_count); if (scan_count > STANDARD_VECTOR_SIZE) {...` (lines 818-820), which is unchanged. One cost remains even when it falls back: the type check and the CanEvaluateDenseMask tree walk run on every vector call. The author notes this.",
+    "label": "general",
+    "label_reason": "This is a standard vectorised, branch-free way to evaluate a column predicate: gather the values, build a byte mask per node, combine the masks, and turn the result into a selection vector. Its only gates are the vector size, a type whitelist chosen for correctness, and a tree-shape check (AND/OR over column-vs-constant comparisons or BETWEEN). Those are semantic conditions, not workload-tuned ones. Nothing in it refers to TPCH columns, sizes or statistics. Any one-column OR/AND range filter on integer, date, timestamp or narrow-decimal columns benefits. The class is somewhat narrow because exact type equality is required, and the measured gain shows up mainly on q19. But nothing in the code is fitted to that query.",
+    "citations": [
+      "src/storage/table/column_segment.cpp:813-817 \"case TableFilterType::EXPRESSION_FILTER: ... if (TryDenseMaskFilterSelection(*expr_filter.expr, vector.GetType(), vdata, sel, approved_tuple_count)) { return approved_tuple_count; }\"",
+      "src/storage/table/column_segment.cpp:616 \"if (approved_tuple_count > STANDARD_VECTOR_SIZE || !IsDenseMaskType(type) || !CanEvaluateDenseMask(expr, type)) { return false; }\"",
+      "src/storage/table/column_segment.cpp:418-440 \"case LogicalTypeId::DATE: ... case LogicalTypeId::DECIMAL: return type.InternalType() != PhysicalType::INT128;\"",
+      "src/storage/table/column_segment.cpp:447 \"return expr.Cast<BoundReferenceExpression>().index == 0 && expr.return_type == type;\"",
+      "src/storage/table/column_segment.cpp:455 \"return !value.IsNull() && value.type() == type;\"",
+      "src/storage/table/column_segment.cpp:457-494 CanEvaluateDenseMask: \"expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND || ... CONJUNCTION_OR\"; comparisons limited to EQUAL/NOTEQUAL/LT/GT/LTE/GTE; BETWEEN with constant bounds",
+      "src/storage/table/column_segment.cpp:600-602 \"if (!vdata.validity.AllValid()) { ... mask[i] &= uint8_t(vdata.validity.RowIsValid(...))\"",
+      "src/storage/table/column_segment.cpp:818-820 unchanged fallback \"auto &state = filter_state.Cast<ExpressionFilterState>(); SelectionVector result_sel(approved_tuple_count);\""
+    ]
+  },
+  "audit_cost_usd": 0.15912739999999997
+}

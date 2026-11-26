@@ -1,0 +1,43 @@
+{
+  "id": "E0004",
+  "sha": "1e7c5bc7108fb752499525983fcc70cab59ab6fd",
+  "subject": "E0004: avg on int32/int64/decimal(int64): int64 sum state when stats prove no overflow",
+  "files": [
+    "extension/core_functions/aggregate/algebraic/avg.cpp"
+  ],
+  "static": {
+    "added_lines": 79,
+    "removed_lines": 4,
+    "conditions": 7,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/planner/expression/bound_aggregate_expression.hpp\"",
+      "\"duckdb/storage/statistics/numeric_stats.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0532454320155398,
+  "accepted_faster": {
+    "q01": 1.05
+  },
+  "audit": {
+    "mechanism": "avg() over INTEGER, BIGINT and DECIMAL types stored as int32 or int64 used to add values into a 128-bit hugeint state. A new statistics callback now checks the input column's min/max statistics and the operator's maximum cardinality. If it can prove that the running sum cannot overflow int64, it swaps the bound function's state callbacks for ones that use an int64 sum (RegularAdd) plus a count. The finalize step widens the int64 sum to hugeint before dividing, so the result is bit-identical to the old path. This is the overflow-proof narrowing that DuckDB's sum() already does (SumPropagateStats), now applied to avg.",
+    "trigger": "All of the following must hold, checked during statistics propagation:\n(1) The aggregate is avg bound to the INT32 or INT64 variant (avg.cpp:317-328, `function.SetStatisticsCallback(AvgPropagateStats)`). This includes DECIMAL with int32/int64 storage, i.e. precision \u2264 18, because `BindDecimalAvg` calls `GetAverageAggregate(decimal_type.InternalType())` (avg.cpp:354).\n(2) Node statistics exist and carry a max cardinality: `if (!input.node_stats || !input.node_stats->has_max_cardinality) return nullptr;` (avg.cpp:260).\n(3) The child has min/max statistics: `if (!NumericStats::HasMinMax(numeric_stats))`.\n(4) The child's internal type is INT32 or INT64 (the switch at avg.cpp:271-279; anything else returns nullptr).\n(5) |min|\u00b7max_cardinality and |max|\u00b7max_cardinality stay strictly inside int64: `if (max_sum_positive >= NumericLimits<int64_t>::Maximum() || max_sum_negative <= NumericLimits<int64_t>::Minimum()) return nullptr;` (avg.cpp:284).\nNo operator type, plan shape, column name or query shape is tested.",
+    "constants": "The only constants are NumericLimits<int64_t>::Maximum()/Minimum() (avg.cpp:284). They are the representable range of the narrower state type, not tuned values. The check is copied from the existing SumPropagateStats (sum.cpp:150, `max_sum_positive >= NumericLimits<int64_t>::Maximum()`). Just outside the bound, i.e. when min/max \u00d7 cardinality could reach the int64 limits (large BIGINT values or very large tables), the callback returns nullptr and the hugeint state is kept, so correctness never depends on luck. The bound is conservative: it uses worst-case max_cardinality, not actual row counts.",
+    "natural_class": "Any avg over an int32/int64-backed integer or decimal column where the column has min/max statistics (e.g. base-table columns, or expressions over them whose statistics propagate) and the bound proves the sum fits in int64. That covers most real-world averages of prices, amounts, counts, ages and so on, with or without GROUP BY. Examples:\n`SELECT store_id, avg(quantity) FROM sales GROUP BY store_id;` (quantity INTEGER)\n`SELECT avg(price_cents) FROM orders WHERE created_at > '2024-01-01';` (price_cents BIGINT with modest range)\n`SELECT category, avg(amount) FROM payments GROUP BY category;` (amount DECIMAL(12,2))",
+    "fallback": "When any condition fails, AvgPropagateStats returns nullptr without changing anything. The function keeps its original AvgState<hugeint_t> / IntegerAverageOperationHugeint callbacks, so the old path runs unchanged. Name, return type, bind and bind_info (the decimal scale) are untouched in both cases. A serialised plan that is re-bound gets the hugeint variant again, which gives the same results.",
+    "label": "general",
+    "label_reason": "This is a principled, correctness-preserving optimisation: proving from statistics that an accumulator cannot overflow, then using a narrower accumulator. DuckDB already applies it to sum() (sum.cpp:126-188), and this change extends it to avg. The only threshold is the int64 range itself, and nothing depends on TPC-H's schema, data or query shapes. Any avg over a bounded int32/int64/decimal(\u226418) column benefits. The measured gain is modest and noisy (\u22121.7% to \u22127% on q01), but that bears on how much it helps, not on how general it is.",
+    "citations": [
+      "extension/core_functions/aggregate/algebraic/avg.cpp:130 `struct IntegerAverageOperationInt64 : public BaseSumOperation<AverageSetOperation, RegularAdd>`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:137 `target = Hugeint::Cast<long double>(hugeint_t(state.value)) / divident;`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:260 `if (!input.node_stats || !input.node_stats->has_max_cardinality) {`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:271-279 `case PhysicalType::INT32: ... case PhysicalType::INT64: ... default: return nullptr;`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:284 `if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ||`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:307 `function.SetStatisticsCallback(nullptr);`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:321,328 `function.SetStatisticsCallback(AvgPropagateStats);`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:354 `function = GetAverageAggregate(decimal_type.InternalType());`",
+      "extension/core_functions/aggregate/distributive/sum.cpp:126-150 `SumPropagateStats ... if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ||`"
+    ]
+  },
+  "audit_cost_usd": 0.1318646
+}

@@ -1,0 +1,55 @@
+{
+  "id": "E0001",
+  "sha": "c6b5dde53f661ee3709ac8121136aef2f9ec784f",
+  "subject": "E0001: Lower cardinality estimate for substring/LIKE table filters",
+  "files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp"
+  ],
+  "static": {
+    "added_lines": 44,
+    "removed_lines": 3,
+    "conditions": 7,
+    "numeric_constants": [
+      "0.05"
+    ],
+    "string_literals": [
+      "\"contains\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\"",
+      "\"ends_with\"",
+      "\"ilike\"",
+      "\"ilike_escape\"",
+      "\"like\"",
+      "\"like_escape\"",
+      "\"regexp_matches\"",
+      "\"suffix\"",
+      "\"~~\"",
+      "\"~~*\""
+    ]
+  },
+  "accepted_gain": 1.2541706264224892,
+  "accepted_faster": {
+    "q09": 1.25
+  },
+  "audit": {
+    "mechanism": "The join-order optimizer guesses how many rows a base-table scan returns after its pushed-down filters. Before this change, any filter that column statistics could not estimate (no equality hit) got one default selectivity of 0.2. Now, if at least one non-optional table filter on the scan is a string pattern match against a constant (contains, LIKE/ILIKE, regexp_matches, suffix/ends_with), the whole scan gets a selectivity of 0.05 instead. This makes such scans look 4x smaller, so they are more likely to be joined early or used as hash-join build sides. Nothing else in the cost model or execution changes.",
+    "trigger": "The new path runs only inside RelationStatisticsHelper::ExtractGetStats, for a LogicalGet with non-empty table filters (`if (!get.table_filters.filters.empty())`, src/optimizer/join_order/relation_statistics_helper.cpp:154). Three things must hold:\n(a) Some filter has `it.second->filter_type != TableFilterType::OPTIONAL_FILTER` (:176) and `IsStringPatternFilter` returns true for it (:178). That function returns true for an EXPRESSION_FILTER whose expression is a BOUND_FUNCTION with at least two children, where `func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT`, and whose name is one of `\"contains\" || \"like\" || \"~~\" || \"ilike\" || \"~~*\" || \"like_escape\" || \"ilike_escape\" || \"regexp_matches\" || \"suffix\" || \"ends_with\"` (diff, IsStringPatternFilter). It also returns true for a CONJUNCTION_AND filter that contains such a child, checked recursively.\n(b) `bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);` is false (:185). This means the statistics-based InspectTableFilter did not already lower the estimate.\n(c) The 0.05 is then applied to the whole table, not per filter: `has_string_pattern_filter ? STRING_PATTERN_SELECTIVITY : DEFAULT_SELECTIVITY` (:187-188). Any other range filters on the same scan add no further reduction.\nCases that do not trigger: `LIKE 'abc%'`, which the optimizer rewrites to `prefix` and which is not in the list. `NOT LIKE` / `!~~`. OR-conjunctions. Patterns that are not constants. In TPC-H this matches Q9 (`p_name like '%green%'`, rewritten to contains) and Q2 (`p_type like '%BRASS'`, rewritten to suffix). It does not match Q14 or Q20 (prefix), or Q13 and Q16 (NOT LIKE).",
+    "constants": "There is one constant: `static constexpr double STRING_PATTERN_SELECTIVITY = 0.05;` (diff, next to IsStringPatternFilter). It replaces `DEFAULT_SELECTIVITY = 0.2` (src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp:57). The value comes from no measurement, statistic or reference. It is a magic default, like many in classic optimizers; PostgreSQL's DEFAULT_MATCH_SEL is 0.005, an order of magnitude lower. It also happens to sit very close to the true selectivity of Q9's `%green%` on p_name (about 5.4%), the one query the author measured. That is reason to suspect it was picked, or at least checked, so that Q9's plan flips. The author says the plan flip needed the part scan estimate (about 2M\u00d70.05 = 100K rows at SF10) to fall below partsupp-derived sizes. A value near 0.2 would leave the old plan, and somewhere between 0.05 and 0.2 lies an unmeasured switching point. Just outside the trigger (a prefix LIKE, NOT LIKE, or a pattern on a column with an equality filter), the old 0.2 or statistics-based estimate applies unchanged. No per-pattern refinement exists (e.g. pattern length, number of wildcards). `'%a%'` and `'%very_specific_token%'` both get 0.05.",
+    "natural_class": "Any query whose scan has a pushed-down, constant-pattern contains/LIKE '%x%'/'%x'/ILIKE/regexp_matches/ends_with filter, and no statistics-estimable equality on that scan, then joined to other tables. Examples outside TPC-H:\n1) `SELECT u.name, count(*) FROM users u JOIN events e ON e.user_id = u.id WHERE u.email ILIKE '%@example.com' GROUP BY u.name;`\n2) `SELECT p.title, sum(s.qty) FROM products p JOIN sales s ON s.product_id = p.id WHERE regexp_matches(p.title, 'wireless') GROUP BY p.title;`\n3) `SELECT * FROM logs l JOIN hosts h ON l.host_id = h.id WHERE l.msg LIKE '%timeout%';`\nThese are common analytic shapes. Whether the new estimate helps depends on the real selectivity. Low-selectivity patterns (e.g. `'%e%'`, `ILIKE '%.com'`) will now be underestimated by 4x more than before. That can put a large side on the build side and make plans worse. The change affects only estimates, so results stay correct.",
+    "fallback": "When no non-optional pattern filter is present, the code takes exactly the old path: `DEFAULT_SELECTIVITY` (0.2) is used, or the estimate from InspectTableFilter when it lowered cardinality (:185-190). There is no other behavioural change. The only extra work is a recursive check of the filter tree during optimization.",
+    "label": "heuristic",
+    "label_reason": "Giving pattern-match predicates a lower default selectivity than generic range predicates is a standard, schema-independent optimizer heuristic: PostgreSQL has DEFAULT_MATCH_SEL. The trigger is broad and natural, a list of string-matching functions with a constant pattern, and touches no TPC-H tables, columns or query shapes. It would plausibly be accepted upstream. However, the constant 0.05 is unjustified and closely matches the true selectivity of Q9's '%green%' filter, the single query used to validate it. It is applied per scan, ignores what the pattern looks like, and the improvement comes from one plan flip. The constant is plausibly tuned to the workload, and the estimate can make plans worse when patterns are unselective. So this is a heuristic rather than general.",
+    "citations": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp:154 \"if (!get.table_filters.filters.empty()) {\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:176 \"if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:178 \"if (IsStringPatternFilter(*it.second)) {\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:185 \"bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:187-188 \"has_string_pattern_filter ? STRING_PATTERN_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp (diff) \"static constexpr double STRING_PATTERN_SELECTIVITY = 0.05;\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp (diff, IsStringPatternFilter) \"func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp (diff, IsStringPatternFilter) \"name == \\\"contains\\\" || name == \\\"like\\\" || ... || name == \\\"suffix\\\" || name == \\\"ends_with\\\"\"",
+      "src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp:57 \"static constexpr double DEFAULT_SELECTIVITY = 0.2;\"",
+      ".dbe/review/issue.md \"q09 went from 980.7 ms to 723.0 ms (-26.3%)\""
+    ]
+  },
+  "audit_cost_usd": 0.1278126
+}

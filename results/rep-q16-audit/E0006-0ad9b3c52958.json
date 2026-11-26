@@ -1,0 +1,45 @@
+{
+  "id": "E0006",
+  "sha": "0ad9b3c52958fd5c935b6715571bd2712ffc69bd",
+  "subject": "E0006: Exact bitmap BF for dense-int join keys on partsupp-style probes",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 11,
+    "removed_lines": 9,
+    "conditions": 9,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.104915980265532,
+  "accepted_faster": {
+    "q16": 1.1
+  },
+  "audit": {
+    "mechanism": "This commit only fixes and narrows the gate on an existing feature; it adds no new optimisation. The feature itself came in the parent E0006 commit. When a hash join pushes a bloom filter into the probe-side scan, and its single integer key has a build-side [min,max] range that is small compared with the build row count, the filter is replaced by an exact bitmap with one bit per value in that range. Probing it is a bounds check plus a bit test on (key - min), with no hashing and no false positives. Before this change the type gate went by physical storage type, so DECIMAL, DATE, TIMESTAMP, ENUM and similar types were accepted. For those types `Value::GetValue<int64_t>()` returns a logically cast value (for example 12.34 becomes 12), not the stored integer. The bitmap's min and range were therefore wrong, and inserting a key could hit the internal \"key outside of the build-side min/max range\" exception. The gate now checks the logical type and accepts only the eight plain integer types.",
+    "trigger": "All of these must hold together:\n(a) The join already qualifies for the normal hashed bloom-filter pushdown, `CanUseBloomFilter`: not a perfect hash table, `ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL`, `build_side_has_filter`, and probe estimated cardinality divided by `ht->Count()` is `> 1.0`. The pushdown column must also have `!has_cast`, and the deferred bloom-filter path must be in use (physical_hash_join.cpp:775-784, 946-951).\n(b) In `TrySetExactBloomFilter`: the filter is not already exact or initialised, there is one condition, and the join does not treat NULLs as equal: `bf.IsExact() || bf.IsInitialized() || ht.conditions.size() != 1 || ht.NullValuesAreEqual(0)` returns early (physical_hash_join.cpp:823).\n(c) Both key sides have the same type and min/max are non-NULL and of that type: `key_type != ht.conditions[0].left->return_type || min_val.IsNull() ...` returns early (physical_hash_join.cpp:826-827).\n(d) This commit's change: `switch (key_type.id())` accepts only `TINYINT, SMALLINT, INTEGER, BIGINT, UTINYINT, USMALLINT, UINTEGER, UBIGINT`; for anything else, `default: return;` (physical_hash_join.cpp:835-849).\n(e) Density: `range = max_key - min_key`, and the bitmap is used only if `range < MinValue(EXACT_BF_MAX_BITS, ht.Count() * EXACT_BF_MAX_BITS_PER_ROW)` (physical_hash_join.cpp:853-857).",
+    "constants": "This commit adds no constants. The constants it inherits from the gate are:\n- `EXACT_BF_MAX_BITS_PER_ROW = 128` (physical_hash_join.cpp:815). This is a density cap: the bitmap may use up to 128 bits per build row, against the hashed filter's minimum of 12 bits per key (`MIN_NUM_BITS_PER_KEY = 12`, bloom_filter.cpp:8). The value is a round number, not derived from anything, but it is generous rather than tuned to a workload. A build side holding 1 in 128 or more of the values in its key range qualifies; anything sparser falls back to the hashed filter.\n- `EXACT_BF_MAX_BITS = 1<<32` (512 MiB), described as \"same as the maximum size of the hashed bloom filter\" (physical_hash_join.cpp:816). This is an absolute memory cap.\nJust outside either cap the code returns and the normal hashed bloom filter is built, so there is no cliff in correctness and only a small change in probe cost. Neither constant depends on TPC-H scale.\nThe type list is a principled correctness boundary: these are exactly the types whose Value accessor returns the stored integer. It is not tuned to the workload.",
+    "natural_class": "The path is taken by any single-key equi hash join on a plain integer key (common surrogate or serial IDs) where the build side is filtered, smaller than the probe side, and its keys are reasonably dense in their [min,max] range. Two non-TPC-H examples:\n1. `SELECT count(*) FROM page_views v JOIN users u ON v.user_id = u.id WHERE u.country = 'DE';` Here `id` is an INTEGER serial and German users are scattered across the whole id range at a density of 1/128 or more.\n2. `SELECT s.store_name, sum(t.amount) FROM transactions t JOIN stores s ON t.store_id = s.store_id WHERE s.region = 'West' GROUP BY 1;` Here `store_id` is a BIGINT key.\nAfter this change, joins on DATE or DECIMAL keys (for example `orders JOIN calendar ON o.order_date = c.d`) no longer take the path; they use the hashed bloom filter.",
+    "fallback": "If any condition fails, `TrySetExactBloomFilter` returns before `SetExactRange`, so the bloom filter stays in hashed mode. `ht->SetBuildBloomFilter(true)` and the deferred push still happen, which is the pre-E0006 behaviour (physical_hash_join.cpp:950-953). For DECIMAL, DATE, TIMESTAMP, ENUM and similar keys, this commit swaps an incorrect exact bitmap that could throw for the unchanged hashed filter. Min/max and IN-filter pushdown are not affected.",
+    "label": "general",
+    "label_reason": "This commit narrows the gate on an existing feature to fix a correctness bug, so it is a fix rather than new behaviour. The new condition is purely about type semantics (logical integer types only) and has nothing to do with the workload's shape. The underlying feature is a standard technique: an exact bitmap or range filter replacing a probabilistic bloom filter when the key domain is dense, gated by a generous density cap (128 bits per row) and the existing memory cap. Any filtered build side joined on a single dense integer key benefits; it does not depend on TPC-H tables, columns or sizes. The cited q16 gain (-7.3%, from 2\u00d74 runs, with the tool's noise threshold around 5%) is weak evidence of speed-up, but nothing in the code is tied to benchmark specifics. Two limitations: the 128 constant is chosen by hand, and DATE and DECIMAL keys are now excluded even though they could be supported with raw physical reads.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:835 \"switch (key_type.id()) {\"",
+      "src/execution/operator/join/physical_hash_join.cpp:836-843 \"case LogicalTypeId::TINYINT: ... case LogicalTypeId::UBIGINT:\"",
+      "src/execution/operator/join/physical_hash_join.cpp:848 \"default: return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:823 \"if (bf.IsExact() || bf.IsInitialized() || ht.conditions.size() != 1 || ht.NullValuesAreEqual(0))\"",
+      "src/execution/operator/join/physical_hash_join.cpp:826 \"if (key_type != ht.conditions[0].left->return_type || min_val.IsNull() || max_val.IsNull()\"",
+      "src/execution/operator/join/physical_hash_join.cpp:815 \"EXACT_BF_MAX_BITS_PER_ROW = 128\"",
+      "src/execution/operator/join/physical_hash_join.cpp:816 \"EXACT_BF_MAX_BITS = idx_t(1) << 32\"",
+      "src/execution/operator/join/physical_hash_join.cpp:854-857 \"const auto max_bits = MinValue<idx_t>(EXACT_BF_MAX_BITS, ht.Count() * EXACT_BF_MAX_BITS_PER_ROW); if (range >= max_bits) return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:775 \"ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL\"",
+      "src/execution/operator/join/physical_hash_join.cpp:781 \"const bool probe_larger_then_build = build_to_probe_ratio > 1.0;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:946-951 \"if (!has_cast && ht && CanUseBloomFilter(...)) { ... TrySetExactBloomFilter(\"",
+      "src/planner/filter/bloom_filter.cpp:46-48 \"if (offset >= exact_bits) { throw InternalException(\\\"Exact bloom filter key outside of the build-side min/max range\\\")\"",
+      "src/include/duckdb/planner/filter/bloom_filter.hpp:45-50 \"const uint64_t offset = key - exact_min; if (offset >= exact_bits) return false; return (bf[offset >> 6] >> (offset & 63)) & 1;\"",
+      "src/planner/filter/bloom_filter.cpp:8 \"MIN_NUM_BITS_PER_KEY = 12\""
+    ]
+  },
+  "audit_cost_usd": 0.2272848
+}

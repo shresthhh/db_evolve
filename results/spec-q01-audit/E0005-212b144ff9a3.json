@@ -1,0 +1,50 @@
+{
+  "id": "E0005",
+  "sha": "212b144ff9a3fb8a0eb07b06f31ef518e7804c48",
+  "subject": "E0005: Perfect HT: fused single-pass update for int64 sum/avg/count_star aggregates",
+  "files": [
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp"
+  ],
+  "static": {
+    "added_lines": 181,
+    "removed_lines": 0,
+    "conditions": 20,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"avg\"",
+      "\"count_star\"",
+      "\"sum_no_overflow\"",
+      "\"unexpected avg state layout\"",
+      "\"unexpected fused aggregate kind values\"",
+      "\"unexpected sum state layout\""
+    ]
+  },
+  "accepted_gain": 1.063160697839501,
+  "accepted_faster": {
+    "q01": 1.06
+  },
+  "audit": {
+    "mechanism": "In the perfect-hash GROUP BY operator, a check now runs when the hash table is built. If every aggregate is count_star, an int64-state sum, or an int64-state avg, then each chunk updates the states in one typed loop per aggregate. Each loop adds or increments directly into the state at its row offset. This replaces the generic path, which made a function-pointer UpdateStates call per aggregate and then ran an AddInPlace pass over the address vector to reach the next state. The state layouts and the Combine, Scan and Finalize steps are unchanged. The change removes interpretation overhead by specialising the update for a few common aggregate kinds; the algorithm is the same.",
+    "trigger": "1. The planner has already chosen the perfect aggregate hash table, which needs small integer group keys with a range proven by statistics. That rule existed before this change.\n2. AddChunk takes the new path only if `use_fused_update` is set (src/execution/perfect_aggregate_hashtable.cpp:326 `if (use_fused_update) { FusedUpdate(payload, groups.size()); return; }`).\n3. The flag is set in InitializeFusedUpdate only if ALL aggregates qualify. One unsupported aggregate disables the path for the whole table:\n   - the list is not empty (`if (aggregates.empty()) return;`);\n   - no aggregate has a FILTER, DISTINCT or a state destructor (`if (aggr.filter || aggr.IsDistinct() || aggr.function.HasStateDestructorCallback()) return;`);\n   - an aggregate with no child must be `name == \"count_star\"` with `state_size == sizeof(int64_t)`;\n   - any other aggregate must have `child_count == 1`, an input whose physical type is `INT32 || INT64`, and either `name == \"sum_no_overflow\" && state_size == sizeof(FusedSumState)` (16) or `name == \"avg\" && state_size == sizeof(FusedAvgState)` (16).\n4. sum_no_overflow only exists when SumPropagateStats proves from min/max statistics and maximum cardinality that the total fits in int64 (extension/core_functions/aggregate/distributive/sum.cpp:150-156 `if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ... return nullptr; ... expr.function = GetSumAggregateNoOverflow(internal_type);`).\n5. A 16-byte avg state over INT32/INT64 only exists after the same stats-based switch from E0004 (extension/core_functions/aggregate/algebraic/avg.cpp:284-298 `AvgState<int64_t>`). Decimals stored as int32 or int64 qualify too, because both sum and avg on them bind through these same functions.\n6. At run time, HAS_NULLS selects a separate loop version (`if (!format.validity.AllValid()) has_nulls = true;`).",
+    "constants": "There are no tuned thresholds.\n- The state sizes 8 and 16 are layout guards, not tuning values. They must match SumState<int64_t> and AvgState<int64_t> in core_functions (`static_assert(sizeof(FusedSumState) == 16 && offsetof(FusedSumState, value) == 8 ...)`). If the size differs, for example AvgState<hugeint_t> at 24 bytes, the whole table uses the old path.\n- The kind values 0 to 4 are internal enum encodings, guarded by a static_assert in FusedUpdate.\n- The only data-dependent bound is the existing int64 no-overflow proof from statistics: max(|min|,|max|) times max_cardinality must stay below the int64 range. It comes from the engine's statistics, not from this change. If a column's statistics cannot rule out overflow, sum and avg keep their hugeint states, the name or size check fails, and the old path is used.\n- Matching aggregates by their name strings (\"count_star\", \"sum_no_overflow\", \"avg\") is fragile engineering, but it is not tied to the workload.",
+    "natural_class": "Any query the perfect hash aggregate handles (low-cardinality integer, enum or compressed group keys with known ranges) whose aggregates are only count(*), and sum/avg over INTEGER, BIGINT or int-backed DECIMAL columns with statistics that prove no int64 overflow. Examples outside TPCH:\n- `SELECT status_code, count(*), sum(bytes_sent), avg(latency_ms) FROM web_logs GROUP BY status_code;` (status_code is a SMALLINT/INTEGER with a small range; bytes_sent and latency_ms are INTEGER)\n- `SELECT store_id, day_of_week, sum(amount_cents), avg(quantity), count(*) FROM sales GROUP BY store_id, day_of_week;`\n\nThese are excluded: count(x), min/max, sum/avg over DOUBLE, SMALLINT or hugeint states, FILTER clauses and DISTINCT. If any one of them appears in the SELECT list, the whole query falls back, so the covered mix is fairly narrow. It happens to be exactly TPCH Q1's aggregate mix, but it is also the most common reporting pattern.",
+    "fallback": "If the flag is false, AddChunk runs the original loop unchanged: UpdateStates or UpdateFilteredStates for each aggregate, followed by `VectorOperations::AddInPlace(addresses, ... payload_size ...)` (src/execution/perfect_aggregate_hashtable.cpp:330-345). Group-location computation, the E0003 replicas, Combine, Scan and Finalize are shared by both paths and unchanged.",
+    "label": "general",
+    "label_reason": "The change specialises the update loop by type, replacing generic function-pointer scatter with direct typed loops. This is a standard way to cut interpretation overhead, and it has no workload-sized thresholds. The gates are exact layout and type checks plus an all-or-nothing rule. Any perfect-hash GROUP BY with only count(*) and int64-state sum/avg benefits, whatever the schema or data. Two caveats:\n- The supported set {count_star, sum, avg} is exactly what Q1 uses, and adding any other aggregate (min, max, count(x), double sum) turns the path off. Coverage is therefore narrower than \"general\" might suggest, but the condition is still a natural one.\n- Identifying aggregates by name string and copying the state structs from core_functions is fragile. An upstream maintainer would likely ask for an aggregate-function callback instead.",
+    "citations": [
+      "src/execution/perfect_aggregate_hashtable.cpp:326 `if (use_fused_update) { FusedUpdate(payload, groups.size()); return; }`",
+      "src/execution/perfect_aggregate_hashtable.cpp:96 `if (aggr.filter || aggr.IsDistinct() || aggr.function.HasStateDestructorCallback()) { return; }`",
+      "src/execution/perfect_aggregate_hashtable.cpp:104 `if (name != \"count_star\" || state_size != sizeof(int64_t))`",
+      "src/execution/perfect_aggregate_hashtable.cpp:112 `if (input_type != PhysicalType::INT32 && input_type != PhysicalType::INT64) { return; }`",
+      "src/execution/perfect_aggregate_hashtable.cpp:117 `if (name == \"sum_no_overflow\" && state_size == sizeof(FusedSumState))`",
+      "src/execution/perfect_aggregate_hashtable.cpp:119 `} else if (name == \"avg\" && state_size == sizeof(FusedAvgState))`",
+      "src/execution/perfect_aggregate_hashtable.cpp:82 `static_assert(sizeof(FusedSumState) == 16 && offsetof(FusedSumState, value) == 8`",
+      "src/execution/perfect_aggregate_hashtable.cpp:330-345 original loop `RowOperations::UpdateStates(...)` / `VectorOperations::AddInPlace(addresses, ...)`",
+      "extension/core_functions/aggregate/distributive/sum.cpp:150-156 `if (max_sum_positive >= NumericLimits<int64_t>::Maximum() ... expr.function = GetSumAggregateNoOverflow(internal_type);`",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:284-298 `AvgState<int64_t>` swapped in when stats prove no overflow (E0004)",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:317-321 default int32 avg uses `AvgState<hugeint_t>` (24 bytes, excluded)"
+    ]
+  },
+  "audit_cost_usd": 0.2898742
+}

@@ -1,0 +1,56 @@
+{
+  "id": "E0024",
+  "sha": "3145ec5c2755703a486765dfeac0382578496d96",
+  "subject": "E0024: Parallel perfect-HJ build + dense INNER builds up to 4M range",
+  "files": [
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
+  ],
+  "static": {
+    "added_lines": 307,
+    "removed_lines": 2,
+    "conditions": 34,
+    "numeric_constants": [
+      "131072",
+      "65536"
+    ],
+    "string_literals": [
+      "\"PerfectHashJoinBuildTask\"",
+      "\"Type not supported for perfect hash join\"",
+      "\"tasks must not share validity entries\""
+    ]
+  },
+  "accepted_gain": 1.0040160855435736,
+  "accepted_faster": {
+    "q02": 1.06,
+    "q14": 1.07
+  },
+  "audit": {
+    "mechanism": "Two changes to DuckDB's perfect hash join, which is a direct-indexed array keyed by (key \u2212 min). (1) For builds of at least 64k rows, the perfect table is no longer filled serially inside Sink Finalize. A new two-phase event does it instead. Phase one runs parallel tasks over groups of 16 hash-table chunks: each task gathers the key column, sets the key's bit in a shared bitmap with an atomic fetch_or, treats a bit that was already set as a duplicate, and records the slot\u2192row pointer. Phase two runs parallel payload-gather tasks over disjoint ranges of 131072 slots, aligned to 64-bit validity words so no two tasks write the same word. Join-filter creation (min/max, Bloom filter) is moved until the duplicate check is done, and a duplicate falls back to the regular hash-join finalize. RIGHT joins flush their found-match flags through the slot\u2192row array. (2) INNER joins now get the existing 'range up to 4M if keys fill \u226550% of it' rule. Before, that rule applied only to build-propagating (RIGHT) joins, and INNER was capped at a 1M range.",
+    "trigger": "The perfect HJ must first qualify in CanDoPerfectHashJoin. Join type must be INNER or RIGHT, with exactly one equality condition on an integer key (perfect_hash_join_executor.cpp:73-74 `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1 || ... != COMPARE_EQUAL || !TypeIsInteger(...)`). The RHS must have no STRUCT/LIST/ARRAY columns (:79-85). Min and max must be non-NULL. The range must satisfy `build_range > Hugeint::Convert(MAX_DENSE_BUILD_SIZE)` \u2192 reject (:110). After this change, ranges above 1M are allowed for any join type when dense enough: `if (perfect_join_statistics.build_range > MAX_BUILD_SIZE && ht.Count() * 2 < perfect_join_statistics.build_range + 1) return false;` (:120). The old condition also had `!PropagatesBuildSide(op.join_type) ||`, which rejected every INNER join with a range above 1M. The join must also have no more rows than slots (:125), and the hash join must be in-memory, not external (physical_hash_join.cpp:1221-1223). The parallel path then runs when `ht.Count() >= PARALLEL_BUILD_MIN_ROWS` (perfect_hash_join_executor.cpp:155, 65536 rows) and `BuildTaskCount() > 0` (physical_hash_join.cpp:1282).",
+    "constants": "MAX_BUILD_SIZE = 1048576 (:105) is DuckDB upstream's perfect-HJ range cap and is unchanged. MAX_DENSE_BUILD_SIZE = 4194304 and the 50% density test were added in an earlier evolve commit (E0003, RIGHT joins) and are now applied to INNER as well. They are not derived from hardware; the code justifies them only as 'the perfect hash table is not much larger than the regular one'. 4M sits just above the TPC-H build sizes at the benchmark's scale (e.g. part/customer, ~2M dense keys for q14 per the author). A build with a range of 4M+1, or below 50% density above 1M, uses the regular hash join, so nothing breaks; there is just no perfect HJ. PARALLEL_BUILD_MIN_ROWS = 65536 is an engineering threshold below which task-scheduling overhead dominates. Builds just under it take the old serial FullScanHashTable path, so there is no performance cliff, only a missed parallel speedup. CHUNKS_PER_BUILD_TASK = 16 is task granularity, comparable to the existing CHUNKS_PER_TASK = 64 in the same file (physical_hash_join.cpp:595). SLOTS_PER_GATHER_TASK = 131072 is a 64-multiple chosen for correctness (static_assert at :142); its size is a granularity choice. None of these four affects results, only speed.",
+    "natural_class": "Any in-memory INNER or RIGHT equi-join on a single integer key whose build side has unique keys and at least 64k rows benefits from the parallel build. This covers typical fact-to-dimension joins on surrogate or serial primary keys. The widened INNER gate adds such joins whose key range is 1M\u20134M and at least half filled. Examples outside TPC-H: `SELECT e.ts, u.country FROM events e JOIN users u ON e.user_id = u.id;` with 3M users whose ids are 1..3M and a few deletions (range 3M, density >50%). Also `SELECT s.amount, p.title FROM sales s JOIN products p ON s.product_id = p.product_id WHERE p.category = 'books';`, where the filtered products still number \u226564k unique ids within a \u22641M range (parallel build only). Joins not covered: sparse keys (UUID-like or hashed ids), ranges above 4M (e.g. a 10M-row dimension), multi-column or non-integer keys, LEFT/SEMI/ANTI joins, and builds with duplicate keys. Builds with duplicates now pay a wasted parallel key pass and then fall back to the regular hash join.",
+    "fallback": "If ht.Count() < 65536, BuildPerfectHashTable calls the unchanged serial FullScanHashTable (perfect_hash_join_executor.cpp:170 `return FullScanHashTable(key_type);`), and filters are finalized as before (physical_hash_join.cpp:1291-1294). If the parallel key pass finds a duplicate, FinishBuild returns false. The event then calls FinalizeFilters with use_perfect_hash=false, resets the executor and calls the regular `sink.ScheduleFinalize(*pipeline, *this)` (physical_hash_join.cpp:654-662), so the result is the regular hash join after a wasted key pass. Joins that fail CanDoPerfectHashJoin use the regular hash join exactly as before. The only path that changes is INNER joins with a range of 1M\u20134M and \u226550% density, which used to be rejected and now take the perfect HJ.",
+    "label": "heuristic",
+    "label_reason": "The parallel build is a principled, general fix: it parallelises a serial finalize step that is O(range) and O(rows), with sound atomic and word-aligned partitioning and a correct fallback. It applies to any large unique-key integer equi-join and depends on nothing TPC-H-specific. Its thresholds (64k rows, task granularities) only affect performance and look like ordinary engineering values. The part of the change that actually moves the benchmark's q14 is the gate widening: INNER joins with ranges up to 4M at \u226550% density. That 4M cap and the 50% density rule come from an earlier evolve commit, not from upstream DuckDB (which caps at 1M). The cap sits just above the TPC-H dimension key ranges at the benchmark's scale. The author's own numbers show the trade-off: widening INNER without the parallel key pass made q14 33\u201347% slower. The constant was evidently chosen with this workload in mind, though the mechanism is broad and upstream would plausibly accept it with different constants.",
+    "citations": [
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:73 `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:105 `static constexpr idx_t MAX_BUILD_SIZE = 1048576;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:108 `static constexpr idx_t MAX_DENSE_BUILD_SIZE = 4194304;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:120 `if (perfect_join_statistics.build_range > MAX_BUILD_SIZE && ht.Count() * 2 < perfect_join_statistics.build_range + 1)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:125 `if (ht.Count() > perfect_join_statistics.build_range + 1)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:137 `static constexpr idx_t PARALLEL_BUILD_MIN_ROWS = 65536;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:141 `static constexpr idx_t SLOTS_PER_GATHER_TASK = 131072;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:155 `if (ht.Count() >= PARALLEL_BUILD_MIN_ROWS) {`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:170 `return FullScanHashTable(key_type);`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:192 `bits[slot / ValidityMask::BITS_PER_VALUE].fetch_or(bit, std::memory_order_relaxed);`",
+      "src/execution/operator/join/physical_hash_join.cpp:1221 `if (sink.external) { // External Hash Join sink.perfect_join_executor.reset();`",
+      "src/execution/operator/join/physical_hash_join.cpp:1282 `if (use_perfect_hash && sink.perfect_join_executor->BuildTaskCount() > 0) {`",
+      "src/execution/operator/join/physical_hash_join.cpp:654 `const auto use_perfect_hash = sink.perfect_join_executor->FinishBuild();`",
+      "src/execution/operator/join/physical_hash_join.cpp:662 `sink.ScheduleFinalize(*pipeline, *this);`",
+      "git log -S MAX_DENSE_BUILD_SIZE \u2192 72de284 E0003: Perfect hash join for RIGHT joins v2"
+    ]
+  },
+  "audit_cost_usd": 0.23158620000000002
+}

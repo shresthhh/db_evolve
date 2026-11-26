@@ -1,0 +1,50 @@
+{
+  "id": "E0036",
+  "sha": "3c9ef54dba04c4763ba2d3dbbccbdbe12e2b324c",
+  "subject": "E0036: Streaming run aggregation for interior rows of clustered-key radix agg",
+  "files": [
+    "src/execution/radix_partitioned_hashtable.cpp"
+  ],
+  "static": {
+    "added_lines": 357,
+    "removed_lines": 11,
+    "conditions": 32,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/common/types/column/column_data_collection.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0453034125693506,
+  "accepted_faster": {
+    "q08": 1.06,
+    "q18": 1.93
+  },
+  "audit": {
+    "mechanism": "Builds on E0033's clustered-key radix aggregate. That path splits each input chunk whose leading integer GROUP BY key is non-decreasing into boundary runs (the first and last key) and interior rows. Before this change the interior rows still went into the hash table. Now the engine finds the run heads with a linear scan, gives each run of equal keys one aggregate-state block from a per-thread arena, and updates the states directly through a per-row state-pointer vector. No hash probe happens. It appends one row per run (the group values plus a pointer to the states) to a per-thread, buffer-managed ColumnDataCollection. At finalize, if the existing interval-disjointness proof holds, each run store becomes a READY_TO_SCAN partition and is finalized and scanned in parallel. If the proof fails, the runs are re-inserted into a SkipLookups HT and combined. A global std::map of streamed intervals stops all streaming as soon as two intervals overlap. In effect this is sort-based (streaming) aggregation used opportunistically when the input arrives already ordered on the group key.",
+    "trigger": "Every E0033 condition must still hold:\n- More than one thread, the GROUP BY is not empty, and the leading group key is an integral physical type (`number_of_threads > 1 && !radix_ht.grouping_set.empty()`, switch over INT8..UINT64).\n- No DISTINCT aggregates.\n- The thread has seen no unclustered chunk so far (`lstate.clustered = gstate.clustered_enabled && !gstate.any_unclustered`).\n- The chunk has at most STANDARD_VECTOR_SIZE rows, and the thread has split fewer than MAX_CLUSTERED_CHUNKS=1048576 chunks.\n- The chunk's key column has no NULLs and is non-decreasing (FindClusteredRuns: `if (cur < prev) return false`).\n- The chunk has interior rows (`first_end < last_start`), i.e. at least three distinct keys.\n\nNew global gates (`stream_runs_enabled`):\n- `aggr.filter || aggr.function.HasStateDestructorCallback() || !aggr.function.HasStateCombineCallback()` disables streaming. That rules out FILTER, string_agg/list/varchar-min/max-style aggregates with destructors, and ORDER BY aggregates.\n- No non-leading group column may be nested, FLOAT or DOUBLE.\n\nNew per-chunk gates:\n- `RegisterRunInterval`: the chunk's (min_key, max_key) interval must not overlap any interval streamed earlier by any thread. After the first overlap, all streaming stops (`run_intervals_overlap = true`).\n- In SinkInteriorRuns, the other group columns must change only at key-run heads (checked with DistinctFrom). If not, that chunk's interior goes to the HT as before.",
+    "constants": "No new numeric thresholds. The constants it inherits:\n- STANDARD_VECTOR_SIZE: the engine's vector size.\n- MAX_CLUSTERED_CHUNKS = 1048576 (`radix_partitioned_hashtable.cpp:459`), an arbitrary cap on the per-thread interval list. Past it, chunks fall back to the HT.\n- `number_of_threads > 1`: single-threaded runs never take the path.\n- \"At least 3 distinct keys per chunk\": structural, not tuned. It follows from the first and last runs going to the boundary HT.\n\nThe overlap detector is a binary decision (overlap or not), not a tuned value. One cost the author does not state: a global mutex is taken once per streamed chunk. Excluding FLOAT/DOUBLE secondary keys is a correctness choice, because DistinctFrom adjacency on floats (-0/+0, NaN) is not group equality. It is not a tuning choice. The gates are type and shape tests, not data-size cutoffs. The real limit is data layout: the input has to reach the aggregate as per-thread chunks with key ranges that do not overlap. That holds for scans of tables physically ordered on the key (TPC-H lineitem by l_orderkey), but not for packed sparse join output (the author notes q03 fails the proof).",
+    "natural_class": "Parallel GROUP BY whose leading key is an integer column and whose input arrives in key order with key ranges that do not overlap across chunks. The typical source is a table loaded or clustered in key order (event ids, order ids, time-bucket ints, auto-increment ids), possibly after a filter, or after a projection or join that keeps order. The aggregates must be simple combinable ones without destructors (sum/count/avg/min/max on numerics, decimal sum). Examples outside TPC-H:\n- `SELECT session_id, count(*), sum(bytes), max(ts_epoch) FROM web_events GROUP BY session_id;` where web_events was inserted ordered by session_id.\n- `SELECT user_id, device_id, avg(latency_ms) FROM requests WHERE status = 200 GROUP BY user_id, device_id;` where requests is sorted by user_id and device_id is constant within a user run (a functional dependency).\n- `SELECT o_id, sum(amount) FROM payments GROUP BY o_id HAVING sum(amount) > 1000;` (a q18-like pattern on any ordered fact table).\n\nThe path is not taken when:\n- string_agg, list or min/max on varchar is present\n- any FILTER clause is present\n- the key is a VARCHAR, DATE-typed column, etc. Note: DATE is INT32 physically, so it may actually qualify. TIMESTAMP is INT64, so it qualifies too.\n- the data is unordered",
+    "fallback": "When the global gates fail, stream_runs_enabled is false and the E0033 behaviour is unchanged: interior rows go to the main HT (`radix_partitioned_hashtable.cpp:952` slice into slice_groups). When a per-chunk gate fails (overlap registered, or the secondary group columns are not constant within runs), that chunk's interior takes the old HT route. After an overlap, every later chunk does too. If runs were already streamed and the final disjointness proof fails, MergeRunStores re-inserts each run into a SkipLookups HT, moves its states with CombineStates and merges into uncombined_data. This step is serial, so its cost is new overhead compared with the parent. Unclustered input is unaffected and follows the original radix HT path.",
+    "label": "heuristic",
+    "label_reason": "The technique is general and principled: streaming aggregation over sorted runs, which avoids hash probes when the input is already clustered on the group key. The new gates are semantic (FILTER, destructor and combine callbacks, float/nested secondary keys, run-head constancy), not benchmark constants. But it applies only on top of E0033's opportunistic clustered path, which needs per-chunk key ranges that do not overlap across threads. In practice that means base tables physically ordered on an integer key, the layout TPC-H lineitem/orders has on l_orderkey. The early-overlap stop and the serial merge fallback were added specifically to fix a q03 regression. The only measured benefit is q18 (a large GROUP BY l_orderkey over lineitem); every other template was noise. The idea would likely be accepted upstream, but its reach depends on data layout, which this benchmark happens to provide. That is why it is labelled heuristic rather than general.",
+    "citations": [
+      "src/execution/radix_partitioned_hashtable.cpp:251 `if (number_of_threads > 1 && !radix_ht.grouping_set.empty()) {`",
+      "src/execution/radix_partitioned_hashtable.cpp:266-268 `if (aggregate->Cast<BoundAggregateExpression>().IsDistinct()) { clustered_enabled = false;`",
+      "src/execution/radix_partitioned_hashtable.cpp:273-276 `stream_runs_enabled = clustered_enabled; ... if (aggr.filter || aggr.function.HasStateDestructorCallback() || !aggr.function.HasStateCombineCallback())`",
+      "src/execution/radix_partitioned_hashtable.cpp:281-283 `type.IsNested() || type.InternalType() == PhysicalType::FLOAT || ... DOUBLE`",
+      "src/execution/radix_partitioned_hashtable.cpp:459 `static constexpr idx_t MAX_CLUSTERED_CHUNKS = 1048576;`",
+      "src/execution/radix_partitioned_hashtable.cpp:868 `if (count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= RadixHTLocalSinkState::MAX_CLUSTERED_CHUNKS)`",
+      "src/execution/radix_partitioned_hashtable.cpp:681-682 `if (cur < prev) { return false;`",
+      "src/execution/radix_partitioned_hashtable.cpp:942-949 `if (first_end < last_start) { if (lstate.stream_runs && !RegisterRunInterval(gstate, min_key, max_key)) ... SinkInteriorRuns(...)`",
+      "src/execution/radix_partitioned_hashtable.cpp:952 `slice_groups.data[c].Slice(group_chunk.data[c], first_end, last_start);` (old HT path)",
+      "diff SinkInteriorRuns: `VectorOperations::DistinctFrom(left, right, nullptr, count - 1, &distinct_sel, nullptr); ... if (h == run_count || heads.get_index(h) != row) return false;`",
+      "diff SinkInteriorRuns: `rows[r] = run_states - aggr_offset;` fake row pointers so RowOperations work unchanged",
+      "diff RegisterRunInterval: `if (overlap) { gstate.run_intervals_overlap = true; intervals.clear(); return false; }`",
+      "src/execution/radix_partitioned_hashtable.cpp:1186-1187 `clustered_disjoint = gstate.uncombined_data && !gstate.external && !gstate.any_unclustered && ClusteredIntervalsDisjoint(...)`",
+      "diff Finalize: `if (!clustered_disjoint && !gstate.run_stores.empty()) { MergeRunStores(context, *this, gstate); }`",
+      "diff Finalize: `partition.runs = std::move(runs); ... partition.state = AggregatePartitionState::READY_TO_SCAN;`",
+      "issue.md: `q18 is 45\u201354% faster ... Every other template stayed within noise`; `Without this, q03 was +5\u201313%`"
+    ]
+  },
+  "audit_cost_usd": 0.2831096
+}

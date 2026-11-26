@@ -1,0 +1,43 @@
+# spec-q21: what changed from v0 to v1
+
+1 accepted changes. Auditor labels: 1 heuristic.
+
+Gain at acceptance is the visible-geomean speedup over the previous best when the change was accepted; alone is the change applied by itself to v0 (from `dbe ablate`, if it was run).
+
+| Id | Change | Label | Files | +/- lines | Conditions added | Gain at acceptance | Alone |
+|---|---|---|---|---|---|---|---|
+| E0006 | Exact key-bitmap mode for join BF + push BF into DELIM_GET-build subqu | heuristic | 5 | +310 / -8 | 55 | 1.152× | – |
+
+## E0006: Exact key-bitmap mode for join BF + push BF into DELIM_GET-build subquery scans
+
+Commit `b0c83377573d`. Files: `src/execution/join_hashtable.cpp`, `src/execution/operator/join/physical_hash_join.cpp`, `src/include/duckdb/planner/filter/bloom_filter.hpp`, `src/optimizer/join_filter_pushdown_optimizer.cpp`, `src/planner/filter/bloom_filter.cpp`.
+Faster when accepted: q21 1.15×.
+Numeric constants in added code: `128`.
+
+**Label: heuristic.** The technique itself is general and principled. A direct-address bitmap semi-join filter for dense integer keys is standard, and it is correct for NULLs, the type set and overflow. The relaxation to single-equality-plus-inequality is a natural generalisation. However, the density cap of 128 bits/key was explicitly raised from 64 because q21's build side measures ~85 bits/key; the author states the 64 cap "was the trap". The DELIM_GET `build_side_has_filter = true` is also an unconditional shape rule that the author calls a heuristic. Neither is keyed to TPCH schema names or specific queries, and an upstream maintainer would plausibly accept both, possibly with a different cap and a memory-based rule. So the change is a broad mechanism gated by a workload-tuned constant: heuristic, not special_case.
+
+- **Mechanism.** There are three changes. (a) When the hash-join build key is a single integer column and its observed [min,max] range is dense enough, the runtime join filter pushed into the probe-side scan is no longer a hashed, blocked bloom filter. It becomes an exact bitmap indexed by (key - min). That is a direct-address semi-join bitmap: one subtract, one bounds check and one bit test per row, with no hashing and no false positives. The bitmap is filled during the hash-table Finalize with atomic fetch_or. (b) Joins with one equality condition plus extra non-equality conditions now also qualify for a bloom filter. Previously the join had to have exactly one condition. (c) A join whose build child is a DELIM_GET (decorrelated subquery) is now always treated as having a "filtering" build side. Before, the optimizer tested the other child with IsFiltering(), so this enables runtime BF pushdown into the subquery's probe scan.
+- **Trigger.** The pre-existing conditions for a deferred bloom filter all still apply: hash join, not a perfect hash table, no cast on the probe column, and probe cardinality estimate > build count (physical_hash_join.cpp:779-783). On top of these:
+- BF eligibility: `ht->equality_predicate_columns.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL` (physical_hash_join.cpp:776). The old test was `ht->conditions.size() == 1`.
+- build_side_has_filter: `if (rhs_child->type == LogicalOperatorType::LOGICAL_DELIM_GET) { ... build_side_has_filter = true; }` (join_filter_pushdown_optimizer.cpp:304-307). This used to be `IsFiltering(join.children[0])`.
+- Exact mode: SetKeyRange is called with the build min/max (physical_hash_join.cpp:906-907). It needs a non-null min and max of the same type, and the type must be one of `INT8, INT16, INT32, INT64, UINT8, UINT16, UINT32` (bloom_filter.cpp:19-31, 57). UINT64, HUGEINT, DATE-as-int32 and so on: DATE is INT32 physically, so it qualifies. Then Initialize checks `range_minus_one < MAX_EXACT_BITS && range_minus_one < number_of_rows * MAX_EXACT_BITS_PER_KEY` (bloom_filter.cpp:83), with `MAX_EXACT_BITS_PER_KEY = 128` and `MAX_EXACT_BITS = (1ULL << 29)` (bloom_filter.cpp:16-17).
+- At probe time, exact filtering is used only if `keys_v.GetType().InternalType() == filter.ExactKeyType()` and no overflow has occurred (bloom_filter.cpp:291-299).
+- **Constants.** - MAX_EXACT_BITS = 2^29 bits (64 MiB bitmap). This is a memory cap, not derived from hardware or from the workload. A key range of 2^29 or more falls back to the hashed BF. For comparison, the hashed BF can grow to MAX_NUM_SECTORS = 2^26 words = 512 MiB (bloom_filter.cpp:7).
+- MAX_EXACT_BITS_PER_KEY = 128. The code comment justifies it as "the join hash table's pointer table already uses at least 128 bits per build row" (bloom_filter.cpp:14-15): 8-byte entries at load factor ≥ 2, so the bitmap never costs more memory than the pointer table already does. That reasoning holds up. But the author's notes say the planned cap was 64 and was raised to 128 specifically because "q21's delim build side is about 85 bits/key, so the l2/l3 filters stayed hashed". So the value was chosen to put q21 over the line, with the justification added afterwards. Just outside the cap (129 or more bits per build row), the hashed BF is built exactly as before, with ~12 bits/key and false positives. Behaviour is correct either way; only selectivity and speed change.
+- No other numeric constants. The DELIM_GET rule has no threshold at all: it is unconditional.
+- **Outside this benchmark.** Any hash join with exactly one equality key of a ≤64-bit signed or ≤32-bit unsigned integer type (including DATE), where:
+- the build side is smaller than the probe estimate,
+- the build is already selected for a BF (it is filtered, or it is a DELIM_GET),
+- the build keys span at most 128× the build row count and fewer than 2^29 values.
+Surrogate-key and dense-id star joins are the typical case. Examples:
+1) `SELECT count(*) FROM page_views v JOIN users u ON v.user_id = u.id WHERE u.country = 'NZ';` Here users.id is a dense INTEGER: 10M users, 50K selected, range ~10M → 200 bits/key, so this one would NOT qualify. With `u.signup_date > '2024-01-01'` on sequential ids, the selected ids are contiguous and dense, so it qualifies.
+2) Correlated EXISTS/IN decorrelated via DELIM join, with an extra inequality: `SELECT o.id FROM orders o WHERE EXISTS (SELECT 1 FROM shipments s WHERE s.order_id = o.id AND s.carrier <> o.preferred_carrier) AND o.created_at > now() - INTERVAL 7 DAY;` This uses the DELIM_GET rule, the relaxed single-equality-plus-inequality rule, and a dense BIGINT order-id range.
+The density condition is the binding one. It favours ranges of sequential ids and fails for sparse or hashed ids (e.g. snowflake BIGINTs, which span huge ranges), for strings, and for UINT64/HUGEINT.
+- **Otherwise.** If the type is unsupported or the range is too wide or too sparse, Initialize builds the original hashed blocked bloom filter, sized as before (bloom_filter.cpp:92-98), and InsertHashes/Filter take the original path. That path is unchanged apart from the extra `!bloom_filter.IsExact()` check (join_hashtable.cpp:720).
+
+Overflow is handled safely: if a build key falls outside the range, InsertKey sets exact_overflow (bloom_filter.hpp:48-51) and Filter lets every row through (bloom_filter.cpp:292-293).
+
+Two side effects reach beyond the gated path:
+1. In exact mode, CheckStatistics always returns NO_PRUNING_POSSIBLE (bloom_filter.cpp:381-383). Zone-map pruning that the hashed BF could do through TemplatedCheckStatistics is lost, and the min/max filters only prune by range, not by holes inside it.
+2. The DELIM_GET and multi-condition relaxations enable BFs (hashed or exact) on joins that previously had none. That costs build-side work on every qualifying decorrelated subquery, guarded only by the probe > build estimate.
+- **Code.** src/planner/filter/bloom_filter.cpp:16 `static constexpr idx_t MAX_EXACT_BITS_PER_KEY = 128;`; src/planner/filter/bloom_filter.cpp:17 `static constexpr idx_t MAX_EXACT_BITS = (1ULL << 29);`; src/planner/filter/bloom_filter.cpp:14-15 `(the join hash table's pointer table already uses at least 128 bits per build row)`; src/planner/filter/bloom_filter.cpp:19-31 `ExactKeyTypeSupported ... INT8 ... UINT32 return true; default: return false`; src/planner/filter/bloom_filter.cpp:57 `if (min.IsNull() || max.IsNull() || min.type() != max.type())`; src/planner/filter/bloom_filter.cpp:83 `if (range_minus_one < MAX_EXACT_BITS && range_minus_one < number_of_rows * MAX_EXACT_BITS_PER_KEY)`; src/planner/filter/bloom_filter.cpp:291-299 `if (filter.IsExact()) { if (filter.ExactOverflow()) { return approved_tuple_count; } ...`; src/planner/filter/bloom_filter.cpp:381-383 `if (filter.IsExact()) { ... return FilterPropagateResult::NO_PRUNING_POSSIBLE;`

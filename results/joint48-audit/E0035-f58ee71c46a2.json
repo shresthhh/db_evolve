@@ -1,0 +1,51 @@
+{
+  "id": "E0035",
+  "sha": "f58ee71c46a2c1c9d4623388d87b7c1c7d25f25a",
+  "subject": "E0035: Parallel hash-join finalize for medium builds (64K-1M rows)",
+  "files": [
+    "src/execution/operator/join/physical_hash_join.cpp"
+  ],
+  "static": {
+    "added_lines": 11,
+    "removed_lines": 4,
+    "conditions": 0,
+    "numeric_constants": [
+      "65536"
+    ],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0906994574736941,
+  "accepted_faster": {
+    "q03": 1.08,
+    "q04": 1.44,
+    "q05": 1.38,
+    "q08": 1.17,
+    "q09": 1.08,
+    "q16": 1.08,
+    "q22": 1.08
+  },
+  "audit": {
+    "mechanism": "DuckDB builds its in-memory hash-join table in two phases: it zeroes the pointer table, then inserts every build row's hash into it (Finalize/InsertHashes, which also fills the deferred bloom filter). Both phases already had a parallel version that inserts with atomic compare-and-swap, but it was only used when the build side had at least 1,048,576 rows. This change lowers that cut-off to 65,536 rows. It also replaces the fixed 64 chunks per insert task with roughly four tasks per thread, clamped to between 4 and 64 chunks per task, so builds of about 64K to 4M rows are split into more, smaller tasks and keep all threads busy. Nothing else changes: the algorithm, the hash-table layout and the probe side are the same.",
+    "trigger": "The trigger is the shared gate `FinalizeSingleThreaded` (src/execution/operator/join/physical_hash_join.cpp:403). The parallel path is taken when all of these hold:\n- More than one thread: `if (num_threads == 1) { return true; }` (:406).\n- Either `verify_parallelism` is on, or the table is not small: `const bool ht_is_small = ht.Count() < PARALLEL_CONSTRUCT_THRESHOLD;` with `PARALLEL_CONSTRUCT_THRESHOLD = 65536` (:388, :417).\n- For the insert phase only, the keys are not skewed: `return ht_is_small || KeysAreSkewed(sink);` (:420). `KeysAreSkewed` is `skew > SKEW_SINGLE_THREADED_THRESHOLD` (0.33), where skew is the largest radix partition's share of the total size (:394-398).\n\nThe pointer-table init event calls the gate with `FinalizeSingleThreaded(sink, false)` (:511). The insert event calls it with `FinalizeSingleThreaded(sink, true)` (:571). On the parallel insert path the task size is `MaxValue(MinValue(chunk_count / (4 * num_threads), CHUNKS_PER_TASK), MIN_CHUNKS_PER_TASK)`, with CHUNKS_PER_TASK = 64 and MIN_CHUNKS_PER_TASK = 4 (:578-583, :601-602). With `verify_parallelism` it is still 1 chunk per task.\n\nThis applies to any operator that uses PhysicalHashJoin's in-memory finalize: inner, outer, semi, anti and mark joins, with any key types. It does not depend on the plan shape, the schema or column statistics.",
+    "constants": "**PARALLEL_CONSTRUCT_THRESHOLD = 65536 (was 1048576).** This is a round power of two with no hardware or cost-model derivation. The author picked it and tested only two micro builds (703K and 937K rows) plus the TPC-H run. The issue says so directly: \"I did not tune the threshold below 64K or test 100K/300K builds\", and it does not scale with thread count.\n- At 65,535 rows the build stays serial. At 65,536 it is split into tasks: with 2048-row vectors that is about 32 chunks, so 32/(4*8) = 1, clamped up to 4 chunks per task, giving about 8 tasks on 8 threads.\n- This range (64K to 1M rows) covers many mid-sized TPC-H build sides, e.g. supplier, filtered customer, part or orders subsets at moderate scale factors. That fits the gains the author reports on q03, q04, q05, q08 and q09.\n- Below the threshold nothing changes.\n\n**MIN_CHUNKS_PER_TASK = 4 and the \"4 tasks per thread\" factor.** These follow the standard oversubscription rule already used by the table-init code at :517 (\"have 4 times more tasks than threads\"), so they are principled rather than tuned.\n- The new sizing only differs from the old fixed 64 when chunk_count < 256 * num_threads. On 8 threads that is roughly 4.2M rows or fewer.\n- Above that, tasks are capped at 64 chunks, as before.\n\n**SKEW_SINGLE_THREADED_THRESHOLD = 0.33 and MINIMUM_ENTRIES_PER_TASK = 131072.** Both were already in the code and are unchanged. Because of the 131072 minimum, the pointer-table zeroing near the 64K mark still runs as only 1 or 2 tasks. The pointer table holds about 128K to 256K entries at that size, so that phase gets little parallelism there.",
+    "natural_class": "Any multi-threaded hash join whose build side has between 64K and 1M rows, keys that are not heavily skewed, and fits in memory. Builds up to about 4M rows also get the finer task split. This is very common in analytics, e.g. dimension tables of 100K to 1M rows.\n\nExample 1:\n```sql\nSELECT p.category, sum(e.revenue)\nFROM events e\nJOIN products p ON e.product_id = p.id\nGROUP BY 1;\n```\nHere `products` has 300K rows.\n\nExample 2:\n```sql\nSELECT count(*)\nFROM clicks c\nWHERE c.user_id IN (SELECT id FROM users WHERE signup_date > '2024-01-01');\n```\nThis is a semi join whose filtered build side has about 200K rows.",
+    "fallback": "Builds below 65,536 rows, single-thread runs, and (for the insert phase only) skewed keys still take the existing single-task path, unchanged (:406-420, :511-514, :571-574). Builds large enough that chunk_count / (4*threads) \u2265 64 get the same 64 chunks per task as before. The external/partitioned hash-join path is not modified and still uses CHUNKS_PER_TASK directly. Correctness does not depend on the threshold: the parallel insert path was already in use for builds of 1M rows or more and is chosen by passing `parallel=true` (:585).",
+    "label": "heuristic",
+    "label_reason": "The technique is general. It reuses DuckDB's existing parallel compare-and-swap hash-table build for smaller tables, and it sizes tasks with the standard rule of about four tasks per thread. The gate refers to nothing specific to TPC-H's schema, plan shapes or data. However, the new cut-off of 65,536 is a hand-picked round number. It was checked only against two builds near 1M rows and the TPC-H run, and it happens to cover TPC-H's mid-sized build sides. Below that point the speed-up is unmeasured: the issue says builds of 100K and 300K rows were not tested and a lower value was not tried. It also ignores thread count, so on many-core machines small builds may now pay task-scheduling and compare-and-swap overhead. Upstream would probably accept it, perhaps with a different or thread-scaled constant, which is why it is labelled heuristic rather than general.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:388 `static constexpr idx_t PARALLEL_CONSTRUCT_THRESHOLD = 65536;`",
+      "src/execution/operator/join/physical_hash_join.cpp:389 `SKEW_SINGLE_THREADED_THRESHOLD = 0.33`",
+      "src/execution/operator/join/physical_hash_join.cpp:406 `if (num_threads == 1) { return true; }`",
+      "src/execution/operator/join/physical_hash_join.cpp:417 `const bool ht_is_small = ht.Count() < PARALLEL_CONSTRUCT_THRESHOLD;`",
+      "src/execution/operator/join/physical_hash_join.cpp:420 `return ht_is_small || KeysAreSkewed(sink);`",
+      "src/execution/operator/join/physical_hash_join.cpp:511 `if (FinalizeSingleThreaded(sink, false)) {`",
+      "src/execution/operator/join/physical_hash_join.cpp:517 `MaxValue(entry_count / num_threads / 4, MINIMUM_ENTRIES_PER_TASK)`",
+      "src/execution/operator/join/physical_hash_join.cpp:527 `MINIMUM_ENTRIES_PER_TASK = 131072`",
+      "src/execution/operator/join/physical_hash_join.cpp:571 `if (FinalizeSingleThreaded(sink, true)) {`",
+      "src/execution/operator/join/physical_hash_join.cpp:580-583 `MaxValue<idx_t>(MinValue<idx_t>(chunk_count / (4 * num_threads), CHUNKS_PER_TASK), MIN_CHUNKS_PER_TASK)`",
+      "src/execution/operator/join/physical_hash_join.cpp:601-602 `CHUNKS_PER_TASK = 64; MIN_CHUNKS_PER_TASK = 4`",
+      ".dbe/review/issue.md: `I did not tune the threshold below 64K or test 100K/300K builds separately.`"
+    ]
+  },
+  "audit_cost_usd": 0.1585768
+}

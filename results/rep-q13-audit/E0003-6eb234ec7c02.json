@@ -1,0 +1,56 @@
+{
+  "id": "E0003",
+  "sha": "6eb234ec7c02002c890caaa9350dd138404e58ed",
+  "subject": "E0003: Large perfect hash aggregate (up to 22 bits) with parallel combine and source",
+  "files": [
+    "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/execution/physical_plan/plan_aggregate.cpp",
+    "src/include/duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp"
+  ],
+  "static": {
+    "added_lines": 185,
+    "removed_lines": 28,
+    "conditions": 12,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/parallel/task_scheduler.hpp\"",
+      "\"duckdb/storage/buffer_manager.hpp\""
+    ]
+  },
+  "accepted_gain": 1.4363477566329013,
+  "accepted_faster": {
+    "q13": 1.44
+  },
+  "audit": {
+    "mechanism": "Before this change DuckDB used its perfect-hash (direct-indexed array) GROUP BY only when the integer key ranges, taken from min/max statistics, fit in perfect_ht_threshold bits (12 by default, so 4K slots). Now a second, \"large\" tier allows up to 22 bits (4M slots). It is used only if the estimated input has at least half as many rows as there are slots, and if one table per thread plus the global table fits in 1/8 of the memory limit. For tables of at least 2^16 slots, the merge of thread-local tables into the global table now runs in parallel: the slots are split into 64 stripes, each with its own lock. The final scan also runs in parallel, in blocks of 16K slots. Smaller tables keep the old single-lock merge and the single-threaded scan.",
+    "trigger": "Planner, CanUsePerfectHashAggregate (src/execution/physical_plan/plan_aggregate.cpp). The checks that already existed still apply:\n- a single grouping set and no GROUPING() functions;\n- every key is an INT8..UINT64 column with min/max statistics;\n- each key's range is below 2^31 (\"range >= NumericLimits<int32_t>::Maximum()\" \u2192 reject, :254);\n- no DISTINCT aggregates, and every aggregate has a combine callback (:271).\n\nThe new checks:\n- Total bits across all keys (each key's range+2, rounded up to a power of two) must satisfy \"perfect_hash_bits > MaxValue<idx_t>(perfect_ht_threshold, LARGE_PERFECT_HT_MAX_BITS)\" \u2192 reject (:264).\n- If \"perfect_hash_bits > perfect_ht_threshold\" (:276), CanUseLargePerfectHashAggregate runs:\n  - \"perfect_hash_bits > LARGE_PERFECT_HT_MAX_BITS\" \u2192 reject (:136);\n  - density: \"input_cardinality < total_groups / 2\" \u2192 reject (:141). input_cardinality is the child plan's estimate, \"plan.get().estimated_cardinality\" (:338);\n  - memory: \"required_memory <= max_memory / 8\" (:156), where required_memory = 2^bits \u00d7 (1 + 8 + sum of aggregate state sizes) \u00d7 (NumberOfThreads + 1) (:153).\n\nExecutor (physical_perfecthash_aggregate.cpp): the striped combine and the parallel source run when \"ht->TotalGroups() >= PERFECT_HT_PARALLEL_MIN_GROUPS\" (2^16, :84, :94, :215). This depends only on table size, so it also covers the existing tier whenever a user has raised perfect_ht_threshold to 16 bits or more.",
+    "constants": "- LARGE_PERFECT_HT_MAX_BITS = 22 (:130). No justification is given; it is the size of one direct-indexed array per thread (4M slots).\n  - TPCH q13 groups on o_custkey. At SF10 that column has 1.5M values, which needs 21 bits, so 22 covers it with one bit to spare. Related commit E0001 also used 2^22 for perfect hash joins.\n  - At 23 bits the query falls back to the radix hash aggregate.\n  - The cap does not adapt to thread count or L2/L3 cache size, except through the memory guard.\n- Density factor 1/2 (:141): a rule of thumb, not derived anywhere.\n  - It uses the estimate. The author notes q13's estimate (3M) is far below the actual 15M and still passes. A slightly worse estimate would silently turn the path off.\n  - It compares input rows to slots, not distinct groups to slots. A big input with few actual groups still allocates and scans the whole table in every thread.\n- Memory guard max_memory/8 \u00d7 (threads+1) (:156): principled in form, but the 1/8 fraction is arbitrary. With many threads or wide aggregate states the guard fails and the radix hash aggregate is used.\n- PERFECT_HT_PARALLEL_MIN_GROUPS = 2^16 (:84), 64 stripes (:86), scan block = STANDARD_VECTOR_SIZE\u00d78 = 16K slots (:88): ordinary parallelism granularity choices with no evidence of tuning. Below 2^16 slots the old serial code runs.\n- The default perfect_ht_threshold = 12 (settings.json:916) is unchanged. As the author admits, a lowered threshold no longer turns the large path off.",
+    "natural_class": "Any GROUP BY on one or more integer columns that have min/max statistics, a combined key domain between 2^13 and 2^22 (about 8K to 4M values), and an estimated input of at least half the domain size, with aggregates that support combine (count, sum, min, max, avg, list, ...). The typical case is grouping a fact table on a dense surrogate or foreign key with up to a few million distinct values. Two examples:\n\nSELECT user_id, count(*), sum(amount) FROM events GROUP BY user_id;\n(user_id dense in 1..2,000,000; events has 50M rows)\n\nSELECT store_id, day_of_year, avg(price) FROM sales GROUP BY store_id, day_of_year;\n(store_id in 1..5000, 13 bits; day_of_year 1..366, 9 bits; 22 bits in total)\n\nThese are common analytic shapes. Sparse keys (for example 64-bit IDs or hashes) are excluded by the range check, and large domains with little input are excluded by the density check.",
+    "fallback": "If the large-tier checks fail, CanUsePerfectHashAggregate returns false. CreatePlan then builds the normal radix-partitioned PhysicalHashAggregate, the same as before.\n\nTables of 12 bits or fewer take the old path: Combine under a single global lock (:183, \"if (!gstate.stripe_locks)\") and a single-threaded scan (MaxThreads returns 1; :265, \"if (!state.parallel)\"). The scan now sits behind ParallelSource()=true but behaves the same. Combine was refactored into a ranged version plus TakeAllocator, which has the same effect for the old path.\n\nOne behaviour change remains: a user-lowered perfect_ht_threshold no longer stops perfect hashing for ranges of 22 bits or fewer that pass the guards.",
+    "label": "heuristic",
+    "label_reason": "The technique is general and standard. Direct-indexed aggregation on dense integer keys, plus a parallel combine and scan of a partitioned array, contains no TPCH schema, column, or query-shape tests, and helps any dense-integer-key GROUP BY.\n\nThe gating, however, rests on unexplained constants:\n- the 22-bit cap, which conveniently sits just above q13's 21-bit o_custkey domain at SF10;\n- a 1/2 density ratio, applied to an estimate the author admits is off by 5x;\n- a 1/8 memory fraction.\nThe change also overrides the user's perfect_ht_threshold setting.\n\nUpstream would plausibly accept the idea, with constants adjusted to thread count and cache size, and with the setting respected. So this is not a special case, but it is not a clean general change either.",
+    "citations": [
+      "src/execution/physical_plan/plan_aggregate.cpp:130 \"static constexpr idx_t LARGE_PERFECT_HT_MAX_BITS = 22;\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:136 \"if (perfect_hash_bits > LARGE_PERFECT_HT_MAX_BITS) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:141 \"if (input_cardinality < total_groups / 2) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:153 \"TaskScheduler::GetScheduler(context).NumberOfThreads()\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:156 \"return required_memory <= max_memory / 8;\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:254 \"if (range >= NumericLimits<int32_t>::Maximum()) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:264 \"if (perfect_hash_bits > MaxValue<idx_t>(perfect_ht_threshold, LARGE_PERFECT_HT_MAX_BITS)) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:271 \"if (aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback()) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:276 \"if (perfect_hash_bits > perfect_ht_threshold) {\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:338 \"CanUsePerfectHashAggregate(context, op, required_bits, plan.get().estimated_cardinality)\"",
+      "src/common/settings.json:916 \"default_value\": \"12\" (perfect_ht_threshold)",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:84 \"PERFECT_HT_PARALLEL_MIN_GROUPS = idx_t(1) << 16;\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:86 \"PERFECT_HT_COMBINE_STRIPES = 64;\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:88 \"PERFECT_HT_SCAN_BLOCK_SIZE = STANDARD_VECTOR_SIZE * 8;\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:183 \"if (!gstate.stripe_locks) {\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:204 \"gstate.ht->TakeAllocator(local_ht);\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:215 \"parallel = total_groups >= PERFECT_HT_PARALLEL_MIN_GROUPS;\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:265 \"if (!state.parallel) {\""
+    ]
+  },
+  "audit_cost_usd": 0.2742032
+}

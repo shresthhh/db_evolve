@@ -1,0 +1,55 @@
+{
+  "id": "E0004",
+  "sha": "a496c6c900cceface52a41cb5babf2ae9f4baade",
+  "subject": "E0004: Exact key bitmap mode for join BF on dense integer build keys",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/planner/filter/bloom_filter.cpp"
+  ],
+  "static": {
+    "added_lines": 297,
+    "removed_lines": 11,
+    "conditions": 64,
+    "numeric_constants": [
+      "128",
+      "2048"
+    ],
+    "string_literals": [
+      "\"BloomFilter: exact key out of range\"",
+      "\"BloomFilter: unsupported type for exact key mode\""
+    ]
+  },
+  "accepted_gain": 1.252583592329534,
+  "accepted_faster": {
+    "q09": 1.25
+  },
+  "audit": {
+    "mechanism": "When the hash join's runtime Bloom filter would be pushed into the probe-side scan, and the first build key is an integer whose build-side [min,max] range is small enough, the filter becomes an exact bitmap with one bit per value in [min,max]. Bit (key-min) is set for each build key. Probing tests that bit on the raw key value with no hashing and no false positives. Values outside the range are rejected. Zone-map pruning (CheckStatistics) also gains an exact range-overlap test plus the existing probe of up to 2048 values. If the trigger fails, the old hashed BF is built unchanged.",
+    "trigger": "All of these must hold.\n\n1. The existing deferred-BF path is reached (physical_hash_join.cpp:956): `!has_cast && is_first_key && ht && CanUseBloomFilter(...)` and `deferred_bloom_filters` is non-null. CanUseBloomFilter (physical_hash_join.cpp:769-785) requires all of:\n   - not a perfect hash table;\n   - `cmp == COMPARE_EQUAL`;\n   - `build_side_has_filter`;\n   - probe cardinality estimate greater than the HT count.\n   It is also reached only when min != max (line 911).\n2. Then TrySetExactBloomFilterRange (physical_hash_join.cpp:845-868) requires:\n   - the BF is not already initialized or exact, and min/max are non-NULL;\n   - `build_type.InternalType() == probe_type.InternalType()` and `min_val.type() == build_type`;\n   - the physical type is INT8/16/32/64 or UINT8/16/32 (GetExactBloomFilterKey, lines 815-841). That includes logical types stored as these, such as DATE and DECIMAL; UINT64, HUGEINT, VARCHAR and floats are excluded;\n   - `range >= MAX_EXACT_RANGE || range / MAX_EXACT_BITS_PER_KEY >= ht.Count()` must be false, with MAX_EXACT_RANGE = 2^31 and MAX_EXACT_BITS_PER_KEY = 128.\n\nIn practice: equality hash joins on an integer key where a filtered build side has at most about 128 distinct-range values per build row, and the join did not qualify for the perfect hash table.",
+    "constants": "- **MAX_EXACT_RANGE = 2^31** (physical_hash_join.cpp:847): caps the bitmap at 256 MB. That is principled: it stays under the hashed BF's own cap of `MAX_NUM_SECTORS = (1ULL << 26)` 64-bit sectors (bloom_filter.cpp:7), and it is not tuned to TPC-H sizes. A range of 2^31 or more uses the hashed BF.\n- **MAX_EXACT_BITS_PER_KEY = 128** (line 846): a density cutoff. It is not derived from anything. The hashed BF uses `MIN_NUM_BITS_PER_KEY = 12` rounded up to a power of two, so roughly 12-24 bits/key. At 128 bits/key the exact bitmap can therefore be about 5-10x larger than the filter it replaces, which contradicts the code comment \"typically a smaller footprint\". The author's notes say a sibling run found the cap \"mattered for q21\", so the value was picked against this benchmark. q09, the query that gained, runs at about 4.6 bits/key and would qualify under almost any cap. Just above the cap, the old hashed BF is used unchanged, so only performance is affected, never correctness.\n- **2048** in TemplatedCheckStatisticsExact (bloom_filter.cpp `if (range > 2048)`): the author says it matches the existing hashed CheckStatistics probe limit (\"as before\"), so it is inherited, not new. Zone ranges above 2048 get only the range-overlap test.",
+    "natural_class": "Any equality hash join on a surrogate or integer key (INT, BIGINT, SMALLINT, DATE, small DECIMAL) where:\n- the build side is filtered;\n- the probe side is larger;\n- the surviving build keys span a range no more than about 128x the build row count;\n- the perfect-hash-join path was not taken (for example because build keys repeat or the range is too large for a PHT).\n\nThis is the common star or snowflake pattern of a filtered dimension joined to a fact table on a dense id. Examples:\n- `SELECT sum(s.amount) FROM sales s JOIN products p ON s.product_id = p.id WHERE p.category = 'Toys';` (p.id is a dense INTEGER sequence).\n- `SELECT e.user_id, count(*) FROM events e JOIN sessions x ON e.session_id = x.session_id WHERE x.started_at > now() - INTERVAL 1 DAY GROUP BY 1;` (session_id is a BIGINT identity, and recent sessions form a dense range).\n\nNot covered: string or UUID keys, UINT64 or HUGEINT keys, sparse or hashed ids, and the non-first keys of multi-key joins.",
+    "fallback": "If any trigger condition fails, TrySetExactBloomFilterRange returns without calling SetKeyRange. `exact` stays false, and Initialize, InsertHashes, Filter, FilterValue and CheckStatistics all take the original hashed-BF branches, which the diff leaves unchanged apart from being nested under `else` (bloom_filter.cpp:24-30; join_hashtable.cpp:721-727; the Filter else-branch).\n\nOne new failure mode exists: if a build key falls outside the recorded min/max, InsertKeys throws `InternalException(\"BloomFilter: exact key out of range\")` instead of degrading gracefully.\n\nThe author's own tests did not exercise the exact path with NULL or negative keys (their EXPLAIN ANALYZE showed no BF on the probe scan), so those cases were never run.",
+    "label": "heuristic",
+    "label_reason": "The technique is standard and principled: an exact bitmap or range filter for dense integer keys, as used in perfect hashing and bitmap semi-join filters. It applies to a broad, natural class of joins on integer and surrogate keys, with no references to TPC-H schema, columns or literals. However, the gate that decides when it beats the hashed filter is a density cap of 128 bits/key. That cap is unprincipled, and the author says a sibling run tuned it against q21. It also lets the exact bitmap grow several times larger than the hashed BF it replaces, which works against the stated footprint rationale. A small cap derived from the hashed BF's bits/key, or a cache-size bound, would be more defensible. The mechanism is likely acceptable upstream with a different constant, so this is \"heuristic\" rather than \"general\".",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:956 \"if (!has_cast && is_first_key && ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable))\"",
+      "src/execution/operator/join/physical_hash_join.cpp:961 \"TrySetExactBloomFilterRange(*ht, condition_type, final_min_max->data[min_idx].GetValue(0), ...)\"",
+      "src/execution/operator/join/physical_hash_join.cpp:769 \"if (is_perfect_hashtable) { return false; }\"",
+      "src/execution/operator/join/physical_hash_join.cpp:785 \"return can_use_bf && build_side_has_filter && probe_larger_then_build;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:846 \"static constexpr uint64_t MAX_EXACT_BITS_PER_KEY = 128;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:847 \"static constexpr uint64_t MAX_EXACT_RANGE = (1ULL << 31);\"",
+      "src/execution/operator/join/physical_hash_join.cpp (TrySetExactBloomFilterRange) \"if (build_type.InternalType() != probe_type.InternalType() || min_val.type() != build_type ...\"",
+      "src/execution/operator/join/physical_hash_join.cpp (TrySetExactBloomFilterRange) \"if (range >= MAX_EXACT_RANGE || range / MAX_EXACT_BITS_PER_KEY >= ht.Count()) return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:815-841 GetExactBloomFilterKey \"case PhysicalType::UINT32: ... default: return false;\"",
+      "src/planner/filter/bloom_filter.cpp:7-9 \"MAX_NUM_SECTORS = (1ULL << 26); MIN_NUM_BITS_PER_KEY = 12; MIN_NUM_BITS = 512\"",
+      "src/planner/filter/bloom_filter.cpp:24-26 \"if (exact) { num_sectors = (key_range >> LOG_SECTOR_SIZE) + 1; }\"",
+      "src/planner/filter/bloom_filter.cpp TemplatedInsertKeys \"throw InternalException(\\\"BloomFilter: exact key out of range\\\")\"",
+      "src/planner/filter/bloom_filter.cpp TemplatedCheckStatisticsExact \"if (max < key_min || min > key_max) return FILTER_ALWAYS_FALSE; ... if (range > 2048)\"",
+      "src/include/duckdb/planner/filter/bloom_filter.hpp LookupKey \"return offset <= key_range && (bf[offset >> 6] >> (offset & 63)) & 1;\"",
+      "src/execution/join_hashtable.cpp:721 \"if (bloom_filter.IsExact()) { ... data_collection->Gather(... 0, key_v ...); bloom_filter.InsertKeys(key_v, count);\""
+    ]
+  },
+  "audit_cost_usd": 0.23677579999999998
+}

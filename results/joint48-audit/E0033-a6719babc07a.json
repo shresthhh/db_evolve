@@ -1,0 +1,50 @@
+{
+  "id": "E0033",
+  "sha": "a6719babc07ae26c30f7906b01fbb89b61303cc3",
+  "subject": "E0033: Clustered-key radix agg: skip finalize combine for interval-disjoint groups",
+  "files": [
+    "src/execution/radix_partitioned_hashtable.cpp"
+  ],
+  "static": {
+    "added_lines": 305,
+    "removed_lines": 4,
+    "conditions": 48,
+    "numeric_constants": [
+      "1048576"
+    ],
+    "string_literals": [
+      "\"duckdb/planner/expression/bound_aggregate_expression.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0131017628414227,
+  "accepted_faster": {
+    "q05": 1.05,
+    "q18": 1.17
+  },
+  "audit": {
+    "mechanism": "In the parallel radix hash aggregate, each thread checks every input chunk to see whether the first group key is non-NULL and non-decreasing. If it is, rows whose key equals the chunk's first or last key go to a small per-thread \"boundary\" hash table, and the contiguous rows strictly between those keys go to the main hash table. The thread also records each chunk's open key interval. At finalize, if all interior intervals across all threads are pairwise disjoint and no boundary key falls strictly inside any interval, every interior group is known to exist in exactly one thread's table. The main partitions are then marked READY_TO_SCAN with no cross-thread combine, the same way the existing single-thread path works. Only the small boundary partitions go through the normal combine. This exploits physical clustering of the input on the group key and verifies it at runtime, so it does not depend on query shape.",
+    "trigger": "Global gate (constructor): `number_of_threads > 1 && !radix_ht.grouping_set.empty()`. The leading group column's physical type must be one of INT8/16/32/64 or UINT8/16/32/64, which sets `clustered_enabled = true`. Any DISTINCT aggregate disables it: `if (aggregate->Cast<BoundAggregateExpression>().IsDistinct()) clustered_enabled = false`.\n\nPer chunk, inside SinkClustered:\n- it returns false if `count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= MAX_CLUSTERED_CHUNKS`;\n- it fails on any NULL in key 0 (`!format.validity.RowIsValid(...)) return false`);\n- it fails on any decrease (`if (cur < prev) return false`).\n\nAny failure sets the global `any_unclustered = true`, so every thread stops splitting for the rest of the query. The path is also abandoned when adaptive lookup-skipping turns on (`hll_percentage > SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD` \u2192 `ht.SkipLookups(); ... gstate.any_unclustered = true`), which happens when keys are about 95% unique after 1M sunk rows.\n\nFinalize fast path: `gstate.uncombined_data && !gstate.external && !gstate.any_unclustered && ClusteredIntervalsDisjoint(...)`. That function returns false if `intervals[i-1].second > intervals[i].first` for the sorted intervals, or if any boundary key satisfies `it->first < key && key < it->second`.",
+    "constants": "- **MAX_CLUSTERED_CHUNKS = 1048576** (a per-thread chunk cap, line 431). This is a memory bound on the interval and key vectors (about 1M \u00d7 2048 rows \u2248 2 billion rows per thread), not a value sized to TPC-H. Above it, the thread falls back and switches the path off globally, so the result is still correct and the cost goes back to the old combine.\n- **STANDARD_VECTOR_SIZE**: the engine's vector size. Chunks larger than it are never produced in normal execution.\n- **0.95 (SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD)** and **1048576 (ADAPTIVITY_THRESHOLD)**: pre-existing DuckDB constants that the patch reuses. Their effect is that a clustered but nearly unique key, such as grouping on a sorted primary key, ends up on the old path.\n- **\"Number of threads > 1\"**: there is nothing to save with one thread, because the existing single_ht path already skips the combine.\n- **Integer-only key types**: needed so the order-preserving uint64 encoding works (sign-bit flip for signed types).\n\nNone of these values looks tuned to TPC-H sizes. Just outside the gates, a single unsorted or NULL-keyed chunk or an overlap at finalize gives the old full combine, plus the small cost of repartitioning the boundary data.",
+    "natural_class": "Any multi-threaded GROUP BY whose first group key is an integer column, where the scanned input arrives (per chunk, and across threads' morsels) in non-decreasing order of that key. This holds for tables loaded or inserted in key order: auto-increment ids, order or line-item style parent\u2013child tables, and time-bucketed integer ids. Groups must have duplicates (not more than 95% unique) and there must be no DISTINCT aggregates.\n\nExamples:\n- `SELECT invoice_id, sum(amount), count(*) FROM invoice_lines GROUP BY invoice_id;` where invoice_lines was bulk-loaded ordered by invoice_id.\n- `SELECT session_id, min(ts), max(ts), count(*) FROM clickstream GROUP BY session_id HAVING count(*) > 10;` where clickstream was written in session_id order.\n\nThese do not qualify:\n- a leading VARCHAR, DATE or HUGEINT key;\n- input that is unordered, for example after a hash join that reorders the probe side or after a shuffle;\n- a GROUP BY where the clustered column is not the first group column.\n\nIn TPC-H the beneficiary is essentially q18's `GROUP BY l_orderkey` over lineitem, which is stored in orderkey order.",
+    "fallback": "When the gate fails in the constructor or a thread's first chunk is unsorted, Sink calls `ht.AddChunk(group_chunk, payload_input, filter)` exactly as before. The only cost is one O(n) scan of key 0 per chunk until the first failure, after which the path is off globally.\n\nIf splitting ran but the finalize check fails (overlapping intervals, a boundary key inside an interval, a spill, or a later fallback), the boundary data is repartitioned to the main data's radix bits. It is then merged with `uncombined_data.Combine(*gstate.boundary_data)`, and the old full-combine path runs unchanged. The work spent splitting is lost in that case, but results are correct. The external (spilled) case always falls back. The author says this case was not tested.",
+    "label": "general",
+    "label_reason": "The technique is principled: skip the parallel combine when runtime checks prove that per-thread groups are key-disjoint. Correctness rests on a checked invariant (disjoint open intervals, with the shared end keys handled separately), not on assumptions about the schema or the query. The constants are either memory caps, the engine's vector size, or existing DuckDB adaptivity thresholds; none look tuned to TPC-H scale. The trigger is a natural data property, clustering on an integer leading group key, that is common in real data loaded in key order.\n\nCaveats:\n- It only fires for the first group column and only for integer types.\n- It is fragile: one unsorted chunk anywhere disables it globally, and nearly unique clustered keys fall back through lookup-skipping.\n- In this benchmark it helps essentially one query (q18).\n\nThese limit how far it reaches, but they do not make it a benchmark branch.",
+    "citations": [
+      "src/execution/radix_partitioned_hashtable.cpp:238 `if (number_of_threads > 1 && !radix_ht.grouping_set.empty()) {`",
+      "src/execution/radix_partitioned_hashtable.cpp:254 `if (aggregate->Cast<BoundAggregateExpression>().IsDistinct()) {`",
+      "src/execution/radix_partitioned_hashtable.cpp:431 `static constexpr idx_t MAX_CLUSTERED_CHUNKS = 1048576;`",
+      "src/execution/radix_partitioned_hashtable.cpp:481 `SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD = 0.95;`",
+      "src/execution/radix_partitioned_hashtable.cpp:503 `ht.SkipLookups();` followed by `gstate.any_unclustered = true;`",
+      "src/execution/radix_partitioned_hashtable.cpp:626 `if (!format.validity.RowIsValid(sel.get_index(i))) { return false;`",
+      "src/execution/radix_partitioned_hashtable.cpp:638 `if (cur < prev) { return false; }`",
+      "src/execution/radix_partitioned_hashtable.cpp:662 `if (count > STANDARD_VECTOR_SIZE || lstate.intervals.size() >= RadixHTLocalSinkState::MAX_CLUSTERED_CHUNKS) {`",
+      "src/execution/radix_partitioned_hashtable.cpp:713 `if (first_end == count) { // A single key: everything is boundary`",
+      "src/execution/radix_partitioned_hashtable.cpp:752 `static bool ClusteredIntervalsDisjoint(...)`",
+      "src/execution/radix_partitioned_hashtable.cpp:755 `if (intervals[i - 1].second > intervals[i].first) { return false;`",
+      "src/execution/radix_partitioned_hashtable.cpp:787 `lstate.clustered = gstate.clustered_enabled && !gstate.any_unclustered;`",
+      "src/execution/radix_partitioned_hashtable.cpp:915 `clustered_disjoint = gstate.uncombined_data && !gstate.external && !gstate.any_unclustered && ClusteredIntervalsDisjoint(...)`",
+      "src/execution/radix_partitioned_hashtable.cpp:945 `(!gstate.external && gstate.active_threads == 1 && gstate.number_of_threads == 1) || clustered_disjoint;`"
+    ]
+  },
+  "audit_cost_usd": 0.23136600000000002
+}

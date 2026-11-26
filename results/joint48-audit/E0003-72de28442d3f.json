@@ -1,0 +1,51 @@
+{
+  "id": "E0003",
+  "sha": "72de28442d3f7bdce9070be47c48d77e509a2789",
+  "subject": "E0003: Perfect hash join for RIGHT joins v2 (all 3 gates)",
+  "files": [
+    "src/execution/operator/join/perfect_hash_join_executor.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/execution/operator/join/perfect_hash_join_executor.hpp",
+    "src/optimizer/join_filter_pushdown_optimizer.cpp"
+  ],
+  "static": {
+    "added_lines": 68,
+    "removed_lines": 6,
+    "conditions": 11,
+    "numeric_constants": [
+      "4194304"
+    ],
+    "string_literals": []
+  },
+  "accepted_gain": 1.0039547522883472,
+  "accepted_faster": {
+    "q13": 1.22
+  },
+  "audit": {
+    "mechanism": "DuckDB's perfect hash join is a direct-addressed array indexed by key minus min. It used to handle only INNER joins, and this change lets RIGHT joins use it too. These are the joins where the build side is preserved, e.g. a LEFT JOIN flipped so the preserved table is the build side. While probing, the engine sets a byte in a per-slot array for each matched build slot. Before the outer scan starts, FlushFoundMatch copies those flags into the regular hash table's found_match field. The existing unmatched-row scan then emits the build rows that never matched, unchanged. NULL build keys are left out of the perfect table but stay in the HT, so they come out as unmatched. The change also adds a second, larger size limit: for build-preserving joins only, a key range up to 4M (instead of 1M) is allowed if the keys fill at least half of it. It also fixes an off-by-one in the duplicate check, so a fully dense key set now qualifies.",
+    "trigger": "All of the following must hold:\n- The join is INNER or RIGHT, with exactly one equality condition on an integer key: `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1 || ... != COMPARE_EQUAL || !TypeIsInteger(...)` \u2192 bail (perfect_hash_join_executor.cpp:74-75).\n- The optimizer now computes min/max aggregates for RIGHT joins: `(join.join_type == JoinType::INNER || join.join_type == JoinType::RIGHT) && join.conditions.size() == 1 && ... COMPARE_EQUAL && TypeIsIntegral(...)` (join_filter_pushdown_optimizer.cpp:275-279).\n- The build side has no nested types (perfect_hash_join_executor.cpp:80-89).\n- Min and max are not NULL: `if (min.IsNull() || max.IsNull()) return false;` (perfect_hash_join_executor.cpp:92-94).\n- Range limits:\n  - `build_range > MAX_DENSE_BUILD_SIZE (4194304)` \u2192 bail (perfect_hash_join_executor.cpp:115-117).\n  - Above `MAX_BUILD_SIZE (1048576)`, the join must propagate the build side and be at least half full: `build_range > MAX_BUILD_SIZE && (!PropagatesBuildSide(op.join_type) || ht.Count() * 2 < build_range + 1)` \u2192 bail (perfect_hash_join_executor.cpp:120-123). In practice only RIGHT passes, since the type check above rejects the other build-propagating types.\n- No duplicates: `ht.Count() > build_range + 1` \u2192 bail (perfect_hash_join_executor.cpp:126). The later full scan of the HT still has to confirm the keys are unique (BuildPerfectHashTable, physical_hash_join.cpp:1008).\n- Match tracking runs only when `PropagatesBuildSide(join.join_type)` (perfect_hash_join_executor.cpp:178). The flush happens in `HashJoinGlobalSourceState::Initialize` when `sink.perfect_join_executor` is set (physical_hash_join.cpp:1270-1273).",
+    "constants": "- **MAX_BUILD_SIZE = 1048576 (2^20).** This is upstream's existing limit and is unchanged for INNER joins.\n- **MAX_DENSE_BUILD_SIZE = 4194304 (2^22).** This is a new, round power of two with no hardware or literature basis. The author says it was chosen so that q13 would take the path: \"q13's key range is 1.5M, so with the cap untouched the fast path never fires\". At SF10, customer keys span 1\u20131.5M. Any value from about 1.5M upward would have worked; 4M is arbitrary headroom.\n- **Fill factor of 1/2 (`ht.Count() * 2 < build_range + 1`).** This is a principled bound: the array is at most about twice the row count, so memory stays comparable to the regular HT. TPCH customer keys are 100% dense, so it passes easily.\n- **What happens just outside the limits:**\n  - A RIGHT join with a range between 1M and 4M but under 50% fill uses the regular hash join, as do INNER joins with a range above 1M. Restricting the larger limit to RIGHT joins is itself an empirical patch. When the author allowed it for INNER joins, q14 got 52% slower and q18 13% slower, because the perfect build is serial and turns off the Bloom filter. Those costs apply to large RIGHT joins too, so a RIGHT join with a small probe side and a 1\u20134M dense build could regress. The author admits this.\n  - The boundary is defined by join type, not by build or probe cardinality.\n- **The `+1` in the duplicate check** is an off-by-one fix: a range of max\u2212min contains max\u2212min+1 keys. It is general.",
+    "natural_class": "Two groups of queries take the new path:\n- **Any RIGHT join with a dense, duplicate-free integer key whose range is at most 1M.** This mostly means LEFT JOINs from a small dimension to a larger fact table, which DuckDB flips so the dimension becomes the build side. This part is broad and natural. Example:\n  ```sql\n  SELECT d.dept_id, d.name, count(e.emp_id) FROM departments d LEFT JOIN employees e ON e.dept_id = d.dept_id GROUP BY ALL;\n  ```\n  Here `departments` (ids 1..500) is the build side and the join is executed as RIGHT.\n- **Ranges of 1M\u20134M at least half full.** These are RIGHT joins on surrogate-key dimensions of roughly 0.5M\u20134M rows. Example:\n  ```sql\n  SELECT u.user_id, count(s.session_id) FROM users u LEFT JOIN sessions s ON s.user_id = u.user_id GROUP BY u.user_id;\n  ```\n  Here `users` has 2M dense ids. The 4M limit lets this query in, and q13 depends on it.\n\nNeither query is from TPCH.",
+    "fallback": "If the trigger fails, CanDoPerfectHashJoin or BuildPerfectHashTable returns false. `sink.perfect_join_executor.reset()` then runs and the regular parallel hash join is scheduled (physical_hash_join.cpp:1016-1019). Plain INNER joins behave as before, apart from the `+1` duplicate fix and the NULL min/max guard. FlushFoundMatch returns immediately when `slot_found_match` is null (perfect_hash_join_executor.cpp:334-335). The outer SCAN_HT scan is unchanged.",
+    "label": "heuristic",
+    "label_reason": "The core change is a general, standard technique. It extends direct-addressed (perfect) hash joins to outer joins that preserve the build side, using per-slot match flags written back to the HT. It applies to any RIGHT or flipped-LEFT join on a dense integer key up to 1M, and it includes a real off-by-one fix. The win on this benchmark (q13), however, comes almost entirely from the second limit, MAX_DENSE_BUILD_SIZE = 4M. The author picked it because q13's 1.5M customer key range didn't fit under 1M. They limited it to RIGHT joins only after measuring regressions on q14 and q18 under INNER. The 50% fill factor is principled. But the decision of who gets the large range uses join type as a proxy for \"probe is big enough to pay for the serial build\" and was tuned against the benchmark's regressions. Upstream would likely accept the RIGHT-join support and might want a cardinality-based gate instead of the 4M constant.",
+    "citations": [
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:74 `(op.join_type != JoinType::INNER && op.join_type != JoinType::RIGHT) || op.conditions.size() != 1`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:92 `if (min.IsNull() || max.IsNull()) { return false; // e.g., only NULL keys`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:115 `static constexpr idx_t MAX_DENSE_BUILD_SIZE = 4194304;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:120 `build_range > MAX_BUILD_SIZE && (!PropagatesBuildSide(op.join_type) || ht.Count() * 2 < perfect_join_statistics.build_range + 1)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:126 `if (ht.Count() > perfect_join_statistics.build_range + 1)`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:178 `if (PropagatesBuildSide(join.join_type)) { slot_found_match = make_unsafe_uniq_array<uint8_t>(build_size);`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:246 `if (!vector_data.validity.RowIsValid(data_idx)) { continue;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:309 `found_match[state.build_sel_vec.get_index(i)] = 1;`",
+      "src/execution/operator/join/perfect_hash_join_executor.cpp:333 `void PerfectHashJoinExecutor::FlushFoundMatch() ... Store<bool>(true, addresses[...] + ht.tuple_size);`",
+      "src/execution/operator/join/physical_hash_join.cpp:1270 `if (sink.perfect_join_executor) { sink.perfect_join_executor->FlushFoundMatch();`",
+      "src/execution/operator/join/physical_hash_join.cpp:1016 `if (!use_perfect_hash) { sink.perfect_join_executor.reset();`",
+      "src/optimizer/join_filter_pushdown_optimizer.cpp:275 `(join.join_type == JoinType::INNER || join.join_type == JoinType::RIGHT) && join.conditions.size() == 1`",
+      "src/common/enums/join_type.cpp:14 `PropagatesBuildSide ... OUTER || RIGHT || RIGHT_ANTI || RIGHT_SEMI`",
+      ".dbe/review/issue.md: `q13's key range is 1.5M, so with the cap untouched the fast path never fires`",
+      ".dbe/review/issue.md: `First version allowed the 4M range for INNER joins too: q14 +52%, q18 +13..16%`"
+    ]
+  },
+  "audit_cost_usd": 0.197522
+}

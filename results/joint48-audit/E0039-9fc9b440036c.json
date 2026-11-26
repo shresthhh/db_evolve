@@ -1,0 +1,53 @@
+{
+  "id": "E0039",
+  "sha": "9fc9b440036c6bf24760e655d58cf6636c4bd561",
+  "subject": "E0039: Huge pages for large join tables v2: HJ pointer table >=8MB + perfect-HJ slot arrays",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/include/duckdb/common/huge_page_util.hpp",
+    "src/include/duckdb/execution/join_hashtable.hpp"
+  ],
+  "static": {
+    "added_lines": 134,
+    "removed_lines": 7,
+    "conditions": 9,
+    "numeric_constants": [
+      "128"
+    ],
+    "string_literals": [
+      "\"/sys/kernel/mm/transparent_hugepage/enabled\"",
+      "\"[always]\"",
+      "\"[madvise]\"",
+      "\"duckdb/common/constants.hpp\"",
+      "\"duckdb/common/huge_page_util.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0211583758451757,
+  "accepted_faster": {
+    "q03": 1.06,
+    "q09": 1.12
+  },
+  "audit": {
+    "mechanism": "When a hash join's pointer table (the ht_entry_t bucket array, probed randomly) would be 8MB or larger, the engine now allocates 2MB extra, aligns the start of the array to a 2MB boundary and calls madvise(MADV_HUGEPAGE) on it before InitializePointerTable first touches it. The kernel can then back the table with transparent huge pages, which cuts TLB misses and page walks on random build and probe accesses. When the table is freed (destructor, Reset, or grow), the range gets MADV_DONTNEED followed by MADV_NOHUGEPAGE, so recycled allocator memory loses the advice. The grow path now frees the old table before allocating the new one. Despite the title, nothing changed for the perfect hash join: the author's notes say that part was dropped.",
+    "trigger": "The new path runs in JoinHashTable::AllocatePointerTable for every hash join (any join type, any key types) when `HugePageUtil::ShouldUse(table_size)` holds (src/execution/join_hashtable.cpp:145). ShouldUse is `size >= MIN_ARRAY_SIZE && Enabled()` (huge_page_util.hpp:37-38), and `MIN_ARRAY_SIZE = 8ULL * 1024ULL * 1024ULL` (huge_page_util.hpp:29). table_size is `new_capacity * sizeof(ht_entry_t)`, and capacity is `NextPowerOfTwo(count * load_factor)` with a minimum of 16384 (join_hashtable.hpp:425-427). With 8-byte entries this means capacity >= 2^20 slots, i.e. more than about 262K build rows at the default load factor of 2.0, or more than about 350K at the external load factor of 1.5. Enabled() requires Linux and that /sys/kernel/mm/transparent_hugepage/enabled reads `[madvise]` or `[always]` (huge_page_util.hpp:83). There are no tests on plan shape, schema or data type.",
+    "constants": "HUGE_PAGE_SIZE = 2MB (huge_page_util.hpp:27) is the x86-64 hardware size for transparent huge pages. It sets both the alignment and the over-allocation slack. MIN_ARRAY_SIZE = 8MB (huge_page_util.hpp:29) is roughly where a randomly probed array outgrows the TLB's reach with 4KB pages (the L2 TLB has about 1.5-2K entries, covering 6-8MB), so it has a hardware basis. It was also tuned against this workload, though: the author lowered it from 32MB in v1 to 8MB and checked q16 and q09 at each setting. Because capacity is a power of two, the cut falls exactly between 4MB tables (512K slots) and 8MB tables (1M slots). Just below it, a 4MB table uses the old allocation unchanged and loses at most a small TLB benefit. Just above it, the cost is 2MB of extra virtual allocation plus a few madvise calls, which is negligible next to 8MB. The slack is in virtual address space, and memory the kernel actually commits depends on how the allocator and THP handle it.",
+    "natural_class": "Any hash join whose build side has more than about 262K rows, on Linux with THP set to madvise or always. This covers fact-to-dimension joins with large dimensions, self-joins, and semi/anti joins with large build sides. Example 1: `SELECT o.user_id, count(*) FROM events e JOIN sessions s ON e.session_id = s.id GROUP BY 1;` with 5M sessions on the build side. Example 2: `SELECT * FROM clicks c WHERE c.ad_id NOT IN (SELECT ad_id FROM blocked_ads);` with blocked_ads holding 1M rows, which gives a large build-side pointer table for the anti join.",
+    "fallback": "If the table is under 8MB, or THP is unavailable or disabled, or the platform isn't Linux, the table is allocated exactly as before: `hash_map = buffer_manager.GetBufferAllocator().Allocate(table_size)` with entries = hash_map.get() (join_hashtable.cpp:153). Two small changes apply to every table: the reuse check now uses HashMapCapacity(), which subtracts the slack only when the flag is set, and the grow path frees the old table before allocating the new one, which lowers peak memory.",
+    "label": "general",
+    "label_reason": "Backing large, randomly accessed hash tables with 2MB-aligned transparent huge pages is a standard, principled technique for reducing TLB misses. The only gate is the table's byte size (8MB, about where TLB reach with 4KB pages runs out) plus an OS capability check. It doesn't look at schema, plan shape or query. The 8MB value was adjusted from 32MB while watching TPC-H results, but it is a single conservative size cut-off with a hardware rationale, and missing it on either side costs almost nothing. So it is not a disguised branch for benchmark queries. One caveat: the measured gains (about 7-9% on q09) are close to the noise level, and the result depends on the host's THP setting.",
+    "citations": [
+      "src/include/duckdb/common/huge_page_util.hpp:27 \"HUGE_PAGE_SIZE = 2ULL * 1024ULL * 1024ULL\"",
+      "src/include/duckdb/common/huge_page_util.hpp:29 \"MIN_ARRAY_SIZE = 8ULL * 1024ULL * 1024ULL\"",
+      "src/include/duckdb/common/huge_page_util.hpp:37 \"return size >= MIN_ARRAY_SIZE && Enabled();\"",
+      "src/include/duckdb/common/huge_page_util.hpp:56 \"madvise(ptr, advised_size, MADV_HUGEPAGE);\"",
+      "src/include/duckdb/common/huge_page_util.hpp:83 \"strstr(buffer, \\\"[madvise]\\\") ... \\\"[always]\\\"\"",
+      "src/execution/join_hashtable.cpp:145 \"if (HugePageUtil::ShouldUse(table_size)) {\"",
+      "src/execution/join_hashtable.cpp:147 \"Allocate(table_size + HugePageUtil::HUGE_PAGE_SIZE)\"",
+      "src/execution/join_hashtable.cpp:153 \"hash_map = buffer_manager.GetBufferAllocator().Allocate(table_size);\"",
+      "src/execution/join_hashtable.cpp:835 \"AllocateHashMap(capacity);\"",
+      "src/execution/join_hashtable.cpp:1702 \"FreeHashMap();\"",
+      "src/include/duckdb/execution/join_hashtable.hpp:426 \"NextPowerOfTwo(LossyNumericCast<idx_t>(static_cast<double>(count) * load_factor))\""
+    ]
+  },
+  "audit_cost_usd": 0.1530498
+}

@@ -1,0 +1,56 @@
+{
+  "id": "E0008",
+  "sha": "f3239195db92fccd7fb0c344e2aa0b6a04be2ed8",
+  "subject": "E0008: Contains-filter scan selectivity to flip q09 build sides at SF10",
+  "files": [
+    "src/optimizer/join_order/relation_statistics_helper.cpp"
+  ],
+  "static": {
+    "added_lines": 47,
+    "removed_lines": 3,
+    "conditions": 9,
+    "numeric_constants": [
+      "0.2"
+    ],
+    "string_literals": [
+      "\"contains\"",
+      "\"duckdb/planner/filter/expression_filter.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0305161810147017,
+  "accepted_faster": {
+    "q09": 1.61
+  },
+  "alone": {
+    "geomean": 1.0157139924179632,
+    "faster": {
+      "q03": 1.09,
+      "q09": 1.58
+    },
+    "slower": {
+      "q10": 0.92
+    }
+  },
+  "audit": {
+    "mechanism": "When the join-order optimizer estimates a base table scan's cardinality and finds no equality-filter estimate from statistics, it normally assumes the pushed-down filters keep 20% of rows (DEFAULT_SELECTIVITY = 0.2). With this change, if any non-optional pushed-down filter on that scan is `contains(col, '<literal of at least 3 bytes>')`, or an AND that includes one, it assumes 4% (0.2 \u00d7 0.2) instead. Only the cardinality estimate changes. Execution is unchanged, but the lower estimate can change the join order and which side builds the hash table. In q09 it shrinks the `part` estimate about 5\u00d7, which flips the build sides.",
+    "trigger": "All of the following must hold, all inside RelationStatisticsHelper::ExtractGetStats for a LogicalGet:\n(1) The scan has pushed-down table filters: `if (!get.table_filters.filters.empty())` (relation_statistics_helper.cpp:158).\n(2) At least one of those filters is not an OPTIONAL_FILTER and `IsContainsFilter(*it.second)` returns true (:180-184).\n(3) IsContainsFilter matches only an EXPRESSION_FILTER whose expression is a BOUND_FUNCTION with `func.function.name != \"contains\" || func.children.size() != 2` false (:75). The second child must be a BOUND_CONSTANT (:79). It must be a non-NULL VARCHAR, `value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR` (:83), and `StringValue::Get(value).size() >= CONTAINS_MIN_LITERAL_LENGTH` (:86, constant = 3 bytes). It also recurses into CONJUNCTION_AND children. It does not look inside NOT, OR, or any other wrapper. So `NOT LIKE '%x%'` (which becomes NOT(contains)) and multi-wildcard LIKE patterns are not matched.\n(4) Statistics produced no equality-based reduction: `bool has_equality_filter = (cardinality_after_filters != base_table_cardinality); if (!has_equality_filter && has_non_optional_filters)` (:189-190).\n`col LIKE '%abc%'` is rewritten to contains() by like_optimizations.cpp:135-137 (\"Contains LIKE pattern: [%]+[^%_]*[%]+\"), so the usual SQL spelling triggers it too. If this rewrite runs after filter pushdown, the expression is already `contains`. In TPCH only q09 (`p_name LIKE '%green%'`) meets this. q13's '%special%requests%' is not a single-substring pattern, and q16's NOT LIKE is wrapped in NOT.",
+    "constants": "CONTAINS_SELECTIVITY = DEFAULT_SELECTIVITY * 0.2 = 0.04 (:64), \"Substring containment filters with a non-trivial literal are typically far more selective than other filters\". The 0.2 multiplier comes from no model, paper or measurement; it is a hand-picked factor. Coincidentally, the true selectivity of '%green%' on TPCH p_name is about 5%: 5 words drawn from 92 colours. So 0.04 sits close to this workload's actual value, and it is exactly enough to flip q09's build sides at SF10. The author's notes say 0.2 alone did not flip the plan at SF1 (E0002). The constant is not tied to string length, column statistics or data. A needle that matches 90% of rows gets the same 4%, and the larger misestimate could pick a bad build side.\nCONTAINS_MIN_LITERAL_LENGTH = 3 bytes (:65). This is an arbitrary guard against short, common needles. With a 2-byte needle such as contains(x,'ab') or LIKE '%ab%', the estimate falls back to 20%. The length is counted in bytes, so a single 3-byte UTF-8 character qualifies.\nThe trigger is a step: one qualifying filter anywhere in an AND, or on any column, switches the whole scan from 0.2 to 0.04. Several such filters do not compound.",
+    "natural_class": "Any scan with a selective substring predicate (single-substring LIKE '%\u2026%' or contains()) whose literal is at least 3 bytes, where no equality filter already reduced the estimate, and which takes part in a join whose order or build side depends on that scan's estimate. This is a common pattern in log, product and text search. Examples outside TPCH:\n`SELECT u.name, count(*) FROM events e JOIN users u ON e.user_id = u.id WHERE u.email LIKE '%@example.org%' GROUP BY u.name;`\n`SELECT p.title, sum(s.qty) FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id WHERE contains(p.description, 'waterproof') AND p.price > 10 GROUP BY p.title;`\nBoth would get a 4% estimate for the filtered dimension instead of 20%, making it more likely to be the build side.",
+    "fallback": "If no qualifying contains filter is present, the code computes exactly the old value: `has_contains_filter ? CONTAINS_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY` (:191-194) reduces to the original `base * DEFAULT_SELECTIVITY` with a floor of 1. If an equality filter already lowered the estimate, the contains flag is ignored. Execution operators are not touched.",
+    "label": "heuristic",
+    "label_reason": "The idea is principled and general in kind: give substring-containment predicates a lower default selectivity than the generic 20%. It is purely an estimate change, it is not tied to TPCH table or column names, and it fires for any single-substring LIKE or contains() with a literal of 3 or more bytes. That is a broad, natural class. However, both constants (\u00d70.2 giving 0.04, and the 3-byte minimum) are hand-picked and unvalidated. 0.04 lands close to the real selectivity of '%green%' in TPCH, and it was chosen after the previous attempt at SF1 failed to flip q09's plan. In this benchmark the rule fires only for q09. Upstream would plausibly accept something like it, perhaps with a different constant or a length-scaled model. It is a default-selectivity heuristic tuned to flip one benchmark plan, not a statistics-based estimate.",
+    "citations": [
+      "src/optimizer/join_order/relation_statistics_helper.cpp:64 \"static constexpr double CONTAINS_SELECTIVITY = RelationStatisticsHelper::DEFAULT_SELECTIVITY * 0.2;\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:65 \"static constexpr idx_t CONTAINS_MIN_LITERAL_LENGTH = 3;\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:75 \"if (func.function.name != \\\"contains\\\" || func.children.size() != 2)\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:83 \"if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR)\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:86 \"return StringValue::Get(value).size() >= CONTAINS_MIN_LITERAL_LENGTH;\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:180-184 \"if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) { ... if (IsContainsFilter(*it.second)) { has_contains_filter = true;\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:189-190 \"bool has_equality_filter = (cardinality_after_filters != base_table_cardinality); if (!has_equality_filter && has_non_optional_filters)\"",
+      "src/optimizer/join_order/relation_statistics_helper.cpp:191-194 \"has_contains_filter ? CONTAINS_SELECTIVITY : RelationStatisticsHelper::DEFAULT_SELECTIVITY;\"",
+      "src/include/duckdb/optimizer/join_order/relation_statistics_helper.hpp:57 \"static constexpr double DEFAULT_SELECTIVITY = 0.2;\"",
+      "src/optimizer/rule/like_optimizations.cpp:135-137 \"} else if (PatternIsContains(patt_str)) { // Contains LIKE pattern: [%]+[^%_]*[%]+ ... GetStringContains()\""
+    ]
+  },
+  "audit_cost_usd": 0.21388939999999995
+}

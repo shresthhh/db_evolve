@@ -1,0 +1,52 @@
+{
+  "id": "E0034",
+  "sha": "95b3104ecc4ac63ef6508038d38e362d3e9c1ddb",
+  "subject": "E0034: Partition-staged sink for large perfect hash aggregate",
+  "files": [
+    "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp"
+  ],
+  "static": {
+    "added_lines": 202,
+    "removed_lines": 7,
+    "conditions": 17,
+    "numeric_constants": [],
+    "string_literals": [
+      "\"duckdb/common/mutex.hpp\"",
+      "\"duckdb/common/optional_ptr.hpp\""
+    ]
+  },
+  "accepted_gain": 1.0195542646630473,
+  "accepted_faster": {
+    "q13": 1.19,
+    "q14": 1.06
+  },
+  "audit": {
+    "mechanism": "This applies to \"large\" perfect hash aggregates, the lazily initialised direct-indexed table from earlier commits. In that mode each thread used to scatter every row into its own private table of up to 2^22 slots, and the private tables were merged stripe by stripe at Combine. Now each thread computes slot indices, counting-sorts each input chunk by 2^16-slot stripe, and copies the payload rows into small per-stripe staging buffers (up to 4 \u00d7 STANDARD_VECTOR_SIZE rows per stripe). When a stripe's buffers are full, the thread takes that stripe's lock and applies them directly to the shared global table, so the private tables are never written and the striped combine is skipped. It is a standard cache-conscious, radix-partitioned buffering technique applied to a shared, lock-striped direct-mapped aggregate table.",
+    "trigger": "The new path needs all of the following.\n\n(1) The planner picked a large perfect HA: every group key is an integer type with min/max stats, and the total key bits exceed `perfect_ht_threshold` (default 12) but stay within `LARGE_PERFECT_HT_MAX_BITS = 22` (plan_aggregate.cpp:142,179-183,280,292). `CanUseLargePerfectHashAggregate` must also pass (plan_aggregate.cpp:149-170):\n- `child.estimated_cardinality < slots / 2` returns false, so the estimated input must be at least half the slot count;\n- no aggregate with `HasStateDestructorCallback()` (no list, string or sorted states);\n- `slots * (state_size + 1) * (threads + 1) <= max_memory / 8`;\n- no DELIM_SCAN in the child;\n- no DISTINCT aggregates and no grouping sets (plan_aggregate.cpp:175,287).\n\n(2) In the HT constructor: `use_staging = total_groups > STAGE_STRIPE_SIZE && data_size + total_groups > STAGE_MIN_TABLE_SIZE`, and every payload type satisfies `TypeIsConstantSize(type.InternalType())` (perfect_aggregate_hashtable.cpp:43-48). That means more than 2^16 slots (17 to 22 key bits) and a table larger than 2 MiB.\n\n(3) Writing straight to the global table happens when `SetStageTarget` returns true, which it does exactly when use_staging holds. It is called on a thread's first Sink (physical_perfecthash_aggregate.cpp:184-192).",
+    "constants": "- `STAGE_STRIPE_BITS = 16` (65,536 slots per stripe; perfect_aggregate_hashtable.hpp). This reuses the stripe size that the existing combine/source locking already used (physical_perfecthash_aggregate.cpp:87: `LARGE_PERFECT_HT_STRIPE_SIZE = PerfectAggregateHashTable::STAGE_STRIPE_SIZE`). It is a cache-sized partition granularity, a principled power of two rather than a value tied to TPCH. With \u22642^16 slots there is a single stripe, staging is off and the old private-table path runs.\n- `STAGE_MIN_TABLE_SIZE = 2 MiB` (perfect_aggregate_hashtable.cpp:11). This is roughly an L2/LLC-slice size, a hardware-motivated cutoff. Smaller tables take the old path unchanged.\n- `STAGE_BUFFERS_PER_STRIPE = 4` (perfect_aggregate_hashtable.cpp:10). The author tuned it empirically on a micro-benchmark (\"1 chunk 0.92s, 4 chunks 0.78s, 8 was worse\"). It is a performance knob only: any value is correct.\n- The enclosing gates (22-bit cap, the `slots/2` density test, `max_memory/8`) predate this commit; they came from the earlier large-HA commit E0031. A 22-bit cap, i.e. 4M slots, conveniently covers TPCH SF10 custkey (1.5M) and suppkey ranges. Just above 22 bits, or with sparse estimated input, the query uses the radix hash aggregate.",
+    "natural_class": "Any multi-threaded GROUP BY qualifies if it has integer keys with known min/max, a key range of about 131K to 4M values (17 to 22 bits), dense estimated input (at least half the range), and only fixed-width-state aggregates with combine callbacks (count, sum, min, max, avg, first on numerics, and so on). Examples outside TPCH:\n\n`SELECT user_id, count(*), sum(amount), max(ts_epoch) FROM events GROUP BY user_id;` (user_id dense in 1..2,000,000; events with 10M rows)\n\n`SELECT sensor_id, hour_of_day, avg(reading) FROM readings GROUP BY sensor_id, hour_of_day;` (sensor_id in 0..99,999 gives 17 bits, plus 5 bits for the hour, 22 bits total)\n\nTypical cases are a fact table grouped by a dense surrogate foreign key, or a count per key after a LEFT JOIN, which is q13's shape. The change itself does not test for any schema- or query-specific condition.",
+    "fallback": "If use_staging is false (\u22642^16 slots, a table \u22642 MiB, or any variable-size payload type such as VARCHAR arguments), AddChunkLazy calls `UpdateLazy(*this, address_data, payload, count)` (perfect_aggregate_hashtable.cpp:254), which is the old per-row lazy update factored out. SetStageTarget returns false, and Combine runs FlushStaged, which does nothing here, and then the original striped CombineRange merge (physical_perfecthash_aggregate.cpp:212-230). Small, non-large perfect HAs and the radix HA are untouched. The refactor does move the bounds-check loop ahead of the address computation, but the behaviour is the same.",
+    "label": "general",
+    "label_reason": "This is a textbook technique: partition-buffer the updates to a big table so each flush only touches a cache-sized region, then apply them under per-region locks to one shared table instead of keeping N private copies. It is gated by principled size conditions: more than one 64K-slot stripe, a table over 2 MiB, and fixed-width payloads so rows can be copied. Nothing in the gate refers to TPCH schemas, column names or query shapes. The only tuned value is 4 buffers per stripe, and it affects speed, not which queries qualify.\n\nThe caveat is that it only runs inside the \"large perfect HA\" mode added by earlier evolve commits. That mode's 22-bit cap and density tests were set while targeting this benchmark (q13's o_custkey grouping), so the class of queries that benefit is limited by those older heuristics. Judged on its own, this commit is a general improvement. The author's own numbers show a gain only on q13.",
+    "citations": [
+      "src/execution/perfect_aggregate_hashtable.cpp:43 \"use_staging = total_groups > STAGE_STRIPE_SIZE && data_size + total_groups > STAGE_MIN_TABLE_SIZE\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:45 \"if (!TypeIsConstantSize(type.InternalType())) { use_staging = false;\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:10-11 \"STAGE_BUFFERS_PER_STRIPE = 4; STAGE_MIN_TABLE_SIZE = idx_t(2) << 20\"",
+      "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp \"STAGE_STRIPE_BITS = 16\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:250-254 \"if (use_staging) { AddChunkStaged(...); return; } UpdateLazy(*this, address_data, payload, count);\"",
+      "src/execution/perfect_aggregate_hashtable.cpp (FlushStagePartition) \"guard = unique_lock<mutex>(stage_locks[partition_idx]); ... UpdateLazy(target, buffer.slots, buffer.payload, count);\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:184-192 \"lstate.shared_sink = lstate.ht->SetStageTarget(*gstate.ht, gstate.stripe_locks.get(), *arena);\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:212-216 \"local_ht.FlushStaged(); if (lstate.shared_sink) { return SinkCombineResultType::FINISHED; }\"",
+      "src/execution/operator/aggregate/physical_perfecthash_aggregate.cpp:87 \"LARGE_PERFECT_HT_STRIPE_SIZE = PerfectAggregateHashTable::STAGE_STRIPE_SIZE\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:142 \"LARGE_PERFECT_HT_MAX_BITS = 22\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:152 \"if (child.estimated_cardinality < slots / 2) return false\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:158 \"if (aggregate.function.HasStateDestructorCallback()) return false\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:166 \"slots * (state_size + 1) * (threads + 1) > max_memory / 8\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:292-296 \"if (perfect_hash_bits > threshold) { if (!CanUseLargePerfectHashAggregate(...)) return false; is_large = true;\"",
+      "src/include/duckdb/main/settings.hpp:1340 perfect_ht_threshold \"DefaultValue = \\\"12\\\"\""
+    ]
+  },
+  "audit_cost_usd": 0.2959906
+}

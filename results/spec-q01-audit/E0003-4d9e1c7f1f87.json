@@ -1,0 +1,49 @@
+{
+  "id": "E0003",
+  "sha": "4d9e1c7f1f8749830c61d9ba05883fd122fc9f0e",
+  "subject": "E0003: Perfect HT: replicate group states (K=4) to break same-state dependency chains",
+  "files": [
+    "extension/core_functions/aggregate/algebraic/avg.cpp",
+    "src/execution/perfect_aggregate_hashtable.cpp",
+    "src/include/duckdb/execution/perfect_aggregate_hashtable.hpp"
+  ],
+  "static": {
+    "added_lines": 73,
+    "removed_lines": 19,
+    "conditions": 6,
+    "numeric_constants": [],
+    "string_literals": []
+  },
+  "accepted_gain": 1.1404670966334836,
+  "accepted_faster": {
+    "q01": 1.14
+  },
+  "audit": {
+    "mechanism": "In the perfect-hash (direct-indexed) group-by table, each group now has K=4 copies of its aggregate state, laid out as 4 consecutive arrays of total_groups tuples. Row i of a chunk updates copy (i & 3) of its group. Consecutive rows of the same group therefore hit 4 independent accumulators instead of forming one serial read-modify-write chain through a single state. This is the standard accumulator privatization/replication trick for low-cardinality aggregation. When threads combine, all source copies are merged into the target's copy 0 (CombineReplicas(other, 0)). Before the first Scan, the table merges its own copies 1..3 into copy 0, once. Separately, avg over integer, hugeint, decimal and interval inputs is now marked NOT_ORDER_DEPENDENT for the whole engine, so it qualifies for replication. That flag is also read by the ordered-aggregate optimizer and by window segment trees.",
+    "trigger": "1. The planner must already pick a perfect-hash aggregate (unchanged code). From src/execution/physical_plan/plan_aggregate.cpp:\n   - No grouping sets: \"op.grouping_sets.size() > 1 || !op.grouping_functions.empty()\" returns false (:128).\n   - All group keys are integer-typed (:136-148).\n   - Each key has min/max statistics, and its range is below 2^31 (:220).\n   - The summed bits stay within the setting: \"perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context)\" (:230). The default is 12 bits (src/common/settings.json:916, \"default_value\": \"12\"), so at most 4096 slots.\n   - No DISTINCT, and every aggregate has a combine function (:237).\n2. New gate in the PerfectAggregateHashTable constructor (src/execution/perfect_aggregate_hashtable.cpp):\n   - At least one aggregate: \"bool can_replicate = !layout_ptr->GetAggregates().empty();\".\n   - Every aggregate is NOT_ORDER_DEPENDENT and none is distinct: \"if (aggr.function.GetOrderDependent() != AggregateOrderDependent::NOT_ORDER_DEPENDENT || aggr.IsDistinct()) { can_replicate = false; }\" (:39-42).\n   - Size cap: \"if (can_replicate && total_groups * tuple_size * MAX_REPLICA_COUNT <= MAX_REPLICATED_HT_SIZE) { replica_count = MAX_REPLICA_COUNT; }\" (:44-46).\n   - NOT_ORDER_DEPENDENT aggregates: count/count_star (src/function/aggregate/distributive/count.cpp:235,243), min/max (minmax.cpp:381), integer and decimal sum (extension/core_functions/aggregate/distributive/sum.cpp:166-211), bool_and/bool_or, quantile/mad, and now integer/decimal/interval avg (avg.cpp:272).\n   - Double sum/avg and list/string_agg/first are order-dependent, so any query using them stays on K=1.",
+    "constants": "- MAX_REPLICA_COUNT = 4 (perfect_aggregate_hashtable.cpp:10).\n  - This is a guess, not a value derived from hardware or the workload. The author says \"K=8 was not tried\".\n  - It must be a power of two because the code uses the mask \"i & replica_mask\".\n  - A typical out-of-order core can overlap a handful of independent load-add-store chains, so 4 is a reasonable default.\n  - Nothing about it is specific to TPCH; Q1 has only about 4 groups, so even K=2 would expose the effect.\n- MAX_REPLICATED_HT_SIZE = 1 MiB (:12, \"1ULL << 20ULL\").\n  - A cache-capacity style cap (roughly an L2 size), so the 4 copies do not spill out of cache.\n  - Just above the cap, replica_count = 1 and the table behaves exactly as before.\n  - At the default 4096-slot maximum, the cap allows tuple_size <= 64 B. Wider states or more groups fall back to K=1.\n  - The cap limits bytes, not group count. Example: 2000 groups x 100 B is allowed, and there replication brings little benefit (few rows per group per chunk, so short chains). It does cost 4x initialization, 4x Destroy, and roughly 4x combine/fold work per thread.\n  - Neither constant appears to be fitted to TPCH table sizes.",
+    "natural_class": "Any GROUP BY that DuckDB executes with the perfect hash table and whose aggregates are all exact and order-independent: count, min, max, sum/avg over integer or decimal inputs, bool_and/or. This typically means low-cardinality integer keys (or keys that compressed materialization turns into small integers), with many rows per group.\n\nExample 1:\n  SELECT status_code, count(*), sum(bytes), avg(latency_us), max(ts)\n  FROM web_logs\n  GROUP BY status_code;\n(status_code is SMALLINT or INTEGER with min/max stats; bytes and latency_us are integers.)\n\nExample 2:\n  SELECT store_id, day_of_week, sum(qty), avg(price_cents), min(price_cents)\n  FROM sales\n  GROUP BY store_id, day_of_week;\n(store_id ranges 1..200 and day_of_week 0..6, so 8+3 bits.)\n\nNot covered:\n  - The same queries using DOUBLE sum/avg.\n  - Queries with string_agg/list/first.\n  - High-cardinality or string keys, which use the radix hash table.",
+    "fallback": "If any aggregate is order-dependent or DISTINCT, or the 4x state array exceeds 1 MiB, then replica_count = 1. Effects:\n- The address computation reduces to the old \"group * tuple_size\", because the mask is 0.\n- CombineReplicas(other, 0) loops over r in [0,1), which is the old Combine.\n- Scan skips the fold: \"if (replica_count > 1)\".\n- Destroy covers total_groups*1 tuples.\nSo the behaviour is the old path, refactored but functionally unchanged. Queries that don't use the perfect hash table are unaffected by the hash-table change.\n\nThe avg change is not gated. Integer/decimal/interval avg is now NOT_ORDER_DEPENDENT everywhere. For example, the ordered-aggregate optimizer (src/optimizer/rule/ordered_aggregate_optimizer.cpp:27) can now drop ORDER BY inside avg(...), and window segment trees (src/function/window/window_segment_tree.cpp:157) treat it as order-insensitive. This is semantically sound because the states are exact integer sums and counts.",
+    "label": "general",
+    "label_reason": "This is a well-known technique (replicated or privatized accumulators that break same-address read-modify-write dependencies in low-cardinality aggregation). Its gate is semantic (all aggregates exact and order-independent, no DISTINCT) plus a cache-sized memory cap. It does not depend on TPCH's columns, types or query shapes, and any low-cardinality integer-key GROUP BY with count/sum/min/max/integer-avg benefits. Caveats:\n- K=4 is an untuned guess.\n- The 1 MiB cap limits bytes, not group count. Near the 4096-slot limit it can replicate where few rows per group per chunk give little benefit, at the cost of more init, combine and fold work. Gating on rows per group would be more principled.\n- The global avg order-dependence change has effects beyond this path, though they are sound.\nNone of this makes it a benchmark branch. At most it would invite upstream tuning of the constants.",
+    "citations": [
+      "src/execution/perfect_aggregate_hashtable.cpp:10 \"static constexpr idx_t MAX_REPLICA_COUNT = 4;\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:12 \"static constexpr idx_t MAX_REPLICATED_HT_SIZE = 1ULL << 20ULL;\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:40 \"if (aggr.function.GetOrderDependent() != AggregateOrderDependent::NOT_ORDER_DEPENDENT || aggr.IsDistinct())\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:44 \"if (can_replicate && total_groups * tuple_size * MAX_REPLICA_COUNT <= MAX_REPLICATED_HT_SIZE)\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:163 \"address_data[i] = uintptr_t(data) + (group + (i & replica_mask) * total_groups) * tuple_size;\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:190 \"CombineReplicas(other, 0);\"",
+      "src/execution/perfect_aggregate_hashtable.cpp:291-296 \"if (!replicas_folded) { ... if (replica_count > 1) { CombineReplicas(*this, 1);\"",
+      "extension/core_functions/aggregate/algebraic/avg.cpp:272 \"function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);\"",
+      "extension/core_functions/aggregate/distributive/sum.cpp:181 \"function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);\" (integer sum, already present)",
+      "src/function/aggregate/distributive/count.cpp:235 \"fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);\"",
+      "src/function/aggregate/distributive/minmax.cpp:381 \"function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);\"",
+      "src/execution/physical_plan/plan_aggregate.cpp:230 \"if (perfect_hash_bits > Settings::Get<PerfectHtThresholdSetting>(context))\"",
+      "src/common/settings.json:916 \"default_value\": \"12\" (perfect_ht_threshold)",
+      "src/execution/physical_plan/plan_aggregate.cpp:237 \"if (aggregate.IsDistinct() || !aggregate.function.HasStateCombineCallback())\"",
+      "src/optimizer/rule/ordered_aggregate_optimizer.cpp:27 \"if (aggr.function.GetOrderDependent() == AggregateOrderDependent::NOT_ORDER_DEPENDENT)\"",
+      "src/function/window/window_segment_tree.cpp:157 \"order_insensitive(aggr.function.GetOrderDependent() == AggregateOrderDependent::NOT_ORDER_DEPENDENT)\""
+    ]
+  },
+  "audit_cost_usd": 0.3230328
+}

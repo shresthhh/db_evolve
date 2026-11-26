@@ -1,0 +1,49 @@
+{
+  "id": "E0006",
+  "sha": "9271a75384bc2a28c6b643bc14f5c743ca9fdfc5",
+  "subject": "E0006: Exact bitmap BF for dense-int join keys on partsupp-style probes",
+  "files": [
+    "src/execution/join_hashtable.cpp",
+    "src/execution/operator/join/physical_hash_join.cpp",
+    "src/include/duckdb/planner/filter/bloom_filter.hpp",
+    "src/planner/filter/bloom_filter.cpp"
+  ],
+  "static": {
+    "added_lines": 273,
+    "removed_lines": 12,
+    "conditions": 55,
+    "numeric_constants": [
+      "128"
+    ],
+    "string_literals": [
+      "\"Exact bloom filter key outside of the build-side min/max range\"",
+      "\"Unsupported type for exact bloom filter\""
+    ]
+  },
+  "audit": {
+    "mechanism": "When a hash join pushes a bloom filter into a probe-side scan, and the build side's single join key is an integer whose [min,max] range is small enough compared with the build row count, the bloom filter becomes an exact bitmap with one bit per value in [min,max]. It is no longer a hashed, blocked bloom filter. The bits are set from the key column of the finalized hash-table rows. The probe-side scan filter then tests a bit at offset (key - min) rather than hashing the key, so it is cheaper and has no false positives. FilterValue and zone-map CheckStatistics use the same bitmap. The join itself is unchanged.",
+    "trigger": "The new code only runs where the existing bloom-filter path already applies. That path needs CanUseBloomFilter: no perfect hash table (`if (is_perfect_hashtable) return false;`), one equality key (`ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL`), a filtered build side (`build_side_has_filter`) and an estimated probe side larger than the build side (`build_to_probe_ratio > 1.0`) (src/execution/operator/join/physical_hash_join.cpp:769-784). It also needs no cast (`!has_cast`), min != max, and non-NULL min/max (physical_hash_join.cpp:887-944). The new TrySetExactBloomFilter (physical_hash_join.cpp:821-857) then adds four conditions:\n1. NULLs must not compare equal: `ht.conditions.size() != 1 || ht.NullValuesAreEqual(0)` returns early.\n2. Build and probe key types must be identical: `key_type != ht.conditions[0].left->return_type` returns early.\n3. The key's physical type must be INT8/16/32/64 or UINT8/16/32/64. Others hit `default: return;`. Since it checks the physical type, DATE, TIME, DECIMAL-as-int etc. also qualify.\n4. The range must be dense enough: `range >= max_bits` returns early, where `max_bits = MinValue<idx_t>(EXACT_BF_MAX_BITS, ht.Count() * EXACT_BF_MAX_BITS_PER_ROW)`. In other words, max - min < min(2^32, 128 \u00d7 build rows).\nNothing in the code refers to a table, column or query. The \"partsupp-style\" in the title is only a description.",
+    "constants": "- EXACT_BF_MAX_BITS_PER_ROW = 128 (physical_hash_join.cpp:815). This is a memory budget: the bitmap may cost up to 128 bits per build row. The existing hashed filter uses `MIN_NUM_BITS_PER_KEY = 12`, rounded up to a power of two (bloom_filter.cpp:8, 99-100), so the exact filter can be roughly 5-10x bigger. In density terms, the build side must cover at least 1/128 of its key range. No measurement or derivation is given. It is a round number and does not match any TPCH size: filtered dimension tables with dense surrogate keys (part, supplier, customer, orders) fall far inside it, typically at 1-30 bits per row. Just outside it (a sparser key range) the engine silently uses the original hashed bloom filter, so the only cost is losing the speedup.\n- EXACT_BF_MAX_BITS = 2^32 bits, i.e. 512 MiB (physical_hash_join.cpp:817). The comment says it matches the hashed filter's cap, and that holds: `MAX_NUM_SECTORS = 1<<26` sectors \u00d7 64 bits (bloom_filter.cpp:7). Above it, the hashed filter is used.\n- The 64-byte alignment in Initialize (bloom_filter.cpp `& ~63ULL`) is a cache-line constant from the hardware.",
+    "natural_class": "Any equality hash join on one integer-typed key (including DATE or integer-backed types) that gets a bloom filter pushed into the probe scan: filtered build side, larger probe side, no perfect hash table, and build keys covering at least 1/128 of their [min,max] span. This is the common star-schema case of a fact table joined to a filtered dimension with dense surrogate keys. Examples:\n1. `SELECT sum(s.amount) FROM sales s JOIN customers c ON s.customer_id = c.id WHERE c.country = 'DE';` (customers.id is a dense BIGINT, and the filter keeps around 5%).\n2. `SELECT count(*) FROM events e JOIN users u ON e.user_id = u.user_id WHERE u.signup_date >= DATE '2024-01-01';`\n3. Joins on DATE keys to a filtered calendar table, e.g. `... JOIN dim_date d ON f.date_key = d.date_key WHERE d.is_holiday`.\nNot covered: VARCHAR, UUID or HUGEINT keys, multi-column keys, and very sparse key ranges such as hashed IDs or snowflake IDs.",
+    "fallback": "If any condition fails, TrySetExactBloomFilter returns without calling SetExactRange, `exact` stays false, and every changed site takes the original branch:\n- InsertHashes: `bloom_filter.IsInitialized() && !bloom_filter.IsExact()` (join_hashtable.cpp:720)\n- Initialize: the `if (exact)` early return is skipped\n- Filter / FilterValue / CheckStatistics: `if (filter.IsExact())` is skipped\nSo the hashed bloom filter behaves exactly as before. One small change on the old path: CheckStatistics is now dispatched through an extra template parameter, which does not change what it does.",
+    "label": "general",
+    "label_reason": "An exact bitmap or range filter for dense integer join keys is a standard technique, used for example in Umbra/HyPer-style perfect filters and in \"dense domain\" semi-join filters. It applies to any single-key integer equality join that already qualified for a bloom filter. Nothing depends on schema, column names or query shape. The only new tuned-looking value is the 128-bits-per-row density bound. It is a plain memory-versus-precision trade-off, sits nowhere near a TPCH-specific boundary, and falling outside it simply reverts to the old hashed filter. Upstream might pick a different constant (closer to the hashed filter's ~16 bits per key, for memory parity), but the gate is broad and natural.",
+    "citations": [
+      "src/execution/operator/join/physical_hash_join.cpp:815 \"static constexpr idx_t EXACT_BF_MAX_BITS_PER_ROW = 128;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:817 \"static constexpr idx_t EXACT_BF_MAX_BITS = idx_t(1) << 32;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:823 \"if (bf.IsExact() || bf.IsInitialized() || ht.conditions.size() != 1 || ht.NullValuesAreEqual(0))\"",
+      "src/execution/operator/join/physical_hash_join.cpp:827 \"if (key_type != ht.conditions[0].left->return_type || min_val.IsNull() ...\"",
+      "src/execution/operator/join/physical_hash_join.cpp:850-854 \"const auto max_bits = MinValue<idx_t>(EXACT_BF_MAX_BITS, ht.Count() * EXACT_BF_MAX_BITS_PER_ROW); if (range >= max_bits) return;\"",
+      "src/execution/operator/join/physical_hash_join.cpp:944-950 \"if (!has_cast && ht && CanUseBloomFilter(...)) { ... TrySetExactBloomFilter(*ht, ...)\"",
+      "src/execution/operator/join/physical_hash_join.cpp:769 \"if (is_perfect_hashtable) { return false; }\"",
+      "src/execution/operator/join/physical_hash_join.cpp:775 \"ht->conditions.size() == 1 && cmp == ExpressionType::COMPARE_EQUAL\"",
+      "src/execution/operator/join/physical_hash_join.cpp:784 \"return can_use_bf && build_side_has_filter && probe_larger_then_build;\"",
+      "src/execution/join_hashtable.cpp:720 \"if (bloom_filter.IsInitialized() && !bloom_filter.IsExact())\"",
+      "src/execution/join_hashtable.cpp:793-796 \"bloom_filter.InsertKeysFromRows(layout_ptr->GetTypes()[0].InternalType(), row_locations, ...)\"",
+      "src/include/duckdb/planner/filter/bloom_filter.hpp LookupKey \"const uint64_t offset = key - exact_min; if (offset >= exact_bits) return false; return (bf[offset >> 6] >> (offset & 63)) & 1;\"",
+      "src/planner/filter/bloom_filter.cpp:7-9 \"MAX_NUM_SECTORS = (1ULL << 26); MIN_NUM_BITS_PER_KEY = 12;\"",
+      "src/planner/filter/bloom_filter.cpp BFTableFilter::Filter \"if (filter.IsExact()) { found_count = ExactLookup(...); } else { HashInternal(...) ...\""
+    ]
+  },
+  "audit_cost_usd": 0.24218579999999998
+}
